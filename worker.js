@@ -2884,6 +2884,27 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // when a document has few constructs and is recorded as a watch item rather than rewritten here.
   // A bounds-keyed memo would be the next step if a document with many constructs and many spans
   // ever shows up in a profile.
+  // FAST PATH: nothing to widen.
+  //
+  // Every stage below -- reference widening, infra widening, the remerge and applyObjectSchema --
+  // only ever ADJUSTS spans that already exist. With no surviving span there is no adjustment to
+  // make, so the reference scan (and everything after it) can be skipped entirely.
+  //
+  // This is not a micro-optimisation: referenceEnvelopes() scans the whole document, so on an input
+  // with no detector hit it was the single most expensive thing in the call. It also narrows the
+  // reachability of R3-REDOS-002, which lives inside that scan -- but it does NOT fix REDOS-002,
+  // because as soon as one span survives, the scan runs again and the repeated failed forward scan
+  // on unclosed constructs is unchanged.
+  //
+  // The coverage contract is preserved deliberately: the parsers have already recorded into
+  // `coverage` by this point, and the normal return path attaches it. Returning a bare [] would
+  // silently drop coverage for exactly the inputs where coverage matters most -- a document the
+  // detectors found nothing in.
+  if (padded.length === 0) {
+    const empty = [];
+    return coverage ? coverage.attachTo(empty) : empty;
+  }
+
   const documentReferences = referenceEnvelopes(text);
   const envelopeFor = (span) => {
     // Same selection rule as enclosingReference(): the narrowest construct that STRICTLY contains

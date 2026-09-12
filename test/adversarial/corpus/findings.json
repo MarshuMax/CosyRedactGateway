@@ -342,6 +342,19 @@
         "phase_3_not_done": "The `padded.length === 0` fast path is NOT free as written: referenceEnvelopes(text) is called unconditionally at worker.js:2867, BEFORE anything tests padded, so it runs even when there are no spans to widen. Making it free means moving the call behind the emptiness test, which is a separate change and was not made."
       },
       "regression": "test/b2-containment.test.js pins the INVARIANT rather than the deletion: envelopes sorted and strictly disjoint across 18 shapes and a 2000-construct corpus; no envelope contained in another over the 111111-string exhaustive corpus; the nested `${{ a: {b:1}}}` case yielding a single envelope; and a bounded linearity check on 4x the construct count. The linearity check is there because correctness alone CANNOT catch this class of defect -- the deleted filter never changed the result, so every other assertion passed while the function was 36x slower than necessary."
+    },
+    {
+      "id": "R3-BODY-002-P3",
+      "seed": "n/a",
+      "input": "documents where no detector produces a surviving span, including one reference construct per line",
+      "expected_invariant": "Stages that only ADJUST existing spans must not run when there are no spans. reference widening, infra widening, the remerge and applyObjectSchema all fit that description.",
+      "observed": "referenceEnvelopes(text) was called unconditionally BEFORE anything tested whether there was anything to widen, so on an input with no detector hit it was the most expensive part of the call. It is not free to skip by accident: the call site sits above the `padded.length === 0` condition, not below it.",
+      "impact": "Constant-factor only, no security consequence. Measured on corpus B (zero spans): 4 MiB findSensitiveSpans 1240.9ms -> 946.5ms, i.e. it removes the ~267ms the reference scan was costing on an input that never used its result. ms/MiB stayed flat (368 -> 296 -> 237 -> 229 -> 236).",
+      "status": "fixed",
+      "fix": "Return early when `padded.length === 0`, placed AFTER the coverage-bearing parsers have run and BEFORE referenceEnvelopes. The coverage contract is preserved rather than short-circuited: `const empty = []; return coverage ? coverage.attachTo(empty) : empty;` -- returning a bare [] would silently drop coverage on exactly the inputs where coverage matters most, a document the detectors found nothing in.",
+      "differential": "Exact comparison against the pre-change implementation, over 14 case/flag combinations covering all four requested shapes: no detector hit with many valid refs, no detector hit with malformed/unclosed refs, no detector hit on ordinary clean text, and WITH a hit so the fast path must not fire. Compared spans by start/end/type/priority/ruleId/classifiedText/evidence, the coverage summary, and the ARRAY'S OWN PROPERTY NAMES (the returned array carries a non-enumerable coverage property). 0 differences. Run twice, once against HEAD and once against the pre-BODY-002 commit 1aad949, so the check also proves that Phase 1 and Phase 3 together are equivalent to the behaviour before either change.",
+      "explicitly_not_a_fix_for_redos_002": "This narrows R3-REDOS-002's reachability but must NOT be recorded as fixing it. The moment a single span survives, referenceEnvelopes() runs again and the repeated failed forward scan over unclosed constructs is unchanged. A document with one secret and one unclosed construct still pays it.",
+      "regression": "Covered by the existing coverage and reference suites; the differential above is the acceptance evidence."
     }
   ],
   "r3_3_baselines": {
