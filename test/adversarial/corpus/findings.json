@@ -714,6 +714,47 @@
         "memory_no_sustained_growth": "NOT MET on heapUsed: slope +0.107 MiB/sample and a monotonic rise across the thirds. RSS is non-monotonic because of collection, so RSS alone would have looked benign.",
         "npm_test_after_soak": "PASS (446/446)"
       }
-    }
+    },
+    "gc_diagnostic": {
+      "command": "node --expose-gc soak4gc.mjs 5 8 gc   (DIAGNOSTIC ONLY; explicit GC never enters a gate run)",
+      "iterations": 1677488,
+      "errors": 0,
+      "samples": 199,
+      "cross_probes": 16772,
+      "cross_leaks": 0,
+      "rejections": 279581,
+      "fetch_violations": 0,
+      "sse_hangs": 0,
+      "heapUsed_MiB": {
+        "first": 27,
+        "mid": 31,
+        "last": 35,
+        "slope_per_sample": 0.0762
+      },
+      "heapAfterGC_MiB": {
+        "first": 15,
+        "mid": 18,
+        "last": 22,
+        "slope_per_sample": 0.0709
+      },
+      "rss_MiB": {
+        "first": 142,
+        "mid": 147,
+        "last": 152,
+        "slope_per_sample": 0.0929
+      },
+      "rssAfterGC_MiB": {
+        "first": 142,
+        "mid": 147,
+        "last": 152,
+        "slope_per_sample": 0.093
+      },
+      "verdict": "FORCED GC WORKS -- post-GC heap (15-22 MiB) sits well below live heapUsed (27-35 MiB), so the samples are genuinely post-collection. And the post-GC heap STILL GROWS: +7 MiB across the run, while heapUsed grows +8 MiB over the same window. The two slopes are nearly identical (0.0709 vs 0.0762), which means the growth is NOT the collector falling behind -- it is retained live data. Rate: about 4 MiB per minute at concurrency 8, i.e. roughly 240 MiB per hour of sustained load.",
+      "what_this_rules_out": "It rules out 'V8 simply has not collected yet', which was the benign explanation the RSS recovery at 17:13 had suggested. The earlier 32-minute run's RSS drop from 534 to 261 MiB was real collection, but it did not return to baseline and this diagnostic shows why.",
+      "what_remains_open": "WHERE the retention is. It is per-time rather than per-request (phase A at concurrency 1 was flat at +0.048 RSS and +0.018 heap over 6 minutes and 1.6M requests, so it is not a per-request leak), and it scales with concurrency. Candidates not yet examined: V8 not releasing pooled objects under sustained concurrent allocation, the harness's own retained arrays (st.lat holds every latency and st.samples every sample -- 12.2M latency entries in the 32-minute run), or genuine gateway-side accumulation such as the foreign-token registry or a per-request context retained somewhere.",
+      "important_caveat_about_the_harness": "`st.lat.push(...)` stores one entry PER REQUEST and is serialised into the checkpoint -- the 32-minute checkpoint file is 9 MB for that reason. At 12.2M requests that is a real, monotonically growing array owned by the HARNESS, and it is a plausible contributor to the observed slope. It was never bounded or trimmed. So the heap growth measured here is NOT yet attributable to the gateway, and the next step must be a run with the harness's own retention removed before any conclusion is drawn about production.",
+      "next_step": "Re-run with (a) the harness keeping bounded rolling windows instead of full arrays, and (b) if the slope persists, a heap snapshot diff to attribute the retention. Do not report this as a gateway leak until the harness's own growth is excluded -- it is currently indistinguishable."
+    },
+    "status": "INCOMPLETE on the memory gate -- real post-GC growth measured, but not yet attributed; the harness itself retains unbounded per-request arrays."
   }
 }
