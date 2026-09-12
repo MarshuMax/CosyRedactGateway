@@ -999,6 +999,103 @@ export function classifyKeyStrength(key) {
   return KEY_STRENGTH.STRONG;
 }
 
+// ------------------------------------------------ structural / reference envelope ---
+//
+// A reference is an INDIRECTION, so on its own it is never a secret verdict: replacing
+// `${SECRET}` with a token destroys the template for no gain. But it is a BOUNDARY, and a
+// detector hit inside it must not be replaced while the syntax around it is left behind:
+//
+//   DB_PASSWORD={{Redact:<64 hex>}}
+//   ->  DB_PASSWORD={{Redact:CRG_...        (partial replacement, half-open syntax)
+//
+// So the reference construct is resolved as a structural envelope: the inner hit widens to
+// the whole construct and the construct becomes the mutation boundary. Nothing here is
+// specific to any template language -- these are balanced-delimiter constructs found by a
+// scanner, not a list of special cases.
+const REFERENCE_CONSTRUCTS = Object.freeze([
+  { opener: "${{", closer: "}}" },
+  { opener: "{{", closer: "}}" },
+  { opener: "${", closer: "}" },
+  { opener: "$(", closer: ")" },
+  { opener: "%", closer: "%", simple: true },
+  { opener: "<", closer: ">", simple: true, namePattern: /^<[A-Za-z_][A-Za-z0-9_]*>$/ },
+  { opener: "{", closer: "}", simple: true, namePattern: /^\{[A-Za-z_][A-Za-z0-9_.]*\}$/ },
+]);
+
+/**
+ * Spans of reference constructs in the text.
+ *
+ * Longest opener first, and nesting is honoured: `${ { a: 1 } }` does not close at the inner
+ * brace. A construct that never closes is not returned -- an unterminated `${` is ordinary
+ * text and treating it as a boundary would widen a span over unrelated content.
+ */
+export function referenceEnvelopes(text) {
+  if (typeof text !== "string" || text.length === 0) return [];
+  const ordered = REFERENCE_CONSTRUCTS.slice().sort((a, b) => b.opener.length - a.opener.length);
+  const out = [];
+  let i = 0;
+  while (i < text.length) {
+    const found = ordered.find((c) => text.startsWith(c.opener, i));
+    if (!found) { i++; continue; }
+
+    if (found.simple) {
+      // `%VAR%`, `<VAR>`, `{var}`: no nesting, and a name-only body, so a stray `%` in prose
+      // or a stray `<` in a comparison cannot open a region.
+      const end = text.indexOf(found.closer, i + found.opener.length);
+      if (end < 0) { i++; continue; }
+      const candidate = text.slice(i, end + found.closer.length);
+      if (found.namePattern && !found.namePattern.test(candidate)) { i++; continue; }
+      out.push({ start: i, end: end + found.closer.length, opener: found.opener });
+      i = end + found.closer.length;
+      continue;
+    }
+
+    // Balanced scan, so nested braces inside the construct do not close it early.
+    let depth = 0;
+    let j = i;
+    let end = -1;
+    while (j < text.length) {
+      if (text.startsWith(found.opener, j)) { depth++; j += found.opener.length; continue; }
+      if (text.startsWith(found.closer, j)) {
+        depth--;
+        j += found.closer.length;
+        if (depth === 0) { end = j; break; }
+        continue;
+      }
+      j++;
+    }
+    if (end < 0) { i++; continue; }
+    out.push({ start: i, end, opener: found.opener });
+    i = end;
+  }
+  // Drop envelopes fully contained in another: the OUTERMOST construct is the boundary.
+  return out.filter((env) => !out.some((other) => other !== env && other.start <= env.start && other.end >= env.end && (other.end - other.start) > (env.end - env.start)));
+}
+
+/** The innermost reference envelope strictly containing [start,end), if any. */
+export function enclosingReference(text, start, end) {
+  let best = null;
+  for (const env of referenceEnvelopes(text)) {
+    if (env.start <= start && env.end >= end && (env.start < start || env.end > end)) {
+      if (!best || (env.end - env.start) < (best.end - best.start)) best = env;
+    }
+  }
+  // Widening to the outermost construct keeps the nesting intact: replacing an inner
+  // `${...}` while leaving the outer `${{` behind is the half-open failure again.
+  let widened = best;
+  let changed = true;
+  while (widened && changed) {
+    changed = false;
+    for (const env of referenceEnvelopes(text)) {
+      if (env.start <= widened.start && env.end >= widened.end && (env.end - env.start) > (widened.end - widened.start)) {
+        widened = env;
+        changed = true;
+      }
+    }
+  }
+  return widened;
+}
+
 function looksLikeReferenceValue(raw) {
   return REFERENCE_VALUE_RE.test(raw.trim());
 }
@@ -2497,12 +2594,38 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 
   const selected = [];
   for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
-  // A detector boundary is not an entity boundary: widen each span to the enclosing
+  // A detector span inside a REFERENCE construct widens to the whole construct. The parser
+  // reports `reference_value` as evidence and the binding candidate is filtered out (a
+  // template is an indirection, not a secret), but the inner detectors still fire -- and a
+  // span covering only the inside left the syntax around it half-open:
+  //
+  //   DB_PASSWORD={{Redact:<64 hex>}}  ->  DB_PASSWORD={{Redact:CRG_...
+  //
+  // The envelope is the mutation boundary. Detector attribution is preserved: the inner
+  // detector decides the ACTION, the construct decides the BOX.
+  const enveloped = selected.map((span) => {
+    const env = enclosingReference(text, span.start, span.end);
+    if (!env) return span;
+    return {
+      ...span,
+      start: env.start,
+      end: env.end,
+      // The BOX changed, the VERDICT did not: classification still runs on the value the
+      // detector actually identified. Without this, `commit: "{{ <sha> }}"` stopped being
+      // recognised as a git sha because the widened text includes the braces and spaces,
+      // so a devops profile that preserves shas silently started redacting this one.
+      classifiedText: text.slice(span.start, span.end),
+      referenceEnvelope: { opener: env.opener, start: env.start, end: env.end },
+      evidence: [...new Set([...(span.evidence || []), "reference_envelope"])],
+    };
+  });
+
+  // A detector boundary is not an entity boundary either: widen each span to the enclosing
   // infrastructure entity and MERGE AGAIN, because the widened span now contains the
   // detector span and possibly its neighbours. Without re-merging, the detector's narrower
   // span survives alongside it and a partial replacement can win -- which is how
   // `i-0a1b2c3d4e5f67890` came out as `i-CRG_...`.
-  const widened = selected.map((span) => {
+  const widened = enveloped.map((span) => {
     const envelope = resolveInfraEnvelope(text, span);
     if (!envelope) return span;
     return {
@@ -2689,11 +2812,14 @@ export class RedactionContext {
       const detector = detectorOfSpan(s);
       // Context is what lets an anchored form be recognised: `commit <40-hex>` is a git
       // sha, while a bare 40-hex run is shape-ambiguous and must not be preserved.
-      const contextBefore = text.slice(Math.max(0, s.start - 64), s.start);
-      // A span already widened to its envelope classifies on the widened text; otherwise
-      // the recogniser would see only the detector's slice of the entity.
-      const infra = recogniseInfra(raw, contextBefore)
-        || (s.infraEnvelope ? recogniseInfra(raw) : null);
+      // Classification runs on the value the detector identified, which for a widened
+      // envelope is the PRE-widening text: the envelope is a boundary, not a verdict.
+      const classifyText = s.classifiedText || raw;
+      const contextBefore = s.classifiedText
+        ? text.slice(Math.max(0, s.start - 64), s.start)
+        : text.slice(Math.max(0, s.start - 64), s.start);
+      const infra = recogniseInfra(classifyText, contextBefore)
+        || (s.infraEnvelope && classifyText === raw ? recogniseInfra(raw) : null);
       const decision = decideSpanAction({ detector, ruleId: s.ruleId, infra, profile: this.profile });
       this.spanActions.push({
         detector,

@@ -1286,6 +1286,61 @@ worker.js 中 'legacyRedactToken' 0 处
 
 对 `DB_PASSWORD={{Redact:<64hex>}}` 这种输入，entropy/binding 的 span 是 `[21,87)`——**把结尾的 `}}` 也包含进去了**，因此输出为 `DB_PASSWORD={{Redact:CRG_...`。安全上没有问题（原值已删除、无豁免），但交付文本不整洁，且说明 detector 边界会跨过 `}}` 这类标点。这不是 legacy 方言的性质（方言已删），而是 detector 的一般边界行为，留待 hardening 处理。
 
+## 9.23 R0.1 Structural Boundary Closure（已实现）
+
+### 根因不是 legacy
+
+```
+DB_PASSWORD={{Redact:<64hex>}}
+→ DB_PASSWORD={{Redact:CRG_...
+```
+
+链路是：parser 识别整个 value 为 `reference_value` → **binding candidate 被过滤**（模板是指代，不是秘密）→ 但 **inner detector 仍然运行** → 只替换 reference 内部那一段 → 语法半开。
+
+### 正确规则：parser 提供边界，不等于 parser 下 verdict
+
+```
+reference 本身                          → 不是 secret verdict
+reference 中无其它 detector hit          → 原样保留
+reference 中有真实 detector hit          → reference boundary 成为 structural envelope
+                                          → 整个 construct 成为 mutation boundary
+                                          → detector attribution / hard evidence 保留
+```
+
+这与 block scalar 的思路一致。
+
+### 通用实现，没有 `{{Redact:` 特殊规则
+
+`referenceEnvelopes()` 用**平衡分隔符扫描器**识别 construct（不是模板语言的特例表）：`${{ }}`、`{{ }}`、`${ }`、`$( )`、`%VAR%`、`<VAR>`、`{var}`。
+
+- 最长 opener 优先，**嵌套被正确处理**（`${{ a: {b:1} }}` 不会在内层 `}` 提前闭合）
+- **未闭合的 construct 不返回**——`${` 未闭合只是普通文本，当作边界会把无关内容卷进来
+- 只返回**最外层** construct：替换内层而留下外层 `${{` 就是又一次半开
+- 简单形态（`%VAR%` `<VAR>` `{var}`）要求 body 是纯名字，避免散文里的 `%` 或比较运算符 `<` 误开区域
+
+### "盒子变了，判定没变"
+
+span 扩到 envelope 后，**分类仍跑在 detector 实际识别的原文上**（`classifiedText`）。没有这一步，`commit: "{{ <sha> }}"` 因为放宽后的文本含括号与空格而不再被识别为 git sha，导致 devops profile 会把本该保留的 sha 静默脱敏。
+
+### 实测（全部 round-trip byte-identical）
+
+```
+DB_PASSWORD=${SECRET}                    → 原样
+DB_PASSWORD=${{ secrets.DB_PASSWORD }}   → 原样
+DB_PASSWORD={{ vault_password }}         → 原样
+DB_PASSWORD=%DB_PASSWORD% / <VAR>        → 原样
+block scalar 内的 ${{ }}                  → 原样
+DB_PASSWORD={{Redact:<64hex>}}           → DB_PASSWORD=CRG_...
+PASSWORD="{{ wrapper <real PAT> }}"      → PASSWORD="CRG_..."
+x: ${{ secrets.<PAT> }}                  → x: CRG_...
+blob: "{{ <64hex> }}"                    → blob: "CRG_..."
+token: "{{ <PAT> }}"  # rotate quarterly → token: "CRG_..."  # rotate quarterly（注释与引号保留）
+```
+
+### 一处夹具教训
+
+`DB_PASSWORD=$(op read op://vault/db/password)` 我最初列为"pure reference"，实测**被替换**——因为 `op://vault/db/password` 是真实的 INTERNAL_HOSTNAME 命中。这不是缺陷，正是"有 hit 则整体替换"规则在生效。夹具与结论混在一起是这类测试最容易犯的错，因此该 case 单独成条并注明理由。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
