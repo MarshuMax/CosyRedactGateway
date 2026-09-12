@@ -1,0 +1,25 @@
+{
+  "note": "Minimised R2 findings only. Ordinary exploration samples are rebuilt from the category seeds by the generators and are deliberately not committed here.",
+  "categories": {
+    "REGISTRY": "0x2e610001",
+    "STREAM": "0x2e610002",
+    "PARSER": "0x2e610003",
+    "MERGE": "0x2e610004",
+    "REPRESENTATION": "0x2e610005",
+    "OPERAND": "0x2e610006"
+  },
+  "findings": [
+    {
+      "id": "R2-REG-001",
+      "seed": "0x2e610001",
+      "input": "new ForeignTokenRegistry([{ name: \"acme\", pattern: /ACME_[A-Z0-9_]+/g }]).namespaceOf(\"ACME_ABCDEF_0001\") called repeatedly",
+      "config": "foreign registry with a pattern-registered namespace whose RegExp carries the g (or y) flag",
+      "expected_invariant": "The same registration must yield the same ownership verdict on every call, and classifyOwnership / ctx.isProtectedToken / the forward path must agree with each other. Registry contract: a registered foreign token is PRESERVED on the input path.",
+      "observed": "namespaceOf alternates acme/null/acme/null because RegExp.prototype.test on a g or y matcher advances lastIndex; classifyOwnership resets lastIndex before matching while isProtectedToken does not, so the two layers fight over one matcher object. Consequence: DB_PASSWORD=ACME_ABCDEF_0001 is redacted to DB_PASSWORD=CRG_... instead of being preserved, and the verdict depends on call order.",
+      "impact": "ownership/policy inconsistency + deployment correctness. A shared registry built once at startup gives different results than one built per request. No confidentiality leak: the failure direction is over-redaction. An EXACT registration is unaffected.",
+      "status": "open",
+      "reproduce": "node --test test/adversarial/registry.test.js (tests R2-REG-001)",
+      "control": "an equivalent non-stateful matcher (/ACME_[A-Z0-9_]+/) preserves the token correctly, which locates the defect in how the matcher is used rather than in the registry's purpose"
+    }
+  ]
+}

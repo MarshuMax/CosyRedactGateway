@@ -1746,6 +1746,94 @@ const expected = profile[infra.infraType] === INFRA_DISPOSITION.PRESERVE ? "pres
 
 硬编码矩阵会让测试变成 policy 的**第二份会漂移的副本**，而不是对 policy 的检查。
 
+## 9.29 R2 Adversarial Exploration（进行中）
+
+### R1 与 R2 的边界
+
+```
+R1 = 已知 property → 证明它始终成立
+R2 = 不预设具体 bug → 主动寻找 property / parser / representation 之间的组合裂缝
+```
+
+R2 允许三类搜索：**mutation**（局部变异）、**combinatorial composition**（两个各自合法的机制组合）、**metamorphic / differential**（改变"不该影响安全语义"的表示，看结果是否不合理变化）。
+
+**暂不做**（留给 R3）：大体积性能压测、ReDoS 时间阈值、MB 级 corpus、长时间随机跑。
+
+### Finding 门槛（四条同时满足）
+
+```
+A 可重复       固定 seed / 输入 / 配置下 100% 重现
+B 可最小化     能给出 minimal reproducer
+C 可归因       能指出违反了哪条 contract / invariant
+D 有实际后果   confidentiality / integrity / availability /
+               ownership-policy inconsistency / protocol corruption / deployment correctness
+```
+
+只有"输出和我想象的不一样" ⇒ **observation，不是 finding**。
+
+**流程固定**：discover → minimize → prove violated contract → add isolated RED regression → classify severity/root cause → 再决定是否修。**看到红测不马上改生产代码。**
+
+**找到第一个可靠 finding 即停止该类别 fuzz**，不一口气找 17 个红点一起改——因为很可能是 1 个 root cause，而这正是本 session 反复出现错误归因的根源。
+
+### corpus 形式
+
+```
+test/adversarial/
+  registry.test.js          已建
+  streaming.test.js         R2.2
+  parser-collision.test.js  R2.3
+  span-collision.test.js    R2.4
+  representation.test.js    R2.5
+  operand.test.js           R2.6
+test/adversarial/corpus/
+  findings.json             只有最小化后的 finding
+```
+
+每类有 derived seed（`REGISTRY 0x2e610001` …），每类 500~2000 case。**R2 的价值来自定向组合，不来自随机次数。**
+
+## 9.29.1 R2-REG-001（open，未修）
+
+**一条 finding：stateful matcher 让 ownership 判定交替。**
+
+**最小复现**（只有一个 registry、一个 matcher、一个 token）：
+
+```js
+const pattern = /ACME_[A-Z0-9_]+/g;
+const r = new ForeignTokenRegistry([{ name: "acme", pattern }]);
+r.namespaceOf("ACME_ABCDEF_0001")  // acme, null, acme, null, ...
+```
+
+根因：`RegExp.prototype.test` 在 `g`/`y` 匹配器上会推进 `lastIndex`，而 `normalizeForeignNamespace` **原样保留传入的 RegExp**（不剥 flag），`namespaceOf` 也不复位。更关键的是**两层互相干扰**：
+
+```
+classifyOwnership  匹配前复位 lastIndex
+isProtectedToken   不复位
+```
+
+于是同一个 registration 的判定**取决于调用顺序**：
+
+```
+#0  classifyOwnership=FOREIGN_REGISTERED  isProtectedToken=false
+#1  classifyOwnership=UNKNOWN             isProtectedToken=true
+```
+
+**实际后果**：输入方向上 `DB_PASSWORD=ACME_ABCDEF_0001` 被**脱敏**而不是保留：
+
+```
+non-global matcher → spans=[]          → kept      ✅
+/g 或 /y matcher   → spans=[binding]   → redacted  ❌
+```
+
+**影响分类**：ownership/policy inconsistency + deployment correctness。**无 confidentiality 泄漏**（失败方向是过度脱敏）。**exact registration 不受影响**（`namespaceOf` 先查 `tokens` 直接返回）。
+
+**控制组**：等价的无状态匹配器 `/ACME_[A-Z0-9_]+/` 正确保留 token ⇒ 缺陷在**匹配器的使用方式**，不在 registry 的设计目的。
+
+### 本轮记录的 observation（**不是** finding）
+
+1. **repeated occurrence 的 index 恒指向第一处**：`text.indexOf(f)` 对重复值返回首位（`[0,11,0]` vs 真实 `[0,11,22]`）。当前该 index 只用于**存在性判定**（`foreign.includes(found)`），位置未被消费，故无后果。若将来有人用它定位内容，这条会变成真缺陷。
+2. **capture group matcher 按 full match 求值**（`.test()` 忽略分组）。正确，记录以免读者误以为用 group。
+3. **exact registration 完全绕过 matcher**，因此免疫该状态问题——这条界定了影响范围。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
