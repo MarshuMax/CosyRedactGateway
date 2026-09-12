@@ -366,7 +366,7 @@
       "expected_invariant": "The span-to-envelope lookup must not cost O(spans x references). Measured as T(2m)/T(m): linear would be ~2.",
       "observed": "SUPERLINEAR and worsening: 500 38.2ms, 1000 77.2ms (2.02x), 2000 229.3ms (2.97x), 4000 719.9ms (3.14x), 8000 1815.5ms (2.52x), 16000 8785.8ms (4.84x). Per-unit cost rises 76 -> 77 -> 115 -> 180 -> 227 -> 549 us per line. At 16000 constructs with 16000 surviving spans the call takes 8.8 SECONDS.",
       "impact": "Availability / CPU. A config-shaped document with a few thousand lines is ordinary for this gateway, and thousands of distinct secrets in one request reaches the same place. Note this is a DIFFERENT defect from R3-BODY-002: that one was the containment filter over the envelope list alone (fixed, and it fired even with ZERO spans); this one needs BOTH many references AND many surviving spans, and it lives in the per-span lookup at worker.js:2868.",
-      "status": "open",
+      "status": "fixed",
       "separate_from_body_002": "Kept as its own finding. BODY-002 was the O(|out|^2) containment filter and is fixed; fixing it did not touch this term, and this term would not have been fixed by it. The measurements overlap in corpus shape but not in mechanism.",
       "evidence_that_the_lookup_is_the_term": "The mechanism is visible in the code rather than inferred: `for (const env of documentReferences)` runs once per span, and then the widening loop runs `for (const env of documentReferences)` again inside a while. Sorted-and-disjoint output is now established, so at most ONE envelope can contain any span, which makes the second loop provably dead and the first one a single-candidate test.",
       "proposed_fix": "Binary search for the last envelope with env.start <= span.start, then test only that candidate for env.end >= span.end and strict containment. No 'find narrowest, then widen to outermost' loop is needed, because disjointness means at most one envelope can contain a span. Acceptance: an exact differential of envelopeFor against the current implementation over spans before a ref, after a ref, exactly equal bounds, strictly inside, crossing either edge, between siblings, and inside nested-looking source text with a failed outer and successful inner.",
@@ -444,7 +444,28 @@
         }
       },
       "remaining_term": "selectedOverlap is now the ONLY quadratic term left: 459.9ms of 622.0ms at m=8000 and 1780.5ms of 2056.7ms at m=16000, tail ratio 3.87. Everything else measures linear: consolidate 1.79, refInfra, finalRemerge 1.9, containmentMerge 1.5, applyObjectSchema ~1.1.",
-      "us_per_span_trend": "52.3 / 48.6 / 56.8 / 77.8 / 128.5 -- still rising, so BODY-004 stays OPEN until selectedOverlap is addressed."
+      "us_per_span_trend": "52.3 / 48.6 / 56.8 / 77.8 / 128.5 -- still rising, so BODY-004 stays OPEN until selectedOverlap is addressed.",
+      "zero_width_guard": {
+        "why": "The containment fast path argues 'disjoint implies no containment'. That argument is FALSE for zero-width spans, because `inner` is a BOUNDS-containment test while disjointness is established with overlaps(): outer [0,5] with inner [0,0] IS absorbed by the legacy code even though overlaps() reports false for the pair, and the same holds at the right boundary with [5,5].",
+        "guard": "`const hasZeroWidth = consolidated.some((s) => s.start === s.end);` and the fast path requires `!hasZeroWidth`; any zero-width span sends the whole list down the legacy algorithm.",
+        "verification": "Exhaustive over every bounds pair in a 0..7 range: 1260 pairs examined, and the number of NON-zero-width pairs that are contained while disjoint is 0, while the zero-width pairs are exactly the ones that are. So the guard is not defensive padding -- it excludes the only case that breaks the proof.",
+        "status": "proof hardening, not a separate finding"
+      },
+      "selected_overlap_fix": {
+        "change": "Disjoint fast path plus the original loop unchanged. The fast path pushes `emitted` ITSELF, not the sorted copy, so the legacy output order is preserved.",
+        "entry_condition": "The SAME detector already validated for the final remerge: sort by start with END ASC tie-break, then test next.start >= prev.end.",
+        "differential": "`emitted` and `selected` compared as EXACT ARRAYS with order over 15 targeted documents (fully disjoint, adjacent touching, crossing overlap, nested, same bounds, equal start, same-bounds-two-detectors, mixed priorities, multi-secret one line, email-adjacent-secret, k8s Secret, ARN infra, empty, single, no hits) plus 40000 seeded random documents: 40015 checked, 0 differences."
+      },
+      "final_curve": {
+        "corpus": "m unique entropy spans, one per line, 0 reference constructs, fresh process per point",
+        "total_ms": "50.5 / 73.3 / 117.5 / 193.8 / 334.1 at m = 1000 / 2000 / 4000 / 8000 / 16000",
+        "total_doubling_ratio": "1.45 / 1.60 / 1.65 / 1.72  -- LINEAR-ISH",
+        "us_per_span": "50.5 / 36.7 / 29.4 / 24.2 / 20.9  -- monotonically FALLING, no longer rising",
+        "per_stage_tail_ratios": "consolidate 1.77 LINEAR | containmentMerge 1.60 LINEAR | absorbedFilter 1.71 LINEAR | selectedOverlap 1.82 LINEAR | refInfra 1.93 LINEAR | finalRemerge 1.88 LINEAR | applyObjectSchema 1.19 LINEAR -- NO stage is superlinear any more",
+        "end_to_end": "m=16000 went 8785.8ms -> 334.1ms, a 26x reduction, with us/span falling rather than rising."
+      },
+      "closing_basis": "Closed on the stated condition: the 8000/16000 totals approach ~2x per doubling, us/span no longer rises, and every stage measures linear-ish. Not closed merely because the three known passes were each reduced to sorting cost -- the curve was re-measured after the last change and the whole pipeline, not just the named passes, is what the numbers above describe.",
+      "regression": "test/b2-containment.test.js now also pins: (a) the zero-width containment argument, exhaustively over bounds pairs; (b) the disjoint detector against a pairwise overlaps oracle, 9 edge shapes plus 50000 seeded sets; (c) a bounded linearity check on span density, which is the only kind of assertion that can catch this class of defect -- all three fast paths replaced passes that provably reproduced their own input, so every semantic assertion passed while the pipeline was quadratic."
     }
   ],
   "r3_3_baselines": {

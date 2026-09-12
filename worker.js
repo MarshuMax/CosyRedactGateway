@@ -2781,7 +2781,17 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // The check is O(n log n) and the fallback below is the ORIGINAL algorithm, untouched. This
   // deliberately does not attempt a general containment reduction: for overlapping input the old
   // semantics, including every attribution and inheritance rule, still decide the result.
-  const disjoint = (() => {
+  // A ZERO-WIDTH span breaks the "disjoint implies no containment" argument, because `inner` is a
+  // BOUNDS-containment test, not an `overlaps()` test:
+  //
+  //   outer [0,5], inner [0,0]  ->  old code absorbs [0,0], yet overlaps() reports false for them
+  //   outer [0,5], inner [5,5]  ->  same, at the right boundary
+  //
+  // So disjointness alone does not imply an empty `inner` set, and any zero-width span sends the
+  // whole list down the legacy path. Zero-width spans have not been observed in this codebase's
+  // corpora, but the fast path's correctness must not rest on that.
+  const hasZeroWidth = consolidated.some((s) => s.start === s.end);
+  const disjoint = !hasZeroWidth && (() => {
     if (consolidated.length < 2) return true;
     const byStart = consolidated.slice().sort((a, b) => a.start - b.start);
     for (let i = 1; i < byStart.length; i++) {
@@ -2867,8 +2877,32 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     && !(span.start === m.start && span.end === m.end));
   const emitted = merged.filter((m) => !isCoveredByMerged(m));
 
+  // Same disjoint fast path as the containment merge and the final remerge. When `emitted` is
+  // pairwise-disjoint under `overlaps()`, no span can be dropped, so the old loop provably yields
+  // `selected === emitted` in the same order -- after O(m^2) work.
+  //
+  // The entry condition is the SAME detector already validated for the final remerge: sort by start
+  // with END ASC as an explicit tie-break, then test `next.start >= prev.end`. It was proven against
+  // a pairwise !overlaps oracle over 13 zero-width edge shapes plus 200000 seeded sets, which matters
+  // here for the same reason: `overlaps()` has its own behaviour at equal starts and for zero-width
+  // spans, and a start-only test would not match it.
+  //
+  // The fast path pushes `emitted` itself, NOT the sorted copy -- the output order must stay the
+  // legacy one.
+  const selectedDisjointCheck = (() => {
+    const byStart = emitted.slice().sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 1; i < byStart.length; i++) {
+      if (byStart[i].start < byStart[i - 1].end) return false;
+    }
+    return true;
+  })();
+
   const selected = [];
-  for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
+  if (selectedDisjointCheck) {
+    selected.push(...emitted);
+  } else {
+    for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
+  }
   // A detector span inside a REFERENCE construct widens to the whole construct. The parser
   // reports `reference_value` as evidence and the binding candidate is filtered out (a
   // template is an indirection, not a secret), but the inner detectors still fire -- and a
