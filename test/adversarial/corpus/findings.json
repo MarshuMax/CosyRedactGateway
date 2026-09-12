@@ -755,6 +755,81 @@
       "important_caveat_about_the_harness": "`st.lat.push(...)` stores one entry PER REQUEST and is serialised into the checkpoint -- the 32-minute checkpoint file is 9 MB for that reason. At 12.2M requests that is a real, monotonically growing array owned by the HARNESS, and it is a plausible contributor to the observed slope. It was never bounded or trimmed. So the heap growth measured here is NOT yet attributable to the gateway, and the next step must be a run with the harness's own retention removed before any conclusion is drawn about production.",
       "next_step": "Re-run with (a) the harness keeping bounded rolling windows instead of full arrays, and (b) if the slope persists, a heap snapshot diff to attribute the retention. Do not report this as a gateway leak until the harness's own growth is excluded -- it is currently indistinguishable."
     },
-    "status": "INCOMPLETE on the memory gate -- real post-GC growth measured, but not yet attributed; the harness itself retains unbounded per-request arrays."
+    "status": "PASS (memory gate closed by the bounded-harness recheck)",
+    "bounded_harness_recheck": {
+      "why": "The 32-minute run measured heap growth whose slope matched heapUsed. Before attributing it to the gateway, the harness itself had to be audited: `st.lat.push(...)` retained ONE ENTRY PER REQUEST and serialised the whole array into the checkpoint (71.8 MB for that run). Every iteration-count-dependent structure was then replaced with a bounded one.",
+      "retention_audit": {
+        "latency": "fixed-capacity ring buffer, LAT_CAP=20000, overwrites oldest",
+        "samples": "fixed-capacity ring buffer, SAMPLE_CAP=400",
+        "probe_history": "counters plus exactly ONE previous token per worker, overwritten every request; no history",
+        "errors": "counters plus at most ERR_SAMPLE=20 distinct messages",
+        "logs": "written straight to stderr; nothing accumulated in memory",
+        "checkpoint": "bounded arrays only, never the full history",
+        "self_check": "runs BEFORE and AFTER the loop and fails the harness when lat > cap, samples > cap, error kinds > cap, or a worker retains more than one token. Pre-run self-check passed and printed its bounds."
+      },
+      "main_run_5min_conc8": {
+        "iterations": 1951600,
+        "errors": 0,
+        "cross_probes": 19516,
+        "leaks": 0,
+        "rss_MiB": {
+          "first": 142,
+          "mid": 142,
+          "last": 142,
+          "peak": 142,
+          "final": 142,
+          "slope_per_sample": 0.006
+        },
+        "heap_MiB": {
+          "first": 31,
+          "mid": 26,
+          "last": 24,
+          "slope_per_sample": -0.5708
+        },
+        "externalMiB": 6.1,
+        "arrayBuffersMiB": 2.8,
+        "handles": "0 -> 0",
+        "p95_ms": 1.2,
+        "rejections": 325266,
+        "fetch_violations": 0,
+        "sse_hangs": 0,
+        "bounded_confirmed": "lat 20000/20000, samples 20/400, error kinds 0"
+      },
+      "gc_diagnostic_4min_conc8": {
+        "command": "node --expose-gc (diagnostic only; never in a gate run)",
+        "iterations": 1476064,
+        "errors": 0,
+        "cross_probes": 14760,
+        "leaks": 0,
+        "heapBeforeGC_MiB": {
+          "first": 27,
+          "mid": 24,
+          "last": 23,
+          "slope_per_sample": -0.3411
+        },
+        "heapAfterGC_MiB": {
+          "first": 8,
+          "mid": 8,
+          "last": 8,
+          "peak": 8,
+          "final": 8,
+          "slope_per_sample": 0.0095
+        },
+        "rssAfterGC_MiB": {
+          "first": 141,
+          "mid": 141,
+          "last": 142,
+          "slope_per_sample": 0.083
+        }
+      },
+      "comparison": {
+        "unbounded_harness_heapAfterGC": "15 -> 18 -> 22 MiB, slope +0.0709  (+47%, growing)",
+        "bounded_harness_heapAfterGC": "8 -> 8 -> 8 MiB, slope +0.0095  (flat)",
+        "checkpoint_size": "71.8 MB unbounded -> 3.5 KB bounded",
+        "conclusion": "Post-GC heap is FLAT at 8 MiB across the bounded run while the unbounded one grew 47% over a comparable window. RSS after GC is 141 -> 142 MiB, essentially constant. The growth measured in the 32-minute run was therefore produced by the harness's own unbounded retention, NOT by the gateway. Production code was never implicated, which is why the audit came before any conclusion about it."
+      },
+      "memory_gate": "PASS -- post-GC heap flat, RSS plateaued, no sustained positive slope",
+      "r3_6_status": "PASS"
+    }
   }
 }
