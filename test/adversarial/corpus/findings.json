@@ -280,6 +280,25 @@
         "conclusion": "ms/MiB is essentially flat (239 -> 244) and every phase keeps the same share across a 4x size increase, so the scaling is healthy and the issue is a constant factor. Detectors are 99.3% of the work; JSON.parse is 0.4%. The single largest contributor is the gitleaks family at ~80%, within which the keyword pre-filter is the dominant term: ~1200 rules each running `lower.includes(keyword)` over the whole body. At 16 MiB that is ~6 GB/s of memory traffic, which is bandwidth-bound rather than algorithmically expensive -- hence linear with a large constant. referenceEnvelopes is a consistent 27-28% and is the known open R3-REDOS-002 family.",
         "next_step": "Optimising is now justified by measurement rather than by inspection, and the target is the gitleaks keyword pre-filter: one multi-pattern pass computing the set of keywords PRESENT, instead of one full-text scan per rule. Any such rewrite must be differential against the current collectGitleakSpans comparing start/end/ruleId AND ORDER, over overlapping keywords, prefix keywords, punctuation keywords, case folding, keyword-less rules and repeated keywords. NOT started in this round, and explicitly not as a giant regex."
       }
+    },
+    {
+      "id": "R3-BODY-002",
+      "seed": "n/a (deterministic corpus shape)",
+      "input": "parser-heavy config text: N lines of `service_i: { host: svc-i.internal, port: 1000+i, password: \"${VAULT_i}\" }` joined by newlines, wrapped in a request body",
+      "config": "default detectors; measured per detector in a FRESH process with the others disabled and structuredContext off",
+      "expected_invariant": "Cost must scale with input size. On a x4 size sequence a linear pass shows T(4n)/T(n) ~ 4.",
+      "observed": "SUPERLINEAR, and unlike R3-BODY-001 this is not a misread base -- the sequence is x4 and the ratios are 7.7 and 9.9, well above 4: gitleaks 222.3ms / 1377.8ms / 10632.3ms at 256K / 1M / 4M (1377.8 -> 10632.3 is 7.7x), highEntropy 201.0 / 1119.5 / 11039.1 (9.9x). Both detectors exceed 10 SECONDS at 4 MiB on this corpus. The same detectors measured on a 4 MiB body of plain 'x' cost 758ms and 477ms respectively, so the cost is a function of the INPUT SHAPE, not of detector setup or of size alone.",
+      "impact": "Availability / CPU, and worse than R3-BODY-001: a few hundred KiB of structured config text already costs seconds, and the linear-extrapolated 16 MiB cost is minutes. Config-shaped text is exactly what this gateway is expected to relay, so this is a realistic payload rather than a contrived one. No confidentiality impact.",
+      "status": "open",
+      "blocking": "R3.3 corpus B (parser-heavy) cannot be measured to 16 MiB until this is understood; the 8 MiB point already took 37 seconds and 16 MiB did not complete inside 60 seconds. Corpus A (clean) and the response-side corpora are unaffected and their baselines are valid.",
+      "localisation_so_far": {
+        "ruled_out": "The four structured-context parsers are LINEAR on this exact corpus: at 4 MiB parseBindings 39.0ms, parseYamlBindings 103.6ms, parseHeaderBindings 18.4ms, parseUrlBindings 1.7ms -- 163ms total, which cannot explain 10 seconds.",
+        "ruled_out_2": "JSON.parse is 0.4% of the work on the clean corpus and the same order here.",
+        "suspected": "Something inside the detector loops that is sensitive to the NUMBER of alphanumeric blocks or of candidate matches rather than to byte count. The corpus produces ZERO spans (G=0, entropy=0, binding=0), so the merge and the token path are not involved at all -- this is entirely inside the two detector functions. For highEntropy the natural candidate is the per-block scoring path (tokenizeBlocks plus shannonEntropy/entropyScore per block) and for gitleaks the candidate post-filtering path, but NEITHER has been measured yet and this record explicitly does not claim either.",
+        "measurement_caveat": "Enabling ALL detectors measured FASTER than gitleaks alone on the same corpus (9351ms vs 11184ms at 4 MiB). That is not possible for additive work and means the isolated single-flag numbers are themselves affected by something other than pure work -- most likely GC pressure and allocation behaviour differing with the total allocation volume. Every number here therefore needs re-measurement before it is used for a decision, and the ordering must not be read as a ranking."
+      },
+      "next_step": "Instrument inside the two detector functions on this corpus: count tokenizeBlocks output, time the per-block scoring loop, count candidate matches per rule, and time the post-match filtering. Fresh process per point. Then localise before any change -- the same rule that produced two wrong guesses this session already.",
+      "measurement_note": "Every point came from a separate process invocation with only one flag enabled. The corpus generator is deterministic and is recorded in full so the reproducer is exact."
     }
   ]
 }
