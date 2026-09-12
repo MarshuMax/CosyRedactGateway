@@ -357,6 +357,20 @@
       "regression": "Covered by the existing coverage and reference suites; the differential above is the acceptance evidence.",
       "config": "default detectors; corpus B (one reference construct per line, zero surviving spans)",
       "note_on_id": "The Phase 3 fast path, recorded as its own finding because it is a separate change from the Phase 1 filter deletion and neither implies the other."
+    },
+    {
+      "id": "R3-BODY-004",
+      "seed": "n/a (deterministic)",
+      "input": "m lines of `cfg_i: { svc: \"svc-i\", token: \"${VAULT_i}\", cred: \"<secret>\" }` -- one reference construct AND one surviving span per line, so envelopeFor() is genuinely called m times and each call scans m references",
+      "config": "gitleaks + highEntropy on; m from 500 to 16000",
+      "expected_invariant": "The span-to-envelope lookup must not cost O(spans x references). Measured as T(2m)/T(m): linear would be ~2.",
+      "observed": "SUPERLINEAR and worsening: 500 38.2ms, 1000 77.2ms (2.02x), 2000 229.3ms (2.97x), 4000 719.9ms (3.14x), 8000 1815.5ms (2.52x), 16000 8785.8ms (4.84x). Per-unit cost rises 76 -> 77 -> 115 -> 180 -> 227 -> 549 us per line. At 16000 constructs with 16000 surviving spans the call takes 8.8 SECONDS.",
+      "impact": "Availability / CPU. A config-shaped document with a few thousand lines is ordinary for this gateway, and thousands of distinct secrets in one request reaches the same place. Note this is a DIFFERENT defect from R3-BODY-002: that one was the containment filter over the envelope list alone (fixed, and it fired even with ZERO spans); this one needs BOTH many references AND many surviving spans, and it lives in the per-span lookup at worker.js:2868.",
+      "status": "open",
+      "separate_from_body_002": "Kept as its own finding. BODY-002 was the O(|out|^2) containment filter and is fixed; fixing it did not touch this term, and this term would not have been fixed by it. The measurements overlap in corpus shape but not in mechanism.",
+      "evidence_that_the_lookup_is_the_term": "The mechanism is visible in the code rather than inferred: `for (const env of documentReferences)` runs once per span, and then the widening loop runs `for (const env of documentReferences)` again inside a while. Sorted-and-disjoint output is now established, so at most ONE envelope can contain any span, which makes the second loop provably dead and the first one a single-candidate test.",
+      "proposed_fix": "Binary search for the last envelope with env.start <= span.start, then test only that candidate for env.end >= span.end and strict containment. No 'find narrowest, then widen to outermost' loop is needed, because disjointness means at most one envelope can contain a span. Acceptance: an exact differential of envelopeFor against the current implementation over spans before a ref, after a ref, exactly equal bounds, strictly inside, crossing either edge, between siblings, and inside nested-looking source text with a failed outer and successful inner.",
+      "not_yet_implemented": "Measurement only, per the instruction to prove a real problem before optimising. The problem is now proven; the fix is the next step."
     }
   ],
   "r3_3_baselines": {
