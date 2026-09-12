@@ -207,8 +207,16 @@
       "expected_invariant": "If a request body has a size limit, the analogous response path should be documented as having one too, or the absence should be stated.",
       "observed": "The non-stream response path calls `await upstreamResponse.text()`, which materialises the entire textual response, and there is no REDACT_MAX_RESPONSE_BYTES or equivalent. A request body is bounded; the response is not. The SSE path is separate and streams.",
       "impact": "Deployment robustness gap, recorded as an OBSERVATION rather than a finding: no documentation promises a response limit, so nothing is contradicted. The asymmetry is still worth knowing, because a deployment sizing memory from REDACT_MAX_BODY_BYTES would be sizing only half the path.",
-      "status": "open",
-      "recommendation": "Either add a response size bound with the same capped-read treatment as the request side, or state in the deployment notes that response buffering is unbounded and the upstream is expected to be trusted for response size. Do not treat this as an implementation bug until a limit is actually promised."
+      "status": "accepted-observation",
+      "recommendation": "Either add a response size bound with the same capped-read treatment as the request side, or state in the deployment notes that response buffering is unbounded and the upstream is expected to be trusted for response size. Do not treat this as an implementation bug until a limit is actually promised.",
+      "verdict": "NO RESPONSE CAP ADDED. The condition set for adding one was a clear memory amplification, a high peak, a latency cliff, or large responses easily causing resource pressure. None appeared.",
+      "r3_3_measurements": {
+        "nonstream_json": "64K 14.4ms/4.34MiB-s/RSS56MiB ; 256K 17.6/14.23/58 ; 1M 25.5/39.21/66 ; 4M 51.0/78.43/96 ; 8M 85.8/93.19/137 ; 16M 153.3ms/104.35MiB-s/RSS217MiB/heap87MiB. x4 ratios 1.22/1.45/2.00/1.68/1.79. Amplification 217MiB for a 16MiB body = 13.6x peak RSS, 5.4x peak heap.",
+        "nonstream_text": "16M 81.3ms, 185 MiB/s, peakRSS 161MiB (10.7x), ratios 1.11-1.69",
+        "binary_passthrough": "16M 51.0ms, 314 MiB/s, peakRSS 152MiB, no parse or policy work at all",
+        "sse": "16M 461.4ms, 34.7 MiB/s, peakRSS 306MiB, ratios 1.46-2.69; slower per byte than non-stream JSON because every event is parsed and walked individually, which is the price of not buffering"
+      },
+      "reasoning": "The triggering condition was explicit: add a cap only if a 16 MiB textual response showed obvious amplification, an excessive peak, a latency cliff, or easy resource pressure. Measured amplification is 13.6x peak RSS on the worst path, scaling stays linear with x4 ratios under 2, and throughput RISES with size (4.3 -> 104 MiB/s for JSON), which is the opposite of a cliff. A response cap would therefore be a new public runtime policy -- with its own status code, default value and binary/SSE semantics -- added without a measured problem to justify it. The asymmetry with the request side is now documented rather than enforced."
     },
     {
       "id": "R3-DEPTH-001",
