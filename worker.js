@@ -1171,18 +1171,43 @@ const REFERENCE_CONSTRUCTS = Object.freeze([
  * brace. A construct that never closes is not returned -- an unterminated `${` is ordinary
  * text and treating it as a boundary would widen a span over unrelated content.
  */
-export function referenceEnvelopes(text) {
+export function referenceEnvelopes(text, options = {}) {
+  // `maxWork` defaults to undefined = UNLIMITED, so the exported helper keeps its historical
+  // contract and every existing oracle/compatibility caller is unaffected. The production forward
+  // path passes a capped budget explicitly.
+  const maxWork = options.maxWork;
   if (typeof text !== "string" || text.length === 0) return [];
+  let work = 0;
+  const charge = (n) => {
+    work += n;
+    if (maxWork !== undefined && work > maxWork) {
+      throw new ReferenceWorkLimitError(`Reference scan work limit exceeded (${maxWork})`);
+    }
+  };
   const ordered = REFERENCE_CONSTRUCTS.slice().sort((a, b) => b.opener.length - a.opener.length);
   const out = [];
   let i = 0;
   while (i < text.length) {
+    charge(ordered.length); // the opener comparisons this position costs
     const found = ordered.find((c) => text.startsWith(c.opener, i));
     if (!found) { i++; continue; }
 
     if (found.simple) {
       // `%VAR%`, `<VAR>`, `{var}`: no nesting, and a name-only body, so a stray `%` in prose
       // or a stray `<` in a comparison cannot open a region.
+      //
+      // NOT charged, deliberately, and this is a KNOWN GAP rather than an oversight.
+      //
+      // indexOf may walk the whole remaining suffix, so a document with many UNCLOSED simple openers
+      // (e.g. one `%` per line) is ALSO quadratic, inside a native call. Charging the suffix length
+      // here would bound it -- but measurement showed the charge destroys the budget's
+      // discriminating power: legitimate corpora then reach work/len of 305 at 4 KiB rising to 4109
+      // at 64 KiB (measurably per-length, not constant), against the JS-loop attack's 1021, so no
+      // per-length factor separates them and ordinary documents containing percent signs would be
+      // refused.
+      //
+      // So this budget covers the JS balanced-scan class only. The simple-opener class needs its own
+      // treatment and is recorded as an open finding rather than papered over here.
       const end = text.indexOf(found.closer, i + found.opener.length);
       if (end < 0) { i++; continue; }
       const candidate = text.slice(i, end + found.closer.length);
@@ -1202,7 +1227,9 @@ export function referenceEnvelopes(text) {
     let owed = found.delimiter;
     let j = i + found.opener.length;
     let end = -1;
+    let scanned = 0;
     while (j < text.length) {
+      scanned++; // one unit per character the balanced scan advances
       if (text.startsWith(found.opener, j)) { owed += found.delimiter; j += found.opener.length; continue; }
       if (text[j] === "{" && found.closer.includes("}")) { owed++; j++; continue; }
       if (text[j] === found.closer[0]) {
@@ -1213,6 +1240,7 @@ export function referenceEnvelopes(text) {
       }
       j++;
     }
+    charge(scanned);
     if (end < 0) { i++; continue; }
     out.push({ start: i, end, opener: found.opener });
     i = end;
@@ -2969,7 +2997,9 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     return coverage ? coverage.attachTo(empty) : empty;
   }
 
-  const documentReferences = referenceEnvelopes(text);
+  // PRODUCTION CALL SITE: capped. The exported referenceEnvelopes() keeps an UNLIMITED default so
+  // oracles and compatibility callers are unaffected -- see the note on `maxWork` there.
+  const documentReferences = referenceEnvelopes(text, { maxWork: (deps.referenceWorkFactor || DEFAULT_REFERENCE_WORK_FACTOR) * text.length });
 
   // ---------------------------------------------------------------------------------------------
   // Binary-search lookup, correct ONLY because referenceEnvelopes() guarantees SORTED, PAIRWISE-
@@ -3101,6 +3131,37 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 }
 
 export class RedactionLimitError extends Error {}
+
+/**
+ * The reference scanner exceeded its deterministic work budget.
+ *
+ * Deliberately a SUBCLASS of RedactionLimitError: handleRequest already maps that to a 413 before
+ * the upstream fetch, so the production behaviour is reject-request, no forward, no output -- fail
+ * closed rather than a degraded redaction. A resource guard must never change the redaction
+ * AUTHORITY; it may only refuse the request.
+ */
+export class ReferenceWorkLimitError extends RedactionLimitError {}
+
+/**
+ * Work budget for the reference scanner, as a multiple of the document length.
+ *
+ * Calibrated, not guessed. Measured work/text.length, counting one unit per character the balanced
+ * scan advances plus the opener comparisons per position:
+ *
+ *   legitimate corpora (CONSTANT across sizes):  deeply nested 0.60, mixed families 3.98,
+ *                                                many siblings 4.44, config bindings 6.15,
+ *                                                sparse malformed 7.00   <- legitimate ceiling
+ *   adversarial (GROWS with size, so the total is quadratic):  1 secret + unclosed `{{`
+ *                                                1021 @4096, 4093 @16384, 16381 @65536
+ *
+ * The word CONSTANT is the load-bearing one: the factor is only usable because legitimate corpora
+ * sit still while the adversarial one grows. Only the JS balanced scan is charged -- see the note at
+ * the simple-opener branch for why charging indexOf would have destroyed that property.
+ *
+ * 64 gives legitimate input ~9x headroom while sitting 250x below the adversarial figure at 64 KiB,
+ * so the budget bites on pathological input long before it could inconvenience a real document.
+ */
+export const DEFAULT_REFERENCE_WORK_FACTOR = 64;
 
 /**
  * Coverage status of the region a span came from, if the caller collected coverage.
@@ -4274,6 +4335,7 @@ export async function handleRequest(request, env = {}, options = {}) {
   const maxBody=intSetting(env?.REDACT_MAX_BODY_BYTES,DEFAULT_MAX_BODY_BYTES);
   const maxRedactions=intSetting(env?.REDACT_MAX_REDACTIONS,DEFAULT_MAX_REDACTIONS);
   const maxDepth=intSetting(env?.REDACT_MAX_JSON_DEPTH,MAX_JSON_DEPTH);
+  const referenceWorkFactor=intSetting(env?.REDACT_REFERENCE_WORK_FACTOR,DEFAULT_REFERENCE_WORK_FACTOR);
   // Both of these are PROGRAMMATIC production inputs, not test-only knobs, and both were
   // missing here. The consequences were easy to miss because each feature looked wired:
   //

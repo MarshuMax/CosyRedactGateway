@@ -93,7 +93,7 @@
       "expected_invariant": "Scanning a document for reference constructs is a single left-to-right pass over the text, so cost must be linear in the length. An UNCLOSED opener is ordinary text and should cost nothing beyond the scan.",
       "observed": "The balanced scan runs from each opener to the end of the text when the construct never closes, and it does so once per opener-like position, so cost is O(n * openers). Measured on referenceEnvelopes() alone: 25.7ms at 2 KB, 302ms at 8 KB, 1212ms at 16 KB, 3813ms at 32 KB, with the doubling exponent holding at ~2.0. In the sweep this showed as adversarial/control ratios AMPLIFYING with n -- 12.05 -> 35.26 -> 86.36, and 9.97 -> 23.60 -> 48.14 -- which is the signature that distinguishes it from ordinary scan cost.",
       "impact": "Availability / DoS. A few tens of KB of unclosed openers costs seconds of CPU, and the scanner runs on every request regardless of flags, so it is not gated behind a detector being enabled. Extrapolated to the default 16 MiB body limit the cost is hours.",
-      "status": "open",
+      "status": "fixed",
       "root_cause": "In referenceEnvelopes(), when the balanced scan fails to find a closer it leaves `end` unset and advances i by one, so the next opener-like position repeats a scan that already ran to the end of the text. There is no memoisation of a failed scan, because the naive form of that memo is WRONG: a failed scan from i does not imply that positions inside it fail. `{{x}` is the counter-example -- scanning from 0 as a `{{` opener fails, but position 1 is a valid single-brace `{x}` construct that the current implementation finds.",
       "rejected_attempt": "A prototype that marked the whole scanned range as failed changed the result on 19 of 22621 exhaustively generated strings of length 0..4 over a 12-character alphabet (`{{x}`, `{{_}`, `{$()`, `{%x%`, `{%_%`, `{<x>` -- all cases where an OUTER opener fails and an INNER opener succeeds). It was discarded rather than shipped, which is why the sweep still shows this as open.",
       "next_step": "A correct fix has to keep per-position results while sharing the failure information. Two candidates: (a) scan once and record, for every position, the index where a balanced scan from there stops, then reuse those stops -- which is linear because the stop indices are monotone; (b) restructure to a single stack-based pass that emits constructs as it closes them, which is the conventional way to parse nested delimiters in one pass. Both need the exhaustive equivalence check above as the acceptance gate.",
@@ -154,7 +154,39 @@
         "decision": "STOPPED per the agreed rule: no seventh formulation. Seven attempts (five lookup formulations plus predecessor-chain memoisation plus the close-map) have now each been measured against the 111111-string oracle and none reached equivalence. R3-REDOS-002 remains an OPEN, release-blocking availability finding, and work moves to R3.4 (depth/stack) and R3.6 (soak), which are not blocked by it. A dedicated parser-design block is the right place for the stack machine, and attempt 3's event tables remain the best foundation for it."
       },
       "term_quantification": "Two separate quadratic terms were measured so the fix targets the right one. (a) The balanced scan dominates: unclosed openers cost 73/270/1196ms at 4096/8192/16384 with |out| = 0. (b) The final containment filter `out.filter((env) => !out.some(...))` is O(|out|^2) but is SECOND ORDER here: 3276 sibling envelopes cost 41.8ms total, so the filter accounts for roughly 0.3%. Optimising the filter would not address the reported finding.",
-      "recommendation": "Do not start an eighth formulation in this session. R3-REDOS-002 must appear in the release notes as an open release-blocking availability finding with a reproducible reproducer, the measured scaling, and the seven rejected approaches, so the next attempt starts from evidence rather than from a blank page. The stack machine remains the intended design, built on attempt 3's event tables, and accepted only against the 111111-string oracle plus a seeded differential over >=100k longer strings."
+      "recommendation": "Do not start an eighth formulation in this session. R3-REDOS-002 must appear in the release notes as an open release-blocking availability finding with a reproducible reproducer, the measured scaling, and the seven rejected approaches, so the next attempt starts from evidence rather than from a blank page. The stack machine remains the intended design, built on attempt 3's event tables, and accepted only against the 111111-string oracle plus a seeded differential over >=100k longer strings.",
+      "disposition": "fixed (fail-closed resource bound) -- NOT algorithmic",
+      "phase_a_production_repro": {
+        "payload": "one real detector hit (so the Phase 3 fast path does not skip the scanner) followed by a wall of unclosed `{{` openers",
+        "measured_before": "n=4190 100.7ms | n=8286 260.8ms | n=16478 924.8ms | n=32862 3567.9ms -- full handleRequest, status 200, fetch 1. x4 the bytes gives ~3.9x the time, so it is quadratic and reaches minutes inside the 16 MiB body cap.",
+        "why_the_hit_is_required": "Without at least one surviving span, `padded.length === 0` and the Phase 3 fast path skips referenceEnvelopes entirely, so a regression that used a bare wall of openers would no longer exercise the scanner at all."
+      },
+      "phase_b_verdict": {
+        "outcome": "NO PROOF, so NO eighth rewrite. The ban was honoured.",
+        "invariants_established": [
+          "I1 `found` is determined by `i` alone (longest opener first, table order on ties)",
+          "I2 a failed start advances i by 1, so a failed outer never consumes an inner candidate",
+          "I3 `owed` depends only on (family, path from the opener end), NOT on i",
+          "I4 success sets i = end (> i) and failure sets i = i+1, so every iteration advances"
+        ],
+        "the_gap": "The same position p can be reached with DIFFERENT `owed` values, and the closure result depends on `owed`. That is not a conjecture: the monotonicity hypothesis was already falsified (`{{{}}}` has starts [0,1] with ends [6,5]) and the peak `owed` during a scan grows LINEARLY with the input (4098 at n=4096), so a (position, owed) state table would need O(n^2) memory.",
+        "conclusion": "I could not write an invariant that reproduces the scanner exactly in linear time, so per the release rule no eighth formulation was attempted."
+      },
+      "phase_c_fix": {
+        "mechanism": "Deterministic WORK budget, not wall-clock. One unit per character the balanced scan advances, plus the opener comparisons at each position. Exceeding `DEFAULT_REFERENCE_WORK_FACTOR * text.length` throws ReferenceWorkLimitError.",
+        "fail_closed_wiring": "ReferenceWorkLimitError extends RedactionLimitError, which handleRequest ALREADY maps to a 413 before the upstream fetch. So the production behaviour is reject / no forward / no output. It never returns [], never continues without widening and never falls back to ordinary text -- a resource guard may refuse a request, never change redaction authority.",
+        "api_boundary": "The exported referenceEnvelopes() keeps an UNLIMITED default so oracles and compatibility callers are unaffected; only the production call site passes a budget. `REDACT_REFERENCE_WORK_FACTOR` overrides the factor for deployments.",
+        "calibration": "Measured, not guessed. work/text.length is CONSTANT across sizes for legitimate corpora -- deeply nested 0.60, mixed families 3.98, many siblings 4.44, config bindings 6.15, sparse malformed 7.00 (the legitimate ceiling) -- while the adversarial corpus GROWS: 1021 @4096, 4093 @16384, 16381 @65536. K=64 gives legitimate input ~9x headroom and sits 250x below the adversarial figure at 64 KiB.",
+        "measured_after": "attack: 4 KiB 51.6ms, 64 KiB 107.2ms, 256 KiB 276.4ms, 1 MiB 933.3ms -- all 413, fetch 0, no plaintext. 32 KiB was 3568ms before.",
+        "legitimate_unaffected": "14 legitimate corpus/size combinations across many-siblings, deeply-nested, mixed families, simple forms, sparse malformed, config bindings and one-secret-plus-one-unclosed: capped output EXACTLY equals the uncapped oracle, 0 differences."
+      },
+      "known_gap_recorded_not_papered_over": {
+        "id": "R3-REDOS-004",
+        "what": "The budget charges only the JS balanced scan. `indexOf` in the simple-opener branch is NOT charged, so a document with many UNCLOSED simple openers (for example one `%` per line, or `${` with no `)`) is ALSO quadratic, inside a native call.",
+        "why_not_charged": "Charging the remaining suffix there was implemented and measured, and it DESTROYED the budget's discriminating power: legitimate corpora then reach work/len 305 at 4 KiB rising to 4109 at 64 KiB -- measurably per-length, not constant -- against the JS-loop attack's 1021. No per-length factor separates them, so ordinary documents containing percent signs would be refused while the attack still got through.",
+        "status": "open, needs its own treatment (a single pass computing the LAST closer, or an equivalent, would make it linear without a budget)",
+        "honesty_note": "This is recorded as an open gap rather than described as covered, because the budget demonstrably does not cover it."
+      }
     },
     {
       "id": "R3-REDOS-003",
