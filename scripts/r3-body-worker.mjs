@@ -99,28 +99,47 @@ if (spec.side === "request") {
   await stageAsync("redactJson", () => redactJson(data, ctx, { gitleaks: true, highEntropy: true, email: true }));
   const out = stage("stringify", () => JSON.stringify(data));
   result = { bytesRead, outBytes: out.length, tokens: ctx.rawToToken.size };
-} else {
-  // Response side: the upstream body is already a string, then parse, policy, stringify.
-  const { applyResponsePolicy } = await import("../worker.js");
-  const ctx = new RedactionContext({ salt: "perf", maxRedactions: 1e9 });
-  if (kind === "binary" || kind === "text") {
-    const out = await stageAsync("passthroughText", async () => body);
-    result = { outBytes: out.length };
-  } else if (spec.sse) {
-    // SSE is streamed, so there is no whole-body parse.
-    const { restoreSseStream } = await import("../worker.js");
-    const event = `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: body.slice(0, 4096) })}\n\ndata: [DONE]\n\n`;
-    const out = await stageAsync("sse", async () => new Response(restoreSseStream(new Response(event).body, ctx)).text());
-    result = { outBytes: out.length };
-  } else {
-    const text = await stageAsync("readText", async () => body);
-    const data = stage("jsonParse", () => JSON.parse(text));
-    await stageAsync("applyResponsePolicy", async () => applyResponsePolicy(data, ctx, null, null));
-    const out = stage("stringify", () => JSON.stringify(data));
-    result = { outBytes: out.length };
+} else if (spec.sse) {
+  // SSE: build a stream of delta events whose deltas total the target size, then drive it through
+  // handleRequest so restoreSseStream, streamFields and the per-event policy all run for real.
+  const CHUNK = 8192;
+  const payload = "streamed assistant text ".repeat(Math.ceil(bytes / 24)).slice(0, bytes);
+  const events = [];
+  for (let at = 0; at < payload.length; at += CHUNK) {
+    events.push(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: payload.slice(at, at + CHUNK) })}\n\n`);
   }
+  events.push("data: [DONE]\n\n");
+  const streamBody = events.join("");
+  const request = new Request("https://p/H$https://api.example/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY" }] }),
+  });
+  const out = await stageAsync("handleRequest", async () => {
+    const res = await handleRequest(request, {}, {
+      fetchImpl: async () => new Response(streamBody, { headers: { "content-type": "text/event-stream" } }),
+      salt: "perf",
+    });
+    return (await res.text()).length;
+  });
+  result = { outBytes: out, events: events.length - 1 };
+} else {
+  // RESPONSE SIDE, non-stream. Driven through handleRequest so the measured cost is the REAL path
+  // -- an earlier version built the response object inline and skipped restoreNonStreamResponse
+  // entirely, which reported 0.2ms of policy work and hid the whole pipeline.
+  const contentType = kind === "binary" ? "application/octet-stream" : kind === "text" ? "text/plain" : "application/json";
+  const request = new Request("https://p/H$https://api.example/v1/chat/completions", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY" }] }),
+  });
+  const out = await stageAsync("handleRequest", async () => {
+    const res = await handleRequest(request, {}, {
+      fetchImpl: async () => new Response(body, { headers: { "content-type": contentType } }),
+      salt: "perf",
+    });
+    return (await res.text()).length;
+  });
+  result = { outBytes: out };
 }
-
 clearInterval(sampler);
 const m = process.memoryUsage();
 if (m.rss > peakRss) peakRss = m.rss;
