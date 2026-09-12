@@ -7,7 +7,9 @@
   "scripts": {
     "test": "node --test",
     "start": "node node-server.mjs",
-    "entropy-report": "node scripts/entropy-report.mjs"
+    "entropy-report": "node scripts/entropy-report.mjs",
+    "perf": "node scripts/perf.mjs",
+    "perf:soak": "node scripts/perf.mjs --soak"
   },
   "engines": {
     "node": ">=20"

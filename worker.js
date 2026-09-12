@@ -2780,8 +2780,38 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     };
   });
 
+  // Memoised on the BOUNDS, so a shared bounds pair yields exactly one envelope object. Without
+  // this, enclosingReference() re-scanned the whole document for EVERY span, which measured as
+  // O(spans x text) and dominated the whole call: at 800 spans it walked 12.7M bytes.
+  //
+  // Keying on the bounds also matters for CORRECTNESS of the optimisation: two spans that converge
+  // on the same envelope must receive the same object, or attribution could depend on how many
+  // candidates happened to land there.
+  const documentReferences = referenceEnvelopes(text);
+  const envelopeFor = (span) => {
+    // Same selection rule as enclosingReference(): the narrowest construct that STRICTLY contains
+    // the span, then widened to the outermost one that contains that.
+    let best = null;
+    for (const env of documentReferences) {
+      if (env.start <= span.start && env.end >= span.end && (env.start < span.start || env.end > span.end)) {
+        if (!best || (env.end - env.start) < (best.end - best.start)) best = env;
+      }
+    }
+    let widened = best;
+    let changed = true;
+    while (widened && changed) {
+      changed = false;
+      for (const env of documentReferences) {
+        if (env.start <= widened.start && env.end >= widened.end && (env.end - env.start) > (widened.end - widened.start)) {
+          widened = env;
+          changed = true;
+        }
+      }
+    }
+    return widened;
+  };
   const enveloped = padded.map((span) => {
-    const env = enclosingReference(text, span.start, span.end);
+    const env = envelopeFor(span);
     if (!env) return span;
     return {
       ...span,
