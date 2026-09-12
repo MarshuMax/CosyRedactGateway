@@ -209,6 +209,20 @@
       "impact": "Deployment robustness gap, recorded as an OBSERVATION rather than a finding: no documentation promises a response limit, so nothing is contradicted. The asymmetry is still worth knowing, because a deployment sizing memory from REDACT_MAX_BODY_BYTES would be sizing only half the path.",
       "status": "open",
       "recommendation": "Either add a response size bound with the same capped-read treatment as the request side, or state in the deployment notes that response buffering is unbounded and the upstream is expected to be trusted for response size. Do not treat this as an implementation bug until a limit is actually promised."
+    },
+    {
+      "id": "R3-DEPTH-001",
+      "seed": "n/a (deterministic)",
+      "input": "JSON.stringify({ model:'g', messages:[{role:'user',content:'hi'}], deep: <object chain of depth 2300> })  -- roughly 14 KB",
+      "config": "default deployment configuration; flags irrelevant (the overflow happens in the structural walk, before any detector)",
+      "expected_invariant": "The agreed R3.4 contract: depth <= 128 completes normally; beyond that a request may succeed OR be rejected in a CONTROLLED way; never a raw RangeError, uncaught exception, 500, or partial mutation.",
+      "observed": "handleRequest THROWS an uncaught RangeError ('Maximum call stack size exceeded') for a ~14 KB body, upstream fetch count 0. The recursion is redactJson's structural walk. Boundary measured on a FRESH node process, first call, three repetitions per point: 2200 ok, 2300 RangeError, for object chains, array chains and alternating chains alike. JSON.parse itself handles 2500 fine, so the limit is the gateway's own recursion rather than the JSON parser.",
+      "impact": "Availability / attacker-controlled 500. The trigger is ~14 KB of ordinary JSON, trivially inside the 16 MiB body cap and requiring no special characters. It fails CLOSED -- no upstream fetch, so no plaintext leaves the gateway -- and no confidentiality fail-open was found. Severity Medium by the R3.4 classification: a shallow attacker-controlled JSON reliably produces a production 500 rather than a clean refusal.",
+      "status": "open",
+      "contract_status": "The depth contract itself is SATISFIED and by a wide margin: 128 is required and 2200 works, 17x the requirement. What is violated is the SEPARATE invariant that a limit must be expressed as a controlled rejection rather than a raw exception. These are two different claims and should not be conflated -- the second is fixable without touching the first.",
+      "measurement_note": "The boundary is only reproducible on the FIRST call in a fresh process. Ten sequential calls in one process gave four RangeErrors followed by six successes, because V8's stack check and tiering change after the function has overflowed once. Any depth figure quoted from a warmed-up process is meaningless; every data point here came from a separate `node` invocation.",
+      "recommendation": "Add ONE structural depth guard shared by all four recursive paths -- redactJson, restoreJson, applyOperandPolicy, restoreCompleteStrings -- rather than four independently invented limits. Placed at the entry point it also saves doing the parse-and-walk work before refusing. A limit around 512 would be 4x the required 128 and far below the measured 2200, so it cannot refuse anything the contract requires. NOT implemented yet: the boundary is high, the failure is fail-closed, and where a guard belongs is a design decision rather than a defect repair.",
+      "regression": "test/r34-depth.test.js -- depth 1/32/64/128 on the request path and the SSE path for object, array and alternating chains; the restore path reaching a leaf 128 deep; depth-invariant output semantics against a shallow equivalent; non-string values and container shape unchanged at 128; a 512 margin check; and a shared-depth assertion so a future guard cannot become four separate limits."
     }
   ]
 }
