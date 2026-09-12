@@ -384,7 +384,29 @@
         "conclusion": "The reference machinery is about 3% of the cost. The dominant term is the SPAN side: a corpus of 8000 unique secrets with NO reference constructs at all costs 1967.9ms by itself.",
         "narrowed_further": "Per-flag on 8000 unique secrets with no references: highEntropy 1528.3ms producing all 8000 spans; gitleaks 43.4ms producing 0; no detectors 13.6ms. And RedactionContext.redactText on the same text alone is 142.4ms at 2000 and 1343.1ms at 8000 -- a 4x input step giving 9.4x time. So the term is inside entropy scoring and/or the text-redaction pass, NOT the envelope lookup.",
         "this_supersedes": "My earlier claim, written from reading the code rather than measuring, that the per-span `for (const env of documentReferences)` scan was the dominant term. It was plausible and wrong; the ablations above are what establish the real location."
-      }
+      },
+      "stage_isolation": {
+        "corpus": "m lines of `cfg_i: { cred: \"<unique secret>\" }` -- 8000 unique secrets, ZERO reference constructs, 8000 surviving spans. Fresh process per point.",
+        "method": "Instrumented every stage of findSensitiveSpans with lap timers. `detectors+pre` is computed as total MINUS the sum of the measured stages, so an unmeasured dominant term could not hide.",
+        "measured_ms": {
+          "m1000": "total 57.4 | consolidate 10.8 | containmentMerge 21.9 | absorbedFilter 0.1 | selectedOverlap 11.6 | padding 0.0 | refInfra 12.9 | detectors+pre 0.0",
+          "m2000": "total 179.6 | consolidate 20.5 | containmentMerge 90.7 | absorbedFilter 0.4 | selectedOverlap 32.9 | padding 0.0 | refInfra 35.0 | detectors+pre 0.0",
+          "m4000": "total 616.8 | consolidate 38.9 | containmentMerge 336.2 | absorbedFilter 0.7 | selectedOverlap 120.8 | padding 0.0 | refInfra 120.2 | detectors+pre 0.0",
+          "m8000": "total 1978.1 | consolidate 72.6 | containmentMerge 1002.9 | absorbedFilter 1.9 | selectedOverlap 458.7 | padding 0.0 | refInfra 442.0 | detectors+pre 0.0"
+        },
+        "tail_ratios_T2m_over_Tm": {
+          "containmentMerge": "4.14 then 4.22  -- QUADRATIC, and 51% of the total at m=8000",
+          "selectedOverlap": "3.67 then 3.80  -- superlinear, 23%",
+          "referenceAndInfra": "3.43 then 3.68  -- superlinear, 22%",
+          "consolidate": "1.90 then 1.87  -- LINEAR",
+          "absorbedFilter": "linear, negligible"
+        },
+        "primary_term": "containmentMerge, at worker.js:2769: `for (const span of byPriority) { const inner = byPriority.filter(...) }` -- a full filter over all spans for every span. 1002.9ms of the 1978.1ms total at m=8000, scaling 4.22x per doubling.",
+        "structuredContext_control": "Run as instructed. m=8000 with structuredContext:true is 1886.0ms against 1978.1ms with it false -- about 5% apart, with containmentMerge at 894.8 vs 1002.9. So the difference is small and the priority is the merge/overlap passes, which is the second branch of the decision rule. An earlier suspicion that the structured parsers were involved is now excluded by measurement.",
+        "coverageStatusForSpan_excluded": "worker.js:3018. It does `spans.coverage?.attempts` and returns null when there is no attempts array, so the `attempts.find(...)` per span never executes unless coverage was collected. It is a genuine O(spans x attempts) candidate the moment coverage IS enabled, and is recorded as such, but it is not this finding's term.",
+        "referenceAndInfra_needs_its_own_split": "It is the SECOND largest term at 22% and it is superlinear (3.68x), yet this corpus contains ZERO reference constructs -- so the cost here is not reference lookup. The reference half can contribute at most the empty-list binary search. That leaves infra recognition, and it has not been split out yet."
+      },
+      "next_step": "Fix the primary term (containmentMerge) with a minimal semantics-preserving reduction, accepted by an exact-array differential, then re-measure the same curve. Then split referenceAndInfra."
     }
   ],
   "r3_3_baselines": {
