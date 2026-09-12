@@ -556,5 +556,33 @@
       "not_a_regression": "The failure could not be reproduced in three isolated runs or in a full re-run, and the corpus in question is unrelated to the change under test (a corpus record was added; no production code changed in that commit).",
       "guidance": "Treat a single timing-assertion failure in a parallel run as a FLAKE until it reproduces in isolation. Do not loosen the threshold to make it pass, and do not treat it as evidence of a regression: re-run the file alone first. The heavy sweeps belong in `npm run perf*`, which run one case per process by design."
     }
+  },
+  "reference_family_sweep": {
+    "status": "PASSED -- reference subsystem frozen, production code frozen",
+    "criterion_1_balanced_malformed": {
+      "requirement": "real surviving span + over-budget balanced scan -> 413, fetch=0, bounded runtime",
+      "measured": "4096 50.9ms | 16384 27.5ms | 65536 54.3ms | 262144 200.1ms | 1048576 811.0ms -- all status 413, fetch 0, no plaintext",
+      "verdict": "PASS. Bounded: 1 MiB costs 811ms where the unguarded scanner reached 3.6s at 32 KiB."
+    },
+    "criterion_2_simple_malformed": {
+      "requirement": "`<` and isolated `{` families stay linear-ish and SUCCEED (200 / fetch=1)",
+      "measured": "repeated `<` 9.5 / 9.1 / 11.0 / 17.7ms at 4K / 16K / 64K / 256K; isolated `{` 3.7 / 7.4 / 18.2 / 69.9ms",
+      "verdict": "PASS. Both answer 200 with fetch 1, and the growth per 4x step is far below quadratic. Confirms the R3-REDOS-004 fix is algorithmic rather than a rejection."
+    },
+    "criterion_3_valid_references": {
+      "requirement": "exact 0 diff against the uncapped oracle",
+      "measured": "24 corpus/size combinations (many siblings, deeply nested, mixed families, simple forms, sparse malformed, config bindings, adjacent simple, one closer shared by many invalid openers) at 4K / 64K / 256K: capped output identical to uncapped, 0 differences",
+      "verdict": "PASS"
+    },
+    "criterion_4_full_suite": {
+      "measured": "446 tests / 446 pass, 8.9s",
+      "verdict": "PASS"
+    },
+    "criterion_5_mixed_production": {
+      "requirement": "one request carrying a legal reference + malformed balanced + malformed simple + a real secret span must still fail closed",
+      "measured": "67791 bytes -> 413, fetch 0, no plaintext, nothing forwarded; the CONTROL with the malformed balanced part removed and everything else identical answers 200 with fetch 1 and no plaintext",
+      "verdict": "PASS. The control matters as much as the refusal: it shows the 413 comes from the malformed balanced region and not from the mixed payload being refused wholesale."
+    },
+    "note": "From this round on, no new theoretical optimisations are pursued. Only problems actually exposed by the sweep or the soak are handled."
   }
 }
