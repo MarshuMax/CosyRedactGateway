@@ -969,6 +969,192 @@ function looksLikeReferenceValue(raw) {
 // attempted only for strings the ledger actually minted. Decoding arbitrary
 // base64-looking text would be a much larger误伤面 and is deliberately not done.
 
+// ----------------------------------------------------------- infra recogniser ---
+//
+// The recogniser CLASSIFIES. It never returns an action, never suppresses anything, and
+// never decides to preserve. Policy is a separate layer (see INFRA_POLICY below), which
+// keeps "what is this" and "what do we do with it" from becoming one entangled guess.
+//
+// Monotonic risk is the governing rule, and it has two halves:
+//
+//   HARD_SECRET may NOT be downgraded by INFRA evidence.
+//     A span that a deterministic credential detector matched stays a secret even if it
+//     also looks like a digest.
+//
+//   SOFT_SIGNAL may be suppressed by high-precision INFRA evidence.
+//     A 64-hex block that the entropy detector flagged, and which the OCI recogniser
+//     identifies as `sha256:<64 hex>`, is preserved.
+
+export const INFRA_TYPE = Object.freeze({
+  GIT_SHA: "GIT_SHA",
+  OCI_DIGEST: "OCI_DIGEST",
+  TRACE_ID: "TRACE_ID",
+  SPAN_ID: "SPAN_ID",
+  AWS_ACCOUNT_ID: "AWS_ACCOUNT_ID",
+  AWS_ARN: "AWS_ARN",
+  PRIVATE_IP: "PRIVATE_IP",
+  INTERNAL_HOSTNAME: "INTERNAL_HOSTNAME",
+  K8S_RESOURCE_NAME: "K8S_RESOURCE_NAME",
+  EC2_RESOURCE_ID: "EC2_RESOURCE_ID",
+});
+
+// Dispositions. Deliberately tiny for a first revision: only correlation identifiers
+// whose loss is what motivated this slice are preserved. Everything else is classified
+// but still redacted, because in some organisations account ids, ARNs, internal
+// hostnames and resource names are sensitive infrastructure metadata -- that call
+// belongs to a profile, not to a pattern matcher.
+export const INFRA_DISPOSITION = Object.freeze({
+  PRESERVE: "preserve",
+  MASK: "mask",
+  REDACT: "redact",
+});
+
+export const INFRA_POLICY = Object.freeze({
+  [INFRA_TYPE.GIT_SHA]: INFRA_DISPOSITION.PRESERVE,
+  [INFRA_TYPE.OCI_DIGEST]: INFRA_DISPOSITION.PRESERVE,
+  [INFRA_TYPE.TRACE_ID]: INFRA_DISPOSITION.PRESERVE,
+  [INFRA_TYPE.SPAN_ID]: INFRA_DISPOSITION.PRESERVE,
+  [INFRA_TYPE.AWS_ACCOUNT_ID]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.AWS_ARN]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.PRIVATE_IP]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.INTERNAL_HOSTNAME]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.K8S_RESOURCE_NAME]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.EC2_RESOURCE_ID]: INFRA_DISPOSITION.MASK,
+});
+
+const HEX32 = "[0-9a-fA-F]{32}";
+const HEX40 = "[0-9a-fA-F]{40}";
+const HEX64 = "[0-9a-fA-F]{64}";
+const HEX16 = "[0-9a-fA-F]{16}";
+const LB = "(?<![A-Za-z0-9_])";
+const RB = "(?![A-Za-z0-9_])";
+
+// Ordered by specificity: the first match wins, so `sha256:<64hex>` is not reported as a
+// bare git sha. Each entry declares its own `hard` flag -- `hard` means the SHAPE is
+// unambiguous rather than that the finding is dangerous.
+const rawInfraRules = [
+  // The whole span is captured, including an optional `sha256:` prefix, because the
+  // rule has to explain every byte it claims.
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}((?:sha256:)?${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.97 },
+  { type: INFRA_TYPE.AWS_ARN, re: /(?<![A-Za-z0-9_])arn:aws[a-z-]*:[A-Za-z0-9-]+:[A-Za-z0-9-]*:\d{0,12}:[^\s"',)]+/g, group: 0, hard: false, confidence: 0.9 },
+  { type: INFRA_TYPE.EC2_RESOURCE_ID, re: new RegExp(`${LB}(?:i|ami|vol|snap|subnet|sg|vpc|eni|rtb|acl)-[0-9a-f]{8,17}${RB}`, "g"), group: 0, hard: false, confidence: 0.85 },
+  // `hard` here means the SHAPE is unambiguous, not that the finding is dangerous: a fixed
+  // length with boundary assertions, and excluded from the longer digest/git-sha forms by
+  // the earlier rules. That is what makes suppressing an entropy-only hit safe. A secret
+  // that happens to be exactly this shape is still protected whenever a provider rule
+  // matches it, because hard secret evidence wins regardless (see decideSpanAction).
+  //
+  // Deliberately NOT hard: shapes that only narrow the odds (a 16-hex run, a 12-digit
+  // number, a bare 40-hex commit that could equally be a random token). Those are
+  // classified as INFRA but stay redacted until a profile opts in.
+  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, confidence: 0.6 },
+  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, anchor: /(?:trace[_-]?id|traceparent|trace)\s*[:=]/i },
+  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, confidence: 0.6 },
+  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, anchor: /(?:commit|git[_-]?sha|revision|rev)\s*[:=]?/i },
+  // Anchored AND hard. The anchor is what makes it safe: an unanchored 16-hex run is not
+  // claimed at all, because the shape is exactly a bank card's and releasing a card number
+  // is a far worse outcome than redacting a span id. With `span_id:` in front, the shape
+  // is doing the work the context already did.
+  { type: INFRA_TYPE.SPAN_ID, re: new RegExp(`${LB}(${HEX16})${RB}`, "g"), group: 1, hard: true, confidence: 0.9, anchor: /span[_-]?id\s*[:=]/i },
+  { type: INFRA_TYPE.AWS_ACCOUNT_ID, re: new RegExp(`${LB}(\\d{12})${RB}`, "g"), group: 1, hard: false, confidence: 0.5 },
+  // The ranges need DIFFERENT numbers of trailing octets, which is why the branches
+  // cannot share one tail: `10` fixes one octet (two more follow), while `192.168` and
+  // `172.16-31` fix two (one more follows). A single shared tail made `10.244.0.11`
+  // silently fail -- only the two-octet prefixes matched.
+  { type: INFRA_TYPE.PRIVATE_IP, re: new RegExp(`${LB}((?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|(?:192\\.168|172\\.(?:1[6-9]|2\\d|3[01]))\\.\\d{1,3}\\.\\d{1,3}))${RB}`, "g"), group: 1, hard: false, confidence: 0.8 },
+  // Sequential labels, each with its OWN quantifier. The previous form nested a `*`
+  // inside a `*` (`(?:[a-z0-9-]*)*`), which backtracks catastrophically: matching a
+  // 71-character hex digest against it ran past a 60-second timeout. This is ReDoS, and
+  // it also made the rule silently absorb inputs far longer than any hostname.
+  { type: INFRA_TYPE.INTERNAL_HOSTNAME, re: new RegExp(`${LB}((?:[a-z0-9][a-z0-9-]*\\.)+(?:internal|local|svc|svc\\.cluster\\.local|cluster\\.local))${RB}`, "g"), group: 1, hard: false, confidence: 0.8 },
+  { type: INFRA_TYPE.K8S_RESOURCE_NAME, re: new RegExp(`${LB}([a-z0-9][a-z0-9-]*-(?:[0-9a-f]{8,10}|[0-9a-f]{5})-[a-z0-9]{5})${RB}`, "g"), group: 0, hard: false, confidence: 0.7 },
+];
+
+const INFRA_RULES = rawInfraRules.map((rule) => ({
+  ...rule,
+  anchorRe: rule.anchor ? new RegExp(rule.anchor.source, rule.anchor.flags.replace("g", "")) : null,
+}));
+
+/**
+ * Classify a span's text as an infrastructure identifier.
+ *
+ * @returns {{entityClass: string, infraType: string, evidence: string[], confidence: number, hard: boolean}|null}
+ */
+/**
+ * Shape-ambiguous identifiers only qualify when the surrounding text names them. A bare
+ * 16-hex run is indistinguishable from a bank card number, and a bare 40-hex run from a
+ * random token, so those need an anchor rather than a guess.
+ */
+function hasAnchor(rule, context) {
+  if (!rule.anchor) return true;
+  if (!context) return false;
+  rule.anchorRe.lastIndex = 0;
+  return rule.anchorRe.test(context);
+}
+
+export function recogniseInfra(value, context = null) {
+  if (typeof value !== "string" || value.length < 8) return null;
+  // Hard variants are tried FIRST. Several types have both a soft shape and an anchored,
+  // hard variant (a bare 40-hex run versus `commit <40-hex>`), and table order meant the
+  // soft rule always won, so the anchor never had a chance to upgrade the finding.
+  const ordered = [...INFRA_RULES].sort((a, b) => Number(Boolean(b.hard)) - Number(Boolean(a.hard)));
+  for (const rule of ordered) {
+    if (!hasAnchor(rule, context)) continue;
+    rule.re.lastIndex = 0;
+    const m = rule.re.exec(value);
+    if (!m) continue;
+    const matched = m[rule.group ?? 0];
+    // A rule only claims the span when it explains the WHOLE span. Accepting a partial
+    // match would let an infra label cover bytes the recogniser never looked at, which
+    // is precisely how a secret slips through behind an identifier.
+    if (matched !== value.trim()) continue;
+    return {
+      entityClass: ENTITY_CLASS.INFRA,
+      infraType: rule.type,
+      evidence: ["infra_shape", `infra_rule:${rule.type.toLowerCase()}`]
+        .concat(rule.hard && rule.anchor ? ["infra_anchored"] : []),
+      confidence: rule.confidence,
+      hard: Boolean(rule.hard),
+      disposition: INFRA_POLICY[rule.type] || INFRA_DISPOSITION.REDACT,
+    };
+  }
+  return null;
+}
+
+/** Detectors whose match is deterministic credential evidence. */
+// Deterministic detectors. Note what is NOT here: `entropy`. Entropy is the SOFT signal
+// this whole slice exists to suppress -- a 64-hex digest and a 64-hex secret are
+// indistinguishable to it. Adding it here would make every infra preserve decision
+// unreachable, which is the opposite failure of the one it was meant to prevent.
+const HARD_SECRET_DETECTORS = new Set(["gitleaks", "secret", "binding", "http-header", "email", "phone", "identity", "bank"]);
+
+/**
+ * Decide the action for a span, given its detector evidence and any infra classification.
+ *
+ * This is the ONLY place that turns a classification into an action, which is what keeps
+ * the recogniser honest: it cannot preserve anything by itself.
+ */
+export function decideSpanAction({ detector, ruleId, infra }) {
+  // ANY deterministic detector match is hard secret evidence. PII detectors belong here
+  // too: without them a bank card whose digits happen to look like a 16-hex run was
+  // classified SPAN_ID and RELEASED -- a payment card number, preserved, because a shape
+  // matched. Fixed-length numeric shapes are exactly where infra and PII collide.
+  const hardSecret = Boolean(ruleId) || HARD_SECRET_DETECTORS.has(detector);
+  if (hardSecret) {
+    // Monotonic: hard evidence is never downgraded by an infra label.
+    return { action: "redact", hardSecret: true, reason: "hard-secret" };
+  }
+  if (infra && infra.hard && infra.disposition === INFRA_DISPOSITION.PRESERVE) {
+    // Soft signal suppressed by high-precision infra evidence.
+    return { action: "preserve", hardSecret: false, reason: `infra:${infra.infraType}` };
+  }
+  if (infra && !infra.hard && infra.disposition === INFRA_DISPOSITION.PRESERVE) {
+    // Ambiguous shape: classify it, but the exemption needs stronger grounds.
+    return { action: "redact", hardSecret: false, reason: `infra-uncertain:${infra.infraType}` };
+  }
+  return { action: "redact", hardSecret: false, reason: "default" };
+}
+
 // ------------------------------------------------------------- entity ledger ----
 //
 // E1: classification RECORDS, it does not decide. The redaction verdict is already made
@@ -1008,6 +1194,16 @@ function classifyEntityClass(evidence = {}) {
   // INFRA is deliberately NOT inferred from "looks like a resource id" here; that waits
   // for the infra recogniser so the guess does not enter policy by the back door.
   return ENTITY_CLASS.UNKNOWN;
+}
+
+/** The detector that actually produced the evidence for a span. */
+export function detectorOfSpan(spanMeta) {
+  const absorbed = Array.isArray(spanMeta.absorbed) ? spanMeta.absorbed : [];
+  const candidates = [spanMeta.type, spanMeta.providerType, spanMeta.shadowed, ...absorbed].filter(Boolean);
+  if (spanMeta.ruleId) return "gitleaks";
+  return candidates.find((t) => t !== "entropy" && t !== "block_scalar")
+    || candidates[0]
+    || "binding";
 }
 
 export class EntityLedger {
@@ -1992,13 +2188,19 @@ export function findSensitiveSpans(text, flags, deps = {}) {
       ? existing : candidate;
     const other = richer === existing ? candidate : existing;
     const attributed = (existing.priority ?? 0) >= (candidate.priority ?? 0) ? existing : candidate;
+    // A DIFFERENT-type hit at the SAME bounds is not a duplicate: it is a second opinion.
+    // It must not be silently dropped either, because it is what tells the policy layer
+    // whether hard secret evidence coexists with an infra shape. It is marked shadowed
+    // instead, and the decision belongs to the policy -- dropping it here was how a
+    // provider rule could lose to an entropy hit.
+    const shadowed = attributed.type !== other.type ? other.type : null;
     byBounds.set(key, {
       ...richer,
       evidence: [...new Set([...(existing.evidence || []), ...(candidate.evidence || [])])],
       priority: Math.max(existing.priority ?? 0, candidate.priority ?? 0),
       type: attributed.type,
       ...(attributed.type !== richer.type ? { providerType: richer.type } : {}),
-      ...(attributed.type !== other.type && attributed.type !== richer.type ? { providerType: other.type } : {}),
+      ...(shadowed ? { shadowed } : {}),
     });
   }
   const consolidated = [...byBounds.values()];
@@ -2018,8 +2220,12 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // Now an enclosing span absorbs the hits inside it and inherits their evidence,
   // so the redaction covers the full value while the provider/type attribution
   // survives on the surviving span.
+  // Widest first, then priority. Sorting by priority first made a WIDER span absorb a
+  // NARROWER one and then hand the type to whichever inner hit had the higher priority,
+  // so `[12,52) gitleaks` absorbed `[16,52) entropy` and came out labelled `entropy`.
+  // Width ordering is what containment needs; priority only breaks ties.
   const byPriority = consolidated.slice().sort((a, b) =>
-    b.priority - a.priority || (b.end - b.start) - (a.end - a.start) || a.start - b.start);
+    (b.end - b.start) - (a.end - a.start) || b.priority - a.priority || a.start - b.start);
   const absorbed = new Set();
   const merged = [];
   for (const span of byPriority) {
@@ -2035,7 +2241,20 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     // narrower span.
     const ranked = inner.slice().sort((a, b) =>
       b.priority - a.priority || (a.end - a.start) - (b.end - b.start));
-    const primaryInner = ranked[0];
+    // Attribution rule. The OUTER span keeps its own identity when it is a provider
+    // rule; it only hands attribution to an inner hit when the outer span is NOT a
+    // provider hit and the inner one is. The previous rule ("highest priority inner
+    // wins") let a wider `gitleaks` span absorb a narrower `entropy` hit and then
+    // relabel ITSELF as entropy -- a weaker detector erasing a stronger one.
+    const PROVIDER_TYPES = new Set(["gitleaks", "secret", "email", "phone", "identity", "bank"]);
+    // Providers outrank non-providers. Among providers the highest-priority one wins;
+    // among non-providers the first (already sorted) wins. An earlier rule let ANY inner
+    // provider take over, which is how a wider `gitleaks` span that absorbed a narrower
+    // `entropy` hit relabelled itself as entropy.
+    const providerCandidates = ranked.filter((x) => PROVIDER_TYPES.has(x.type));
+    const primaryInner = providerCandidates.length
+      ? providerCandidates[0]
+      : (PROVIDER_TYPES.has(span.type) ? span : ranked[0]);
     const evidence = span.evidence ? span.evidence.slice() : [];
     for (const extra of ranked) {
       if (extra.type && extra.type !== span.type && !evidence.includes(extra.type)) evidence.push(extra.type);
@@ -2138,6 +2357,9 @@ export class RedactionContext {
     // E1 entity classification ledger. Populated at emit time; consumed read-only by
     // entityClassFor(), which is what the sink policy asks.
     this.entityLedger = new EntityLedger();
+    // Per-span policy decisions, for telemetry. Records the action and WHY, which is what
+    // makes a preserve auditable rather than invisible.
+    this.spanActions = [];
     // Eligibility for protected spans: a token is protected only if this request
     // minted or registered it (including re-minted legacy tokens). Shape alone is
     // never sufficient, otherwise a CRG-looking label would smuggle a secret past
@@ -2184,13 +2406,7 @@ export class RedactionContext {
     // Attribute to the MOST SPECIFIC detector that participated, not to whatever type
     // the merge happened to leave on the span. A provider rule that fired inside a
     // wider binding is the real evidence, even when the span's own type says otherwise.
-    const absorbed = Array.isArray(spanMeta.absorbed) ? spanMeta.absorbed : [];
-    const candidates = [spanMeta.type, ...absorbed].filter(Boolean);
-    const detector = spanMeta.ruleId
-      ? "gitleaks"
-      : candidates.find((t) => t !== "entropy" && t !== "block_scalar")
-        || candidates[0]
-        || "binding";
+    const detector = detectorOfSpan(spanMeta);
     return this.entityLedger.record(token, {
       detector,
       ruleId: spanMeta.ruleId ?? null,
@@ -2249,16 +2465,59 @@ export class RedactionContext {
       out += text.slice(at, s.start);
       const raw = text.slice(s.start, s.end);
       const encodingKind = s.schemaEncoding || ENCODING_KIND.PLAIN;
+
+      // Policy layer. The recogniser only classifies; THIS is where a classification can
+      // turn into an action, which is what keeps the recogniser from preserving anything
+      // on its own. Monotonic risk is enforced inside decideSpanAction: hard secret
+      // evidence is never downgraded by an infra label.
+      const detector = detectorOfSpan(s);
+      // Context is what lets an anchored form be recognised: `commit <40-hex>` is a git
+      // sha, while a bare 40-hex run is shape-ambiguous and must not be preserved.
+      const infra = recogniseInfra(raw, text.slice(Math.max(0, s.start - 64), s.start));
+      const decision = decideSpanAction({ detector, ruleId: s.ruleId, infra });
+      this.spanActions.push({
+        detector,
+        ruleId: s.ruleId ?? null,
+        infraType: infra?.infraType ?? null,
+        action: decision.action,
+        reason: decision.reason,
+        bytes: raw.length,
+      });
+
+      if (decision.action === "preserve") {
+        // Emitted verbatim: no token, nothing recorded in the mapping, and therefore
+        // nothing for restoreText to substitute later.
+        out += raw;
+        at = s.end;
+        continue;
+      }
+
       const visible = await this.emit(raw, encodingKind);
       const token = resolveSurrogate(visible, this);
       // Recorded BEFORE any verdict could change, so telemetry and the enforcement path
       // see the same classification.
-      this.recordEntity(token, { ...s, coverageStatus: coverageStatusForSpan(spans, s) }, encodingKind);
+      this.recordEntity(
+        token,
+        { ...s, detector, coverageStatus: coverageStatusForSpan(spans, s), infra },
+        encodingKind
+      );
       out += visible;
       at = s.end;
     }
     return out + text.slice(at);
   }
+  /** Rollup of the per-span policy decisions taken in this request. */
+  policySummary() {
+    const byAction = {};
+    for (const row of this.spanActions) {
+      const acc = byAction[row.action] || (byAction[row.action] = { spans: 0, bytes: 0, reasons: {} });
+      acc.spans += 1;
+      acc.bytes += row.bytes;
+      acc.reasons[row.reason] = (acc.reasons[row.reason] || 0) + 1;
+    }
+    return { decisions: this.spanActions.length, byAction, rows: this.spanActions };
+  }
+
   /** Rollup of every parser attempt seen in this request. */
   coverageSummary() {
     const all = this.coverage;

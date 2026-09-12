@@ -833,6 +833,68 @@ UNKNOWN     entropy    （SHA-like 串）
 
 另有一条值得记的实测：`cache_key: <base64>` **会**被判 `CREDENTIAL`——但归因是通用 provider 规则命中**值**，`key=null` 证明**不是 key 名给的**。这与"弱 key 名不授予 class"不矛盾：`cache_key: abc123` 完全不产生实体。测试同时固定这两点。
 
+## 9.14 Infra Recognizer（已实现：recognizer 只分类，policy 才 preserve）
+
+**recognizer 从不输出 action，从不 suppress，从不 preserve。** 它回答"这是什么"；独立 policy 层回答"拿它怎么办"。测试断言返回值里**不存在 `action` 字段**——一旦出现，说明两层又揉回成一个猜测。
+
+```js
+{ entityClass: "INFRA", infraType, evidence: [...], confidence, hard, disposition }
+```
+
+### disposition 与 preserve allowlist（第一版刻意极小）
+
+| infraType | disposition |
+|---|---|
+| `GIT_SHA` / `OCI_DIGEST` / `TRACE_ID` / `SPAN_ID` | **preserve** |
+| `AWS_ACCOUNT_ID` / `AWS_ARN` / `PRIVATE_IP` / `INTERNAL_HOSTNAME` / `K8S_RESOURCE_NAME` / `EC2_RESOURCE_ID` | mask（**仍然脱敏**） |
+
+后一组虽然通常不是 secret，但在一些组织属于敏感基础设施元数据——**那个判断属于 profile，不属于模式匹配器**。测试断言 allowlist 恰好是这四项，防止以后顺手扩大。
+
+### 单调风险（两半都必须成立）
+
+```
+HARD_SECRET 不可被 INFRA 降级      provider 规则 / 敏感 binding / email / phone / identity / bank 命中 → 一律 redact
+SOFT_SIGNAL 可被高精度 INFRA 压制   entropy-only + hard 且 allowlisted 的 INFRA → preserve
+```
+
+`entropy` **刻意不在硬密钥集合里**：熵是这一刀要压制的软信号。把它算作硬密钥会让所有 preserve 决策不可达——与被它误放行同样糟。
+
+### 上下文锚：歧义形状需要证据才能成为 hard
+
+裸的定长 hex 无法自证身份，因此引入锚点。**无上下文时 soft、有上下文时 hard**：
+
+| 形状 | 无锚 | 有锚 |
+|---|---|---|
+| 40-hex | `GIT_SHA` soft → **redact** | `commit <sha>` → hard → preserve |
+| 32-hex | `TRACE_ID` soft → **redact** | `trace_id: <id>` → hard → preserve |
+| 16-hex | **不 claim**（形状与银行卡相同） | `span_id: <id>` → hard → preserve |
+| `sha256:<64hex>` | hard（形状本身无歧义） | — |
+
+这条规则直接来自实测暴露的一个安全问题，见下。
+
+### 实现期抓到的四个缺陷
+
+**① 银行卡被当作 span id 释放（安全）**：`4111111111111111` 匹配 16-hex ⇒ 判 `SPAN_ID` ⇒ `hard` ⇒ **preserve**。双重原因：PII detector 未被算作硬密钥，且裸 16hex 形状歧义被当作 hard。修法：把 `email/phone/identity/bank` 纳入硬密钥集合 + 16hex 需锚点。
+
+**② 宿主名规则灾难性回溯（ReDoS）**：嵌套量词 `(?:[a-z0-9-]*)*` 使一个 71 字符的 digest 分类**超过 60 秒**。改为非嵌套形式，并加压力测试（含 2000 字符敌对输入，断言总耗时 < 1s）。这类 bug 属于"静默挂死"，正是这一刀该防的。
+
+**③ 私有 IP 只匹配两段式前缀**：`10` 需两段后续、`192.168`/`172.16-31` 需一段，共用一个尾部导致 **`10.244.0.11` 静默失配**而 `192.168.1.5` 正常。按段数分别写。
+
+**④ 归因被弱信号篡改**：更宽的 `gitleaks` span 吸收更窄的 `entropy` 命中后，按"内层优先级最高"规则把自己**改标成 entropy**——弱 detector 抹掉了强 detector。改为 **provider 优先，provider 之间按优先级**。同时把等边界归并从"丢弃较弱一方"改为**标记 `shadowed`**：丢弃会让 policy 再也看不到"硬密钥与 infra 形状共存"这个事实。
+
+### 实测行为
+
+```
+commit a1b2...                      → 原样（锚定 GIT_SHA）
+image: nginx@sha256:7031…           → 原样（OCI_DIGEST）
+trace_id: 4bf92f35…                 → 原样（锚定 TRACE_ID）
+sha_alone: a1b2…                    → 脱敏（无锚，infra-uncertain）
+card: 4111111111111111              → 脱敏（hard-secret）
+DB_PASSWORD=Pr0d-P@ssw0rd-Xy9Zk2mQ  → 脱敏（hard-secret）
+```
+
+round-trip 逐字节一致。preserve 不写 mapping（测试断言 `tokenToRaw.size === 0`），因此"保留"是**原样发出**而非"发 token 再还原"。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
@@ -843,6 +905,7 @@ UNKNOWN     entropy    （SHA-like 串）
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
 6. **【覆盖率机制已建立，见 9.12】** 已实现 attempt 级 coverage（PARSED/PARTIAL/FAILED/NOT_APPLICABLE）与请求级 union 汇总，并有 8 份语料基线。仍**无实现数据**的部分：YAML 锚点/别名、shell 引号与转义、多行 `.env`——这些目前会体现为 PARTIAL 或不计入，需要更大语料才能定量。
 7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
+8. **【已实现，见 9.14】** Infra Recognizer：10 个 subtype，4 个在 preserve allowlist。**未做**：profile 机制（让 mask 类 subtype 按组织策略改成 preserve）、`INTERNAL_HOSTNAME` 对 K8s `svc` 短名的覆盖（当前需要完整 FQDN）。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。
 9. **【待替换】测试内的实现占位**：`token-syntax` 的 `targetToken()`（`djb2(明文)` 派生 entity slot）与 `k8s-surrogate` 的 `base64Surrogate()`、`restore-miss` 的 `classifyRestore()` 都是形态占位；前者的派生方式正是 8.1 所禁止的 checksum oracle 形态，worker.js 实现时必须用 CSPRNG，不得复用测试里的推导。
