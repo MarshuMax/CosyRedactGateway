@@ -390,29 +390,75 @@ function isCanonicalBase64(value) {
   return Buffer.from(value, "base64").toString("base64") === value;
 }
 
-test("D2c: a v1 Secret under root data.* keeps a valid base64 replacement [RED]", async () => {
-  // Executable spec for a regression we ALREADY KNOW ABOUT.
-  //
-  // D2a redacts `data.password` because it is a simple YAML scalar, and substitutes
-  // a portable token. The result is valid YAML, so the YAML parser is happy -- but
-  // Kubernetes requires Secret.data values to be valid base64, and the API server
-  // rejects the document:
-  //
-  //   illegal base64 data at input byte 3
-  //
-  // Without this test the suite reads as "only block scalar / header / URL left",
-  // which underestimates the remaining work. The fix belongs to D2c: an
-  // object-level recogniser (apiVersion == v1 AND kind == Secret AND path under
-  // root `data`) selects a base64 surrogate instead of a plain token.
+test("D2c: a v1 Secret under root data.* keeps a valid base64 replacement [GREEN NOW]", async () => {
+  // Was an executable spec for a known regression; the surrogate ledger and the
+  // object-level recogniser now close it.
   const ctx = new RedactionContext({ salt: "fixture" });
   const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
   const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
   assert.ok(replaced, "a replacement must be present");
-  assert.equal(
-    isCanonicalBase64(replaced),
-    true,
-    `Secret.data must keep canonical base64, got: ${replaced}`
-  );
+  assert.equal(isCanonicalBase64(replaced), true, `Secret.data must keep canonical base64, got: ${replaced}`);
+  assert.notEqual(replaced, "YWRtaW4xMjM0NTY3OA==", "the plaintext must actually be replaced");
+  // And the representation is recoverable: the original document comes back byte for byte.
+  assert.equal(ctx.restoreText(out), K8S_SECRET_B64, "restore must be byte-identical");
+});
+
+test("D2c: only a v1 Secret gets the base64 surrogate, and only under root data [GREEN NOW]", async () => {
+  const cases = [
+    ["ConfigMap", ["apiVersion: v1", "kind: ConfigMap", "data:", "  password: YWRtaW4xMjM0NTY3OA=="].join("\n")],
+    ["no apiVersion", ["kind: Secret", "data:", "  password: YWRtaW4xMjM0NTY3OA=="].join("\n")],
+    ["v2 apiVersion", ["apiVersion: v2", "kind: Secret", "data:", "  password: YWRtaW4xMjM0NTY3OA=="].join("\n")],
+    ["generic data block", ["data:", "  password: YWRtaW4xMjM0NTY3OA=="].join("\n")],
+    ["nested data", ["apiVersion: v1", "kind: Secret", "spec:", "  data:", "    password: YWRtaW4xMjM0NTY3OA=="].join("\n")],
+  ];
+  for (const [label, doc] of cases) {
+    const ctx = new RedactionContext({ salt: "fixture" });
+    const out = await ctx.redactText(doc, { gitleaks: true });
+    const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+    assert.ok(replaced, `${label}: a replacement must be present`);
+    assert.equal(
+      isCanonicalBase64(replaced),
+      false,
+      `${label} must NOT be treated as base64: got ${replaced}`
+    );
+  }
+});
+
+test("D2c: a stringData sibling is not given the data encoding [GREEN NOW]", async () => {
+  const doc = [
+    "apiVersion: v1",
+    "kind: Secret",
+    "data:",
+    "  password: YWRtaW4xMjM0NTY3OA==",
+    "stringData:",
+    "  token: adm1n-p@ssw0rd",
+  ].join("\n");
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(doc, { gitleaks: true });
+  const dataValue = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+  const stringValue = (out.match(/^\s+token:\s*(\S+)\s*$/m) || [])[1];
+  assert.equal(isCanonicalBase64(dataValue), true, "root data keeps base64");
+  assert.equal(stringValue.startsWith("CRG_"), true, `stringData keeps a plain token, got ${stringValue}`);
+  assert.equal(ctx.restoreText(out), doc, "round-trip is byte-identical across both blocks");
+});
+
+test("D2c: the surrogate is registered in the ledger, not derivable by shape [GREEN NOW]", async () => {
+  // `restoreText` recognises tokens by SHAPE, so a base64 surrogate is invisible to
+  // it. The ledger is what makes the round trip work, and only strings this request
+  // minted are eligible -- unrelated base64 must not be decoded and looked up.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
+  const visible = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+
+  const entries = ctx.ledger.entries();
+  assert.equal(entries.length, 1, "exactly one surrogate was minted");
+  assert.equal(entries[0].visible, visible);
+  assert.equal(entries[0].encodingKind, "base64");
+  assert.equal(ctx.tokenToRaw.has(entries[0].token), true, "and it maps back to an owned token");
+
+  // An unrelated base64 string in the same payload is left alone.
+  const unrelated = "YWJjZGVmZ2hpams=";
+  assert.equal(ctx.restoreText(`x: ${unrelated}`), `x: ${unrelated}`, "only minted surrogates are eligible");
 });
 
 test("D2c control: root stringData.* accepts a plain portable token [GREEN NOW]", async () => {

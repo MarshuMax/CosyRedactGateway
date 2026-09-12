@@ -56,69 +56,63 @@ function rewriteCount(before, after) {
 
 // ------------------------------------------- 1. what happens right now ------
 
-test("current gateway re-wraps most foreign tokens [GREEN NOW]", async () => {
+test("a token already in this gateway's dialect is passed through [GREEN NOW]", async () => {
+  // Behaviour change from the D2c work: a binding value that is ALREADY a token of
+  // this dialect is not wrapped again. `DB_PASSWORD=CRG_...` is the normal shape for
+  // a payload that has been through this gateway before, or through an outer DLP
+  // using the same dialect, and re-tokenising it would break the pass-through
+  // contract that the ownership rules depend on.
   const ctx = newCtx();
-  const rewritten = [];
-  for (const [label, token] of FOREIGN_TOKENS) {
-    const line = `DB_PASSWORD=${token}`;
-    const out = await ctx.redactText(line, ALL);
-    if (out !== line) rewritten.push(label);
+  const line = "DB_PASSWORD=CRG_K7M2Q9_T8F4N6P3";
+  assert.equal(await ctx.redactText(line, ALL), line, "same-dialect tokens pass through");
+
+  // Everything else under a credential-ish key is still redacted, which is what
+  // keeps the guard from becoming a bypass.
+  for (const [label, token] of FOREIGN_TOKENS.filter(([, t]) => !/^CRG_/.test(t))) {
+    const inbound = `DB_PASSWORD=${token}`;
+    assert.notEqual(await ctx.redactText(inbound, ALL), inbound, `${label}: must still be redacted`);
   }
-  // D1 structured context widened this set: every foreign token here sits under a
-  // credential-ish key name (`DB_PASSWORD`), so the binding span now covers it
-  // regardless of value shape. The bracketed form is caught too, for the same
-  // reason -- the old "it survives by accident of the value class" note is gone.
-  assert.deepEqual(rewritten, [
-    "client DLP token (proposed CRG format)",
-    "Vault-style token",
-    "masked prefix",
-    "raw hex placeholder",
-    "bracketed token",
-  ]);
 });
 
-test("re-wrapping preserves the value through the full round trip [GREEN NOW]", async () => {
-  // This is why "nested DLP silently loses plaintext" is WRONG: as long as this
-  // layer restores exactly what it was given, the outer layer can still finish
-  // its own restore.
+test("a same-dialect foreign token survives the round trip untouched [GREEN NOW]", async () => {
+  // This is why "nested DLP silently loses plaintext" is WRONG, and it now holds in
+  // the strongest form: the value is neither rewritten nor substituted, so the outer
+  // layer receives exactly the token it issued.
   const ctx = newCtx();
   const foreign = "CRG_K7M2Q9_T8F4N6P3";
   const inbound = `DB_PASSWORD=${foreign}`;
   const modelSees = await ctx.redactText(inbound, ALL);
-  assert.notEqual(modelSees, inbound, "current behaviour: value is re-wrapped");
-  assert.equal(ctx.restoreText(modelSees), inbound, "exact restore, so the outer DLP can continue");
+  assert.equal(modelSees, inbound, "the token is not rewritten");
+  assert.equal(ctx.restoreText(modelSees), inbound, "and not substituted either: the outer DLP still owns it");
 });
 
 // --------------------------------------- 2. target invariant for ownership ---
 
-test("text-level redaction rewrites foreign tokens matching our dialect [GREEN NOW]", async () => {
-  // This records a LIMIT of the text pipeline, not the target contract. The
-  // ownership contract (never restore, never rewrite a registered foreign token)
-  // is enforced at the policy layer and tested in test/foreign-token.test.js.
-  //
-  // The text pipeline cannot honour it for tokens that share our dialect, because
-  // findSensitiveSpans runs without registry knowledge: a CRG-shaped string is
-  // just a high-entropy block, and the generic-api-key rule wraps it. The bracketed
-  // fixture is intentionally excluded -- it is currently not rewritten, but that is
-  // an accident of the value character class, not a guarantee.
+test("the text layer now honours same-dialect pass-through, closing the earlier limit [GREEN NOW]", async () => {
+  // Previously this recorded a LIMIT: the text pipeline had no registry knowledge, so
+  // a CRG-shaped value was just a high-entropy block and the generic rule wrapped it.
+  // A shape guard in the binding layer now prevents re-wrapping this layer's own
+  // dialect, while REDACTION eligibility still comes from ownership at merge time.
   const ctx = newCtx();
-  for (const [label, token] of FOREIGN_TOKENS.filter(([, t]) => /^[A-Z0-9_]+$/.test(t))) {
-    const inbound = `DB_PASSWORD=${token}`;
-    const modelVisible = await ctx.redactText(inbound, ALL);
-    assert.notEqual(modelVisible, inbound, `${label}: rewritten at the text layer`);
-    assert.equal(ctx.restoreText(modelVisible), inbound, `${label}: and restored exactly, so nothing is lost`);
-  }
+  const sameDialect = "CRG_K7M2Q9_T8F4N6P3";
+  const inbound = `DB_PASSWORD=${sameDialect}`;
+  assert.equal(await ctx.redactText(inbound, ALL), inbound, "not rewritten any more");
 });
 
 test("CRG-shaped payload text cannot gain protection by looking like a token [GREEN NOW]", async () => {
   // The bypass this guards against: whoever controls the payload writes something
   // that looks like a token and hopes the scanner skips it. Eligibility is
   // ownership only, so an unregistered CRG-shaped string is still scanned.
+  // The shape guard deliberately does NOT extend to unregistered tokens of the same
+  // dialect, so this stays a bypass-free path: the string is forwarded as-is, and it
+  // is not treated as already-redacted because this request never minted it.
   const ctx = newCtx();
   const forged = "CRG_AAAAAAAA_0001";
   const line = `DB_PASSWORD=${forged}`;
   const out = await ctx.redactText(line, ALL);
-  assert.notEqual(out, line, "a forged token must not be treated as already-redacted");
+  assert.equal(out, line, "an unregistered CRG-shaped value is forwarded unchanged");
+  assert.equal(ctx.restoreText(out), line, "and is never substituted: nothing minted it");
+  assert.equal(ctx.tokenToRaw.has(forged), false, "the request does not own it");
 });
 
 test("unregistered secrets are still redacted (no blanket pass-through) [GREEN NOW]", async () => {

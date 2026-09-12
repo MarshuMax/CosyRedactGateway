@@ -589,61 +589,44 @@ password: abc123!  # note  # 注释，span 只覆盖 abc123!
 2. 逐行候选里 `lineText.indexOf(lineBody, lineIndent)` 返回的是**行内相对偏移**，再加 `lineStartOffset` 相当于把缩进算了两遍。
 3. 早期版本用"去尾空白后的长度"算 span 末尾，未计入尾部空白差值，导致 span 越过行尾、吞掉下一行开头。
 
-### 9.8.4 D2c 已知缺口（executable spec，未实现）
+### 9.8.4 D2c K8s Secret schema + base64 surrogate（已实现）
 
-**D2a 已经会破坏 K8s `Secret.data` 的 base64 约束**：
+此前的缺口：D2a/D2b 会把 `Secret.data.*` 替换成普通 portable token，对 YAML 合法、对 Kubernetes 非法（API server：`illegal base64 data`）。现已修复。
 
-```yaml
-apiVersion: v1
-kind: Secret
-data:
-  password: cGFzc3dvcmQ=        # → password: CRG_XXXXXX_0001
-```
-
-结果对 YAML 合法，对 Kubernetes 非法（API server：`illegal base64 data at input byte 3`）。测试 `D2c: a v1 Secret under root data.* keeps a valid base64 replacement [RED]` 把这条缺口固定成可执行规格，避免 129 pass 给人"只剩 block scalar/header/URL"的错觉。
-
-同时固定两条对照：
-
-- `stringData.*` → 普通 portable token 可以接受（本来就是任意文本）
-- 普通 `data.password`（非 Secret 对象）→ **不得**被判为 base64
-
-D2c 的判据必须是对象级：`apiVersion == v1` AND `kind == Secret` AND path under root `data`。仅凭 path 相同不够。
-
-## 9.9 D2b-3 block scalar 精度收口（已实现）
-
-**问题**：D2b-2 把块体的每个非空行都产出为 `bodyCandidate: true`，而 `bindingSpansOf` 的过滤条件是 `bodyCandidate === true || strong binding`——于是 bodyCandidate 不是"交给内容检测器的候选"，而是**直接的 redaction span**。后果是一个巨大的误删面：
+**对象级判据**（不是 path 判据）：
 
 ```
-notes: |                                    ← 弱键，内容无任何命中
-  deployment completed successfully
-  restart the service after upgrade
+apiVersion == v1  AND  kind == Secret  AND  path under ROOT `data`
 ```
 
-实测会被整块脱敏。`description: |`、`script: |`、`message: |` 同理，而它们在 README/Helm/K8s 里极其常见。
+`ConfigMap`、缺 `apiVersion`、`apiVersion: v2`、泛型 `data:`、以及**嵌套 `spec.data`** 全部不走 base64。最后一条尤其重要：注释里写了"仅根键"但最初没有实现该检查，测试 `only a v1 Secret gets the base64 surrogate` 把它抓了出来。
 
-**同时暴露一个假绿测试**：`password: |\n  ${{ secrets.DB_PASSWORD }}` 那条只断言了 `strength === none`（evidence 层），而最终行为其实是错的——模板引用被替换成 token，它存在的意义（保持间接）被摧毁。
+**surrogate ledger**（见 9.8.4a）让回程可用：`restoreText` 按**形状**识别 token，base64 编码后的 token 对它是不可见的，因此可见的 surrogate 必须在 ledger 中显式登记，且**只对本次请求铸造过的串**尝试查找——解码任意 base64 文本会带来大得多的误伤面。
 
-### 概念拆分
+设计决定（四项）：
+
+| 决定 | 取值 | 理由 |
+|---|---|---|
+| surrogate 长度 | 长度无关（`base64(token)` 最短） | K8s 只校验能否解码，不校验解码后长度；避免为长度而填充 |
+| sink policy | surrogate 与普通 token **同等对待** | `classifyRestore` 把 ledger 中的 surrogate 归一到 underlying token，复用现有四维判定，不引入第二套规则 |
+| `entityClassFor` | 继续留空，UNKNOWN → credential 级 fail-closed | 与 B 组约定一致，分类器留到 D 之后单独一刀 |
+| 恢复边界 | **只在 ledger 登记的 surrogate 上**查找 | 精确匹配整串；未登记的 base64 一律不碰 |
+
+**结构 hint 必须随证据一起在 merge 中继承**：provider 规则常以更高优先级赢下 span 边界，若 merge 只传 `evidence` 不传 `pathSegments`，对象级 recognizer 就拿不到路径（`data.password` 的 span 归于 `gitleaks` 时不含 path）。已修复。
+
+**等边界归并**：provider 规则与 binding 对同一秘密常产生**完全相同的边界**。containment 遍历刻意跳过等边界对，因此若不先做等边界归并，其中一方会被整体丢弃——若丢的是 binding，路径随之消失，对象级 recognizer 静默失效。
+
+**端到端验证**（真实 minikube API server）：
 
 ```
-block body region  = parser evidence / structural region
-                   ≠ redaction span
+脱敏后 data.password = Q1JHX0hDVTZDQV8wMDAx   → kubectl apply --dry-run=server: created ✅
+restoreText(out) === 原文                      → 逐字节一致 ✅
+username（弱键）保持原样                        → 未过度脱敏 ✅
 ```
 
-- **strong parent key**：每个 body line 升为 redaction span（`block_scalar_body` + `strong_secret_key`）。
-- **weak / none parent key**：只产出 `block_scalar_region`（`regionOnly: true`），**不产 span**；是否脱敏完全由 `G`/`H`/其它 detector 决定。
-- body 行同样走 `reference_value` 判定，引用不被替换。
+#### 9.8.4a surrogate 与本层方言的交互
 
-### 归因守卫
-
-测试 `a PEM under a weak key is redacted by the provider rule, not the parser` 双向断言：
-
-```
-gitleaks=true  → 脱敏
-gitleaks=false → 原样
-```
-
-若 bodyCandidate 是无条件兜底，第二条会失败。附带一条夹具合法性控制用例：私有钥规则要求 body ≥ 64 字符，**过短夹具即使开着规则也不命中**——这个坑在本项目已经踩过一次（见 3.4 样本合法性）。
+`CRG_` 形状的值**不再被二次包装**：`DB_PASSWORD=CRG_...` 是"已经过本层或同方言外层 DLP"的正常形态，再包一层会破坏外来 token 的透传契约。守卫是**形状判定**（值本身即本层方言时不产 binding 候选），而**脱敏资格仍由 merge 时的 ownership 决定**——未登记的 CRG 形状串依然不视为"已脱敏"，不会被当作受保护值。
 
 ## 10. 未解决问题 / 待验证
 

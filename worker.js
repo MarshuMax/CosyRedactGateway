@@ -258,6 +258,31 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, 
     }
   }
 
+  // A representation-constrained surrogate is judged as its underlying token, so the
+  // sink policy does not need a second set of rules for it. Without this the
+  // base64 form would fall through as "not protected-token-like" and be forwarded as
+  // an ordinary string, which is exactly the value the model would then use.
+  const ownedSurrogates = ctx && ctx.ledger
+    ? new Map(ctx.ledger.entries().map((e) => [e.visible, e.token]))
+    : new Map();
+  const surrogateTokens = [...ownedSurrogates.keys()].filter((visible) => text.includes(visible));
+  if (sensitive && !trusted && surrogateTokens.length) {
+    const visible = surrogateTokens[0];
+    return {
+      action: RESTORE_ACTION.BLOCK,
+      text,
+      blockedTokens: [visible],
+      unknownTokens: [],
+      telemetry: {
+        event: "restore_blocked_untrusted_sink",
+        sink: sink.kind,
+        tokenShape: "surrogate",
+        encodingKind: ctx.ledger.lookup(visible)?.encodingKind,
+        reason: "surrogate-into-untrusted-sink",
+      },
+    };
+  }
+
   for (const token of text.match(REDACTED_TOKEN) || []) {
     const { ownership, namespace } = classifyOwnership(token, ctx, registry);
 
@@ -905,6 +930,143 @@ function looksLikeReferenceValue(raw) {
   return REFERENCE_VALUE_RE.test(raw.trim());
 }
 
+// ------------------------------------------------------- surrogate ledger -------
+//
+// A representation-constrained field cannot carry a plain portable token. The
+// clearest case is a Kubernetes `Secret.data` entry: the API server requires valid
+// base64, and a `CRG_...` string is rejected with "illegal base64 data". The
+// replacement therefore has to be a SURROGATE whose visible form satisfies the
+// constraint while still mapping back to the entity.
+//
+// Measured constraint that shapes the design: `restoreText` recognises tokens by
+// shape, so a base64-encoded token is invisible to it. The ledger is what makes the
+// round trip work -- the visible surrogate is registered explicitly, and a lookup is
+// attempted only for strings the ledger actually minted. Decoding arbitrary
+// base64-looking text would be a much larger误伤面 and is deliberately not done.
+
+export const ENCODING_KIND = Object.freeze({
+  PLAIN: "plain",
+  BASE64: "base64",
+});
+
+export const SURROGATE_ENCODINGS = Object.freeze({
+  [ENCODING_KIND.PLAIN]: {
+    // Identity: the visible form IS the token.
+    encode: (token) => token,
+  },
+  [ENCODING_KIND.BASE64]: {
+    encode: (token) => btoa(token),
+  },
+});
+
+export function encodeSurrogate(token, encodingKind = ENCODING_KIND.PLAIN) {
+  const encoding = SURROGATE_ENCODINGS[encodingKind];
+  if (!encoding) throw new Error(`unknown surrogate encoding: ${encodingKind}`);
+  const visible = encoding.encode(token);
+  // Guard the constraint itself, not just the encoder: a surrogate that is not
+  // canonical base64 is rejected by the API server, so fail loudly here instead of
+  // forwarding a document that will be refused downstream.
+  if (encodingKind === ENCODING_KIND.BASE64) {
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(visible) || visible.length % 4 !== 0) {
+      throw new Error(`base64 surrogate is not canonical: ${visible}`);
+    }
+  }
+  return visible;
+}
+
+export class SurrogateLedger {
+  constructor() {
+    this.byVisible = new Map(); // visible form -> { token, encodingKind }
+  }
+  /** Register a surrogate and return its visible form. Idempotent per token+kind. */
+  mint(token, encodingKind = ENCODING_KIND.PLAIN) {
+    const visible = encodeSurrogate(token, encodingKind);
+    if (encodingKind !== ENCODING_KIND.PLAIN) {
+      const existing = this.byVisible.get(visible);
+      if (existing && existing.token !== token) throw new Error("surrogate collision");
+      this.byVisible.set(visible, { token, encodingKind });
+    }
+    return visible;
+  }
+  /** @returns {{token: string, encodingKind: string}|null} */
+  lookup(visible) {
+    return this.byVisible.get(visible) || null;
+  }
+  get size() { return this.byVisible.size; }
+  /** Read-only view for policy code (sink classification, telemetry). */
+  entries() { return [...this.byVisible.entries()].map(([visible, meta]) => ({ visible, ...meta })); }
+}
+
+// ------------------------------------------------ object-level K8s recogniser ----
+//
+// The criterion is deliberately OBJECT-level, not path-based. A `data:` block also
+// appears in ordinary application config, and treating every `data.*` as base64
+// would corrupt unrelated YAML. Only a document that actually declares
+// `apiVersion: v1` and `kind: Secret` gets representation-constrained `data`.
+//
+// Applied only to ROOT keys: a nested `data:` inside some other mapping is not part
+// of the Secret contract.
+
+export const SCHEMA_ENCODING = Object.freeze({
+  BASE64: "base64",
+});
+
+const SECRET_API_VERSION_RE = /^v1$/;
+const SECRET_KIND_RE = /^Secret$/;
+
+/** @returns {boolean} whether this document is a v1 Secret. */
+export function isKubernetesSecret(doc) {
+  const bindings = parseYamlBindings(doc);
+  const root = (key) => bindings.find((b) => b.key === key && b.indent === 0 && !b.bodyCandidate && !b.regionOnly);
+  const apiVersion = root("apiVersion");
+  const kind = root("kind");
+  return Boolean(apiVersion && SECRET_API_VERSION_RE.test(apiVersion.raw)
+    && kind && SECRET_KIND_RE.test(kind.raw));
+}
+
+/**
+ * Mark spans that sit under a root `data` block of a v1 Secret with the encoding
+ * their replacement must use. Returns the spans unchanged for every other document.
+ *
+ * The `data:` key itself has an empty value, so the binding parser emits no record
+ * for it. The block is therefore located by scanning lines rather than by looking up
+ * a record: a root-level `data:` line, followed by lines indented deeper than it.
+ */
+export function applyObjectSchema(text, spans) {
+  if (!isKubernetesSecret(text)) return spans;
+
+  const lines = text.split("\n");
+  const offsets = [];
+  for (let i = 0, at = 0; i < lines.length; i++) { offsets.push(at); at += lines[i].length + 1; }
+
+  let dataLine = -1;
+  let dataIndent = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([ \t]*)data[ \t]*:[ \t]*(?:#.*)?$/.exec(lines[i]);
+    // ROOT only: `spec.data` and any other nested `data:` are not part of the Secret
+    // contract, and treating them as base64 would corrupt unrelated documents. The
+    // comment said "root" before this check existed.
+    if (m && m[1].length === 0) { dataLine = i; dataIndent = 0; break; }
+  }
+  if (dataLine < 0) return spans;
+
+  let lastDataLine = lines.length - 1;
+  for (let i = dataLine + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "") continue;
+    const indent = line.match(/^[ \t]*/)[0].length;
+    if (indent <= dataIndent) { lastDataLine = i - 1; break; }
+  }
+  const blockStart = offsets[dataLine] + lines[dataLine].length;
+  const blockEnd = offsets[lastDataLine] + lines[lastDataLine].length;
+
+  return spans.map((span) => (
+    span.start >= blockStart && span.end <= blockEnd
+      ? { ...span, schemaEncoding: SCHEMA_ENCODING.BASE64 }
+      : span
+  ));
+}
+
 export const PATH_CONFIDENCE = Object.freeze({
   SIMPLE_MAPPING: "simple-mapping",
   UNKNOWN: "unknown",
@@ -1308,6 +1470,13 @@ export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
     .filter((b) => !b.regionOnly)
     .filter((b) => b.bodyCandidate === true
       || (b.strength === KEY_STRENGTH.STRONG && !b.evidence.includes("reference_value")))
+    // A value that is ALREADY a token of this layer's dialect must not be wrapped
+    // again. `DB_PASSWORD=CRG_...` is the normal shape for a payload that has already
+    // been through this gateway, or through an outer DLP using the same dialect, and
+    // re-tokenising it would defeat the foreign-token pass-through contract. The check
+    // is shape-based on purpose: eligibility for REDACTION still comes from ownership
+    // at merge time, because an unregistered CRG-shaped string must remain detectable.
+    .filter((b) => !isOwnDialectToken(b.raw))
     .map((b) => ({
       start: b.valueStart,
       end: b.valueEnd,
@@ -1374,6 +1543,38 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     return true;
   });
 
+  // Identical-bounds consolidation, done BEFORE containment.
+  //
+  // A provider rule and a structured binding frequently produce the SAME bounds for
+  // the same secret (`data.password: <base64>` matches the generic rule and the
+  // binding span alike). The containment pass skips equal bounds on purpose, so
+  // without this step one of the two is simply dropped -- and if the dropped one was
+  // the binding, its path/structural hints vanish, which silently disables the
+  // object-level recogniser that needs them.
+  const byBounds = new Map();
+  for (const candidate of candidates) {
+    const key = `${candidate.start}:${candidate.end}`;
+    const existing = byBounds.get(key);
+    if (!existing) { byBounds.set(key, candidate); continue; }
+    // Structural hints are taken from whichever side has them; ATTRIBUTION is taken
+    // from the higher-priority side, so a provider rule keeps naming the secret
+    // (`type: gitleaks`, `providerType: binding`) while the binding still supplies the
+    // path. Picking one side wholesale loses one or the other.
+    const richer = (existing.pathSegments?.length || 0) >= (candidate.pathSegments?.length || 0)
+      ? existing : candidate;
+    const other = richer === existing ? candidate : existing;
+    const attributed = (existing.priority ?? 0) >= (candidate.priority ?? 0) ? existing : candidate;
+    byBounds.set(key, {
+      ...richer,
+      evidence: [...new Set([...(existing.evidence || []), ...(candidate.evidence || [])])],
+      priority: Math.max(existing.priority ?? 0, candidate.priority ?? 0),
+      type: attributed.type,
+      ...(attributed.type !== richer.type ? { providerType: richer.type } : {}),
+      ...(attributed.type !== other.type && attributed.type !== richer.type ? { providerType: other.type } : {}),
+    });
+  }
+  const consolidated = [...byBounds.values()];
+
   // Containment-aware merge.
   //
   // The previous priority-then-drop rule had a redaction-bounds hole:
@@ -1389,7 +1590,7 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // Now an enclosing span absorbs the hits inside it and inherits their evidence,
   // so the redaction covers the full value while the provider/type attribution
   // survives on the surviving span.
-  const byPriority = candidates.slice().sort((a, b) =>
+  const byPriority = consolidated.slice().sort((a, b) =>
     b.priority - a.priority || (b.end - b.start) - (a.end - a.start) || a.start - b.start);
   const absorbed = new Set();
   const merged = [];
@@ -1411,6 +1612,12 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     for (const extra of ranked) {
       if (extra.type && extra.type !== span.type && !evidence.includes(extra.type)) evidence.push(extra.type);
     }
+    // Structural hints travel with the absorbed hit too. A provider rule commonly
+    // wins the bounds over the narrower binding span, and without this the object
+    // level recogniser loses the path it needs (a `data.password` span attributed to
+    // `gitleaks` carries no path unless the merge hands it over).
+    const structural = ranked.find((x) => x.pathSegments) || (span.pathSegments ? span : null);
+    const inheritedEncoding = ranked.find((x) => x.schemaEncoding)?.schemaEncoding || span.schemaEncoding;
     merged.push({
       ...span,
       evidence,
@@ -1421,6 +1628,16 @@ export function findSensitiveSpans(text, flags, deps = {}) {
       type: primaryInner.type || span.type,
       providerType: span.type,
       priority: Math.max(span.priority, primaryInner.priority ?? 0),
+      ...(structural && structural.pathSegments
+        ? {
+            pathSegments: structural.pathSegments,
+            pathConfidence: structural.pathConfidence,
+            indent: structural.indent,
+            key: structural.key,
+            syntax: structural.syntax,
+          }
+        : {}),
+      ...(inheritedEncoding ? { schemaEncoding: inheritedEncoding } : {}),
     });
     for (const x of inner) absorbed.add(x);
   }
@@ -1437,7 +1654,11 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 
   const selected = [];
   for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
-  return selected.sort((a,b) => a.start-b.start);
+  const sorted = selected.sort((a,b) => a.start-b.start);
+  // Last step: an object-level recogniser may impose a representation on a span
+  // (Kubernetes Secret.data must stay base64). It only annotates; the caller decides
+  // how to publish the replacement.
+  return applyObjectSchema(text, sorted);
 }
 
 export class RedactionLimitError extends Error {}
@@ -1464,6 +1685,9 @@ export class RedactionContext {
     this.nextToken = 0;
     this.rawToToken = new Map();
     this.tokenToRaw = new Map();
+    // Representation-constrained entities publish a surrogate instead of the bare
+    // token; the ledger is what makes the round trip possible (see SurrogateLedger).
+    this.ledger = new SurrogateLedger();
     // Eligibility for protected spans: a token is protected only if this request
     // minted or registered it (including re-minted legacy tokens). Shape alone is
     // never sufficient, otherwise a CRG-looking label would smuggle a secret past
@@ -1487,6 +1711,17 @@ export class RedactionContext {
     this.rawToToken.set(raw, token); this.tokenToRaw.set(token, raw);
     return token;
   }
+  /**
+   * Publish an entity, optionally through a representation-constrained surrogate.
+   * `match` is the token a caller already knows, or the raw plaintext.
+   */
+  async emit(match, encodingKind = ENCODING_KIND.PLAIN) {
+    const token = typeof match === "string" && TOKEN_FULL_RE.test(match)
+      ? match
+      : await this.tokenFor(match);
+    return this.ledger.mint(token, encodingKind);
+  }
+
   async redactText(text, flags) {
     // A legacy v1 token arriving in the payload (multi-turn history, or a client
     // that cached a pre-migration response) is re-minted as a v2 token rather
@@ -1507,7 +1742,7 @@ export class RedactionContext {
     let out = "", at = 0;
     for (const s of spans) {
       out += text.slice(at, s.start);
-      out += await this.tokenFor(text.slice(s.start, s.end));
+      out += await this.emit(text.slice(s.start, s.end), s.schemaEncoding || ENCODING_KIND.PLAIN);
       at = s.end;
     }
     return out + text.slice(at);
@@ -1515,7 +1750,21 @@ export class RedactionContext {
   restoreText(text) {
     // Both formats are restored during the transition. Mapping lookup is the only
     // authority: an unknown token of either shape is left untouched.
-    return text
+    //
+    // Surrogates are handled FIRST and by exact visible-string match against the
+    // ledger. Decoding arbitrary base64-looking text is deliberately not attempted:
+    // only strings this request actually minted are eligible, which keeps unrelated
+    // base64 payloads untouched.
+    let out = text;
+    if (this.ledger.size > 0) {
+      for (const { visible, token } of this.ledger.entries()) {
+        if (!out.includes(visible)) continue;
+        const raw = this.tokenToRaw.get(token);
+        if (raw === undefined) continue;
+        out = out.split(visible).join(raw);
+      }
+    }
+    return out
       .replace(TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token)
       .replace(LEGACY_TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token);
   }

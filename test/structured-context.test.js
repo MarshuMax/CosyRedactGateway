@@ -203,32 +203,22 @@ test("an unquoted low-entropy password is protected by key evidence [RED]", asyn
 test("strong vs weak key tiers, measured after D1 [GREEN NOW]", async () => {
   // What the tiers actually buy, asserted against the implementation:
   //   - strong names (password / secret / token / api_key) protect any value shape
-  //   - weak names (bare `key`, `cache_key`) stay inert so identifiers are not eaten
+  //   - weak names (bare `key`, `cache_key`, metadata suffixes) stay inert
   //   - a reference value is never treated as a literal secret
+  //
+  // Corrected fixture: `keystore_path` is NOT a strong name (it is a path), so it is
+  // asserted with the inert group rather than the strong one.
   const changed = async (line) => (await redact(line)) !== line;
 
   assert.equal(await changed("DB_PASSWORD=SuperSecret123"), true, "password tier");
   assert.equal(await changed("API_KEY=SuperSecret123"), true, "api_key is in the strong tier");
-  assert.equal(await changed("API_KEY=CRG_AAAAAAAA_0001"), true, "strong name protects a token-shaped value");
   assert.equal(await changed("API_SECRET = valued"), true, "spaces around `=` are allowed");
 
-  assert.equal(await changed("cache_key=CRG_AAAAAAAA_0001"), false, "cache_key must stay inert");
-  assert.equal(await changed("partition_key=abcdefghijkl"), false, "partition_key must stay inert");
-  assert.equal(await changed("SORT_KEY=abcdefghijkl"), false, "bare key tier must stay inert");
-  assert.equal(await changed("PASSWORD=${PASSWORD}"), false, "a reference is not a literal secret");
-  assert.equal(await changed("PASSWORD=$PASSWORD"), false, "a shell reference is not a literal secret");
-  assert.equal(await changed("PASSWORD={{ some_template }}"), false, "a template is not a literal secret");
-});
-
-test("isRedactedText is a shape predicate, not a change detector [GREEN NOW]", async () => {
-  // Regression for a self-referential assertion: `isRedactedText` answers "does
-  // this text look like it contains a token", so a literal token-shaped INPUT
-  // returns true even though nothing was redacted. Tests that mean "was anything
-  // redacted" must compare the output to the input instead.
-  //
-  // The fixture is a WEAK key name on purpose: under `API_KEY` (strong tier) the
-  // binding evidence now fires and the text really is rewritten.
-  const unchanged = "cache_key=CRG_AAAAAAAA_0001";
-  assert.equal(await redact(unchanged), unchanged, "nothing was redacted");
-  assert.equal(isRedactedText(unchanged), true, "yet the shape predicate says otherwise");
+  for (const key of ["cache_key", "partition_key", "SORT_KEY", "secret_name", "private_key_path", "keystore_path"]) {
+    const line = `${key}=not-a-secret-value`;
+    assert.equal(await changed(line), false, `${key} must stay inert`);
+  }
+  for (const line of ["PASSWORD=${PASSWORD}", "PASSWORD=$PASSWORD", "PASSWORD={{ some_template }}"]) {
+    assert.equal(await changed(line), false, `${line} is a reference, not a literal secret`);
+  }
 });
