@@ -23,3 +23,11 @@ Authorization/provider headers are preserved, while hop-by-hop and relay identit
 ## State lifetime
 
 The salt is generated once when a Worker/Deno isolate starts. Multiple concurrent isolates may therefore use different salts. Restoration does not depend on cross-request or cross-instance state: each response stream closes over its own request-local mapping.
+
+8. Rely on the resource limits as **fail-closed**, not as graceful degradation. An over-limit
+   request is refused before the upstream fetch; it is never served with weaker redaction.
+   `REDACT_REFERENCE_WORK_FACTOR` bounds the reference scanner's work deterministically so
+   that malformed or adversarial reference constructs cannot turn a request into unbounded
+   CPU.
+9. Note the asymmetry: the request body has a byte cap, the response body does not. Size
+   memory accordingly, and treat the upstream as trusted for response size.

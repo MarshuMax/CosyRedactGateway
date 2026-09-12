@@ -229,6 +229,8 @@ curl -N \
 | `REDACT_ALLOWED_HOSTS` | unset | comma-separated hostname allow-list; unset allows arbitrary upstreams |
 | `REDACT_MAX_BODY_BYTES` | 16 MiB | hard cap on request-body bytes consumed by the gateway; an oversized read is cancelled before JSON parsing or redaction |
 | `REDACT_MAX_REDACTIONS` | 16384 | maximum number of unique plaintext identities minted in one request; bounds request-local mapping and output allocation, NOT detector candidate count or pre-mint CPU work |
+| `REDACT_MAX_JSON_DEPTH` | 512 | structural JSON nesting depth, applied at three boundaries: request body (413 before any forward), non-stream response (502), and SSE event (stream error, offending event withheld). One limit rather than one per walker |
+| `REDACT_REFERENCE_WORK_FACTOR` | 64 | deterministic work budget for the reference scanner, as a multiple of document length. Exceeding it refuses the request (413) rather than degrading the redaction |
 | `REDACT_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `HOST` | `127.0.0.1` | Node local adapter only |
 | `PORT` | `8787` | Node local adapter only |
@@ -240,6 +242,29 @@ Large base64 image/audio payload fields and URL/control fields are excluded from
 On memory-constrained deployments, lower `REDACT_MAX_BODY_BYTES`. It is the knob that bounds how much of a request is read: the read stops as soon as the cap is exceeded, and the body is never parsed, redacted or forwarded.
 
 `REDACT_MAX_REDACTIONS` additionally bounds the number of unique request-local entity mappings, but it is **not** a detector/merge CPU budget. It is consulted while tokens are minted, which happens after the parsers, detectors, span envelopes and merge have already run, so lowering it does not shorten the work done on a document full of candidates. It bounds distinct entity identities only: one identity repeated many times counts once. A real CPU bound would be a separate candidate-count or time budget enforced before the merge.
+
+## Limits and fail-closed behaviour
+
+These are the resource contracts, and every one of them refuses the request rather than
+degrading the redaction. A resource guard may decide *whether* a request is served; it never
+changes *what* redaction authority applies to it.
+
+| Limit | Behaviour when exceeded |
+|---|---|
+| `REDACT_MAX_BODY_BYTES` | The read is cancelled as soon as the cap is exceeded and the request is answered 413. The body is never parsed, redacted or forwarded. |
+| `REDACT_MAX_JSON_DEPTH` | 413 on the request path, before any upstream fetch; 502 for an over-deep non-stream upstream response, since the upstream call has already happened; a stream error on the SSE path, with the offending event withheld and the upstream reader cancelled. |
+| `REDACT_MAX_REDACTIONS` | Caps unique plaintext identities minted in one request. It bounds request-local mapping and output allocation, and it is **not** a detector or merge CPU budget: it is consulted while tokens are minted, after the parsers, detectors, envelopes and merge have run. |
+| `REDACT_REFERENCE_WORK_FACTOR` | Bounds the reference scanner's work deterministically. Exceeding it is a 413 with no upstream fetch. |
+
+Two further properties worth stating explicitly:
+
+- **The response path has no size cap.** The request side does. A deployment sizing memory
+  from `REDACT_MAX_BODY_BYTES` is sizing only half the path; measured amplification on the
+  non-stream JSON path is about 13.6x peak RSS for a 16 MiB response, with linear scaling.
+- **A parser failure and a policy failure are not the same thing.** Malformed JSON may fall
+  back to treating the body as inert text. A policy or traversal failure must fail closed,
+  because the inert-text fallback *resolves* tokens and would otherwise turn a failure into a
+  channel downgrade.
 
 ## Tests
 

@@ -12,6 +12,15 @@
     "perf:soak": "node scripts/perf.mjs --soak",
     "perf:redos": "node scripts/perf-redos.mjs"
   },
+  "files": [
+    "worker.js",
+    "node-server.mjs",
+    "wrangler.toml",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "engines": {
     "node": ">=20"
   },
