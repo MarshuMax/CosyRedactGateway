@@ -658,7 +658,7 @@ UNKNOWN token 形状  → 不享受任何豁免；strong binding / G / 其它 de
 
 **输入方向的 ownership 也与回程统一**：此前 `ForeignTokenRegistry` 只接在 `classifyRestore()` 上，输入 redaction 路径并未用它决定 foreign ownership——B 组测的是回程透传，不等于已支持 `input → model_visible`。现在 `RedactionContext` 接受 `foreignRegistry`，`isProtectedToken` 统一判定 own / registered-foreign；registry 的 token 与 namespace 命中也会作为候选进入 merge，由**同一个** ownership 过滤器决定去留。精确登记（`registerTokens`）本身即信任决定，不再受形状检查约束（与 `classifyOwnership` 同一规则）。
 
-**已知过渡缺口（显式测试记录）**：legacy `{{Redact:<64 hex>}}` 形状在输入方向**仍被豁免**，因为 v1 token 没有 request-local namespace，无法对照 mapping 校验。后果是与刚修掉的 v2 口子同形的绕过：任何人写一个 `{{Redact:<64 hex>}}` 就能让该值跳过。移除条件已在 9.1 写明——删除 legacy restore 分支时一并去掉，测试 `KNOWN TRANSITIONAL GAP` 会在那时失败提醒。
+**~~已知过渡缺口~~【已解决，见 9.22】** ~~legacy `{{Redact:<64 hex>}}` 形状在输入方向**仍被豁免**~~，因为 v1 token 没有 request-local namespace，无法对照 mapping 校验。后果是与刚修掉的 v2 口子同形的绕过：任何人写一个 `{{Redact:<64 hex>}}` 就能让该值跳过。移除条件已在 9.1 写明——删除 legacy restore 分支时一并去掉，测试 `KNOWN TRANSITIONAL GAP` 会在那时失败提醒。**G3 已执行该移除**：整个方言从生产代码删除，该测试改为"gap 已关闭"。
 
 #### 9.8.4a surrogate 与本层方言的交互
 
