@@ -370,7 +370,21 @@
       "separate_from_body_002": "Kept as its own finding. BODY-002 was the O(|out|^2) containment filter and is fixed; fixing it did not touch this term, and this term would not have been fixed by it. The measurements overlap in corpus shape but not in mechanism.",
       "evidence_that_the_lookup_is_the_term": "The mechanism is visible in the code rather than inferred: `for (const env of documentReferences)` runs once per span, and then the widening loop runs `for (const env of documentReferences)` again inside a while. Sorted-and-disjoint output is now established, so at most ONE envelope can contain any span, which makes the second loop provably dead and the first one a single-candidate test.",
       "proposed_fix": "Binary search for the last envelope with env.start <= span.start, then test only that candidate for env.end >= span.end and strict containment. No 'find narrowest, then widen to outermost' loop is needed, because disjointness means at most one envelope can contain a span. Acceptance: an exact differential of envelopeFor against the current implementation over spans before a ref, after a ref, exactly equal bounds, strictly inside, crossing either edge, between siblings, and inside nested-looking source text with a failed outer and successful inner.",
-      "not_yet_implemented": "Measurement only, per the instruction to prove a real problem before optimising. The problem is now proven; the fix is the next step."
+      "not_yet_implemented": "Measurement only, per the instruction to prove a real problem before optimising. The problem is now proven; the fix is the next step.",
+      "binary_search_change": {
+        "what_changed": "The per-span envelope lookup now uses an upper-bound binary search for the last envelope starting at or before the span, plus an explicit scan of the run of envelopes sharing span.start, instead of two full linear scans (the second of which was provably dead under the disjointness invariant).",
+        "result": "NEARLY NO PERFECT IMPROVEMENT: 16000 refs x 16000 spans went 8785.8ms -> 8042.4ms, about 8%, and us/row still rises 68 -> 74 -> 108 -> 169 -> 243 -> 503. The cost is NOT the lookup.",
+        "why_it_is_kept": "It is semantically equivalent for every input production can produce, it is strictly better asymptotically, and it removes a provably dead loop. But it must NOT be recorded as fixing this finding.",
+        "semantic_gap_found_and_handled": "The differential surfaced a real edge case the first version got wrong. Adjacent envelopes SHARE A BOUNDARY in production -- `${a}${b}` yields [0,4] and [4,8] -- so a span starting exactly on such a boundary is contained in the envelope that ENDS there, not only in the one that begins there, and the old rule took the NARROWER. Checking only the entry beginning at span.start picked the wider one. The lookup now considers both. The only inputs that still distinguish the two implementations are ZERO-WIDTH spans, which were not observed anywhere: across 20000 random strings plus targeted corpora, 0 of the spans found had start === end."
+      },
+      "revised_attribution": {
+        "method": "Ablation on the same corpus shape, m=2000 and m=8000, disabling references and secrets independently.",
+        "m_8000": "refs+secrets 1450.3ms ; refs only 46.0ms ; secrets only 1967.9ms ; neither 19.3ms",
+        "m_2000": "refs+secrets 186.6ms ; refs only 11.8ms ; secrets only 175.1ms ; neither 4.5ms",
+        "conclusion": "The reference machinery is about 3% of the cost. The dominant term is the SPAN side: a corpus of 8000 unique secrets with NO reference constructs at all costs 1967.9ms by itself.",
+        "narrowed_further": "Per-flag on 8000 unique secrets with no references: highEntropy 1528.3ms producing all 8000 spans; gitleaks 43.4ms producing 0; no detectors 13.6ms. And RedactionContext.redactText on the same text alone is 142.4ms at 2000 and 1343.1ms at 8000 -- a 4x input step giving 9.4x time. So the term is inside entropy scoring and/or the text-redaction pass, NOT the envelope lookup.",
+        "this_supersedes": "My earlier claim, written from reading the code rather than measuring, that the per-span `for (const env of documentReferences)` scan was the dominant term. It was plausible and wrong; the ablations above are what establish the real location."
+      }
     }
   ],
   "r3_3_baselines": {

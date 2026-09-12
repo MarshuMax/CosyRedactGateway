@@ -2906,27 +2906,61 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   }
 
   const documentReferences = referenceEnvelopes(text);
+
+  // ---------------------------------------------------------------------------------------------
+  // Binary-search lookup, correct ONLY because referenceEnvelopes() guarantees SORTED, PAIRWISE-
+  // DISJOINT envelopes (established and permanently tested in test/b2-containment.test.js).
+  //
+  // That invariant is what makes this a single-candidate test: if two envelopes both contained the
+  // same span they would overlap each other, which cannot happen. So "narrowest containing envelope,
+  // then widen to the outermost one containing that" collapses -- there is nothing to choose
+  // between, and the widening loop is provably dead.
+  //
+  // IF THE REFERENCE PARSER EVER RETURNS NESTED ENVELOPES, THIS LOOKUP MUST BE REVISITED. It would
+  // silently start returning an arbitrary one of several candidates instead of failing. The
+  // invariant test is the tripwire: do not delete it and do not relax the disjointness assertion.
+  //
+  // Replaces an O(spans x references) scan. Measured at 16000 constructs with 16000 surviving
+  // spans, that scan took 8.8 seconds with per-span cost rising sevenfold across the range
+  // (R3-BODY-004).
+  // ---------------------------------------------------------------------------------------------
+  // Both candidate rules, because envelopes may be ADJACENT with a shared boundary: `${a}${b}`
+  // yields [0,4] and [4,8]. The old rule picked the NARROWEST strict container, and when a span
+  // starts exactly on such a boundary both envelopes qualify, so only checking the one that begins
+  // there would differ from it -- and would pick the WIDER one.
+  const strictCandidate = (env, span) =>
+    env !== undefined
+    && env.end >= span.end
+    && (env.start < span.start || env.end > span.end)
+    && env.start <= span.start
+      ? env
+      : null;
   const envelopeFor = (span) => {
-    // Same selection rule as enclosingReference(): the narrowest construct that STRICTLY contains
-    // the span, then widened to the outermost one that contains that.
-    let best = null;
-    for (const env of documentReferences) {
-      if (env.start <= span.start && env.end >= span.end && (env.start < span.start || env.end > span.end)) {
-        if (!best || (env.end - env.start) < (best.end - best.start)) best = env;
-      }
+    let lo = 0;
+    let hi = documentReferences.length;
+    while (lo < hi) {
+      const mid = lo + ((hi - lo) >> 1);
+      if (documentReferences[mid].start <= span.start) lo = mid + 1;
+      else hi = mid;
     }
-    let widened = best;
-    let changed = true;
-    while (widened && changed) {
-      changed = false;
-      for (const env of documentReferences) {
-        if (env.start <= widened.start && env.end >= widened.end && (env.end - env.start) > (widened.end - widened.start)) {
-          widened = env;
-          changed = true;
-        }
-      }
+    if (lo === 0) return null;
+    // At most one envelope ENDS exactly at span.start and at most one BEGINS there (disjointness),
+    // but both can exist at once because adjacent envelopes share a boundary: `${a}${b}` gives
+    // [0,4] and [4,8]. A span sitting on that boundary is contained in the one that ends there, and
+    // for a zero-width span also in the one that begins there. The old rule took the NARROWER, so
+    // both must be considered -- checking only the one that begins at span.start picks the wider.
+    //
+    // The loop covers the run of entries sharing span.start; `begin` is found by walking back
+    // because that run can start at or BEFORE lo-1.
+    let best = strictCandidate(documentReferences[lo - 1], span);
+    let begin = lo - 1;
+    while (begin > 0 && documentReferences[begin - 1].start === span.start) begin--;
+    for (let i = begin; i < documentReferences.length && documentReferences[i].start <= span.start; i++) {
+      const cand = strictCandidate(documentReferences[i], span);
+      // `<=` keeps the LAST of equally narrow candidates, matching the old scan's list order.
+      if (cand && (!best || (cand.end - cand.start) <= (best.end - best.start))) best = cand;
     }
-    return widened;
+    return best;
   };
   const enveloped = padded.map((span) => {
     const env = envelopeFor(span);
