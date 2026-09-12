@@ -1917,6 +1917,47 @@ registry matcher flags                 → 仍含 y    ✅ 未被永久改写
 
 另一条「admission 不被放宽」最初断言在 **span** 上，但 span 也可能由 strong binding 产生，测试会因错误原因通过。改为直接断言**权威判定**（`classifyOwnership` → `UNKNOWN`、`isProtectedToken` → false），并附**大小写对照**（精确大小写被准入），确保拒绝的原因是大小写而非 registry 失效。
 
+## 9.30 R2.2 Streaming / SSE Fragmentation（已实现，**无新 finding**）
+
+### 两个 oracle，严格分开
+
+**A. Transport fragmentation** —— SSE **字节完全相同**，只改变 HTTP chunk 边界：
+
+```
+gateway(fragmented bytes) === gateway(unsplit bytes)   逐字节
+```
+
+**B. Logical delta fragmentation** —— 同一逻辑文本由**不同数量**的 SSE 事件承载。**raw 相等在这里是错的**：`SseRestorer` 合并 channel 后把 restored 内容放在该 run 的**第一条 record**，后续 delta 合法地变成空串，事件数量与 JSON 表示可以不同。
+
+```
+canonical(fragmented logical events) === canonical(single logical event)
+```
+
+另**单独**验证：每个 event 仍可解析、顺序不变、元数据不丢、sink policy 不变。
+
+混用两者是这套测试要防的错误：**用 raw 相等测 B 会在正确行为上失败，用 canonical 测 A 会掩盖真实的字节变化。**
+
+### 覆盖
+
+`test/adversarial/streaming.test.js` + `streaming-helpers.mjs`
+
+**A（5 条）**：每一个切分点（穷举）、逐字节 chunk、随机 2~8 段、**UTF-8 多字节序列在 chunk 边界被切开**、五种 sink channel（`output_text` / `function_call_arguments` / `mcp_call_arguments` / `custom_tool_call_input` / 未知事件）。
+
+**B（7 条）**：canonicalizer 自身守卫（并**演示两个 oracle 确实不同**）、surrogate 跨事件分片、元数据与顺序保持、sink policy 不变、未知事件不因分片获得 RESTORE 权限、无关 base64 不被 hold 或改写、seeded 探索 120 例。
+
+### 结论
+
+**transport 层逐字节等价**（穷举所有切分点验证）；**logical 层 canonical 等价**；两者均未发现缺陷。
+
+### 本轮修正的四处**测试方法**错误（无一是实现缺陷）
+
+1. **跨请求比较 token**：我先跑基线、再用**基线 token** 构造另一个请求，差异来自随机 request-id 而非分片。改为**每次 trip 用自己铸出的 token 构造事件、比较前归一化 token**（token 跨请求唯一性由 R0.2.1 的独立不变量测试保证，不在此重复断言）。
+2. **canonicalizer 把元数据也拼接**：`type` 是事件类型、每个事件都出现，按内容拼接会重复计数，使**正确合并的结果与单事件不等**——一个假 oracle。改为区分 **content field**（`delta` / `text` / `partial_json` / `arguments` / `input` / `content` / `output_text`，累积）与 **metadata**（其余，单独校验保持性）。
+3. **在 raw 输出里搜值**：分片会合法地把一个值分配到**两个 delta 字段**，原文不再连续。改为在**重组后的 canonical content** 里搜索。
+4. **分发载荷时漏掉前缀**：whole 用 `curl x?y=<token>`、split 只用 `<token>` 两段——**两侧根本不是同一逻辑内容**。另有一条 fixture 断言了 `minted`，但 surrogate 字段下 upstream 根本看不到 CRG token，该断言不适用。
+
+第 4 条尤其值得记：我当时一度怀疑是 **gateway 丢前缀**。用 `restoreSseStream` 隔离后证明 SSE 层**保留前缀**、合并完全正确，问题在我的 harness。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
