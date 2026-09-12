@@ -1869,21 +1869,53 @@ function namespaceMatches(matcher, value) {
 
 `y` 保留 sticky 语义（只匹配 offset 0），这是调用方声明的含义——已用测试固定。
 
-## 9.29.3 R2-REG-002（open，**不在本次修复范围**）
+## 9.29.3 R2-REG-002 已修复（fixed）
 
-修 R2-REG-001 过程中发现**独立缺陷**：sticky matcher **无法在文档中间找到 token**。
+**判定**：Severity Low，但属 **release-blocking correctness**——它破坏的是**既定 tool-sink contract**，而不是未承诺的特性。
+
+### 缺陷
+
+sticky matcher **无法在文档中间找到 token**：
 
 ```
-namespaceOf("ACME_ABCDEF_0001")            = acme   （offset 0 命中）
-namespaceOf("curl x?y=ACME_ABCDEF_0001")   = null   （有前缀即找不到）
+namespaceOf("ACME_ABCDEF_0001")           = acme   （offset 0 命中）
+namespaceOf("curl x?y=ACME_ABCDEF_0001")  = null   （有前缀即找不到）
 → untrusted tool operand 被交付而不是 BLOCK
 ```
 
-**已用 `git stash` 验证修复前后行为完全一致** ⇒ 既有缺陷，与 R2-REG-001 **无关**。按 R2 规则**不扩大当前 finding 范围**（避免"17 个现象、1 个 root cause"的错误归因），作为独立条目 `R2-REG-002` 记入 corpus，status `open`。
+用 `git stash` 验证过修复前后行为一致 ⇒ 既有缺陷，与 R2-REG-001 无关。
 
-**影响**：prose 与 operand 两个通道对同一 registration 给出不同结论；**无明文暴露**（失败方向是"交出一个本层无法解析的 token"）；仅在 sticky matcher 下可达。Severity Low。
+### 修复：`namespaceFindAll` 是**文档搜索**，不是 membership predicate
 
-**候选修法（未实施）**：拆分两个操作——ownership 谓词保持锚定（`namespaceMatches` 从 0 开始，保留 sticky/大小写声明的含义），而**文档扫描改为非锚定**（`namespaceFindAll` 剥掉 `g`/`y` 扫描全部出现）。ownership 仍由同一谓词决定，因此**不扩大准入**。
+**`namespaceOf` 完全不动**——它问的是"**整个字符串**是否属于该 namespace"，所以保留 matcher 声明的语义，包括 sticky 的"只在 offset 0"。
+
+扫描问的是"该 namespace 在文档的什么位置出现"，sticky/有状态 matcher 会答错。因此：
+
+```js
+search clone   → 去掉 y、确保 g        （可在任意 offset 找 candidate）
+original       → 完全不动              （membership 仍保留 sticky 语义）
+找到后          → 重新 namespaceMatches(original, value)
+```
+
+**discovery ≠ authority**：clone 只提出候选，原 matcher 决定。这既让 sticky 对"整串成员性"仍然有意义，又不让它蒙住扫描，而且 **registry 自己的 matcher 永不被人为改写**。
+
+### 两个方向都固定
+
+```
+namespaceOf(TOKEN)          = acme    ← 不变
+namespaceOf(prefix + TOKEN) = null    ← 不变（sticky 语义保留）
+operand ("curl x?y=" + TOKEN)          → BLOCKED  ✅ 已收口
+prose                                  → 保留      ✅ 两通道现在一致
+registry matcher flags                 → 仍含 y    ✅ 未被永久改写
+```
+
+### 回归（含一条我写错后修正的表）
+
+`每一组 flag 组合`都要求：offset 0 成员性成立、**文档中间能被扫到**、且 prefixed 整串的成员性遵循**声明语义**。
+
+我最初把期望表写成"`gi` 也是锚定的"——**错**：只有 sticky 才是锚定的，`gi` 无锚定、本就能匹配中间位置。已修正为 `y` / `gy` 锚定，其余不锚定。
+
+另一条「admission 不被放宽」最初断言在 **span** 上，但 span 也可能由 strong binding 产生，测试会因错误原因通过。改为直接断言**权威判定**（`classifyOwnership` → `UNKNOWN`、`isProtectedToken` → false），并附**大小写对照**（精确大小写被准入），确保拒绝的原因是大小写而非 registry 失效。
 
 ## 10. 未解决问题 / 待验证
 

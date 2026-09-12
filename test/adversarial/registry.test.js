@@ -231,12 +231,9 @@ test("R2-REG: sink policy agrees with ownership for every registration shape [GR
   // Extends the agreement to the consumer: a registered foreign token is refused as an operand
   // and preserved in prose, whatever flags the matcher carries.
   //
-  // SCOPE: `g` and plain matchers. `y` is deliberately excluded here and covered as its own
-  // observation below -- a sticky matcher only matches at index 0, so it cannot FIND a token that
-  // appears later in a document. That is a separate, pre-existing defect, verified to behave
-  // identically before and after the R2-REG-001 fix, and folding it into this finding would be
-  // exactly the "17 symptoms, 1 root cause" mistake R2 exists to avoid.
-  for (const flags of ["", "g"]) {
+  // SCOPE: all three flag families. `y` was excluded while R2-REG-002 was open, because a sticky
+  // matcher could not find a token mid-document; that is fixed, so the exclusion is gone.
+  for (const flags of ["", "g", "y"]) {
     const registry = registryWith(flags);
     const ctx = new RedactionContext({ salt: "r2", foreignRegistry: registry });
 
@@ -273,41 +270,91 @@ test("R2-REG OBSERVATION: repeated occurrences always resolve to the FIRST index
   assert.notDeepEqual(viaIndexOf, real, "so indexOf is not a substitute for real match positions");
 });
 
-test("R2-REG OBSERVATION: a STICKY matcher cannot find a token mid-document [GREEN NOW]", () => {
-  // INDEPENDENT, PRE-EXISTING, and NOT part of R2-REG-001. Verified by stashing the fix and
-  // re-running: the behaviour below is identical before and after, so the stateful-matcher fix
-  // neither caused nor cured it.
+test("R2-REG-002: a sticky matcher still finds a token mid-document, without changing namespaceOf [GREEN NOW]", () => {
+  // The defect: a sticky matcher anchors every attempt at lastIndex, so the DOCUMENT SCAN could
+  // not find a token that had anything before it. One registration then behaved differently in
+  // the two channels -- ownership-recognised in prose, invisible as an operand, so the operand was
+  // delivered instead of refused.
   //
-  // The mechanism: `namespaceOf` calls `.test()` with the cursor at 0, so for a sticky matcher it
-  // matches only at position 0. `namespaceFindAll` uses `String.match`, which with the `y` flag is
-  // likewise anchored at `lastIndex`. Reading a document for foreign tokens is a SEARCH, not a
-  // membership test at offset 0, so a sticky registration can never be found once anything
-  // precedes it.
-  //
-  // Consequence, asserted so it cannot drift silently: with `y`, a foreign token is OWNERSHIP-
-  // RECOGNISED when it stands alone (prose preserves it) but NOT FOUND when it appears inside a
-  // longer string, so an operand carrying it is delivered instead of refused. No plaintext is
-  // exposed -- the failure direction is "this layer hands over a token it cannot resolve", which
-  // the outer DLP owns -- but the two channels disagree for one registration.
+  // The fix separates the two questions. `namespaceOf` keeps the matcher's declared semantics
+  // exactly; the scan runs on a clone with `y` removed, and every candidate it proposes is
+  // re-checked against the ORIGINAL matcher. Discovery is not authority.
   const sticky = registryWith("y");
   const ctx = new RedactionContext({ salt: "r2", foreignRegistry: sticky });
 
-  // Ownership at offset 0: recognised.
-  assert.equal(sticky.namespaceOf(TOKEN), "acme", "sticky matches the token standing alone");
-  assert.equal(ctx.isProtectedToken(TOKEN), true, "so it is protected");
+  // Membership is UNCHANGED, in both directions. This is the part that must not move.
+  assert.equal(sticky.namespaceOf(TOKEN), "acme", "a whole token still matches at offset 0");
+  assert.equal(sticky.namespaceOf(`curl x?y=${TOKEN}`), null, "sticky still refuses a string with a prefix");
 
-  // Inside a longer string: not found.
+  // The scan now finds it, so the operand is refused.
   const embedded = `curl x?y=${TOKEN}`;
-  assert.equal(sticky.namespaceOf(embedded), null, "sticky does not match with a prefix present");
   const operand = applySinkPolicy(embedded, ctx, { kind: "tool_argument" }, null, sticky);
-  assert.equal(operand.text.includes(TOKEN), true, "so the operand is delivered rather than refused");
+  assert.equal(operand.blocked, true, "an untrusted operand must refuse a token the registry owns");
+  assert.equal(operand.text.includes(TOKEN), false, "and must not deliver it");
 
-  // The control: the equivalent non-sticky matcher behaves consistently in both channels.
-  const normal = registryWith("g");
-  const normalCtx = new RedactionContext({ salt: "r2", foreignRegistry: normal });
-  assert.equal(normal.namespaceOf(TOKEN), "acme");
-  assert.equal(applySinkPolicy(embedded, normalCtx, { kind: "tool_argument" }, null, normal).blocked, true,
-    "a non-sticky matcher refuses the operand, which is the expected behaviour");
+  // Prose still preserves it, which it did before too: the channels now AGREE.
+  assert.equal(applySinkPolicy(TOKEN, ctx, { kind: "assistant_text" }, null, sticky).text, TOKEN);
+
+  // The registry's own matcher is not permanently rewritten: the sticky flag is still there.
+  assert.match(sticky.namespaces[0].matcher.flags, /y/, "the registry keeps its declared flags");
+});
+
+test("R2-REG-002: every matcher flag combination scans AND keeps its membership semantics [GREEN NOW]", () => {
+  // The class, not the one example. For every flag set: membership at offset 0 works, membership
+  // of a prefixed string follows the DECLARED semantics (sticky refuses, everything else accepts),
+  // and the scan finds the token inside a document either way.
+  const embedded = `curl x?y=${TOKEN}`;
+  // Membership of a PREFIXED WHOLE STRING follows the matcher's declared semantics. Only a sticky
+  // matcher is anchored, so only `y` and `gy` refuse the prefixed form -- `gi` is unanchored and
+  // matches mid-string, which an earlier version of this table got wrong.
+  const expectations = [
+    ["", true], ["g", true], ["y", false], ["gi", true], ["gy", false], ["gm", true],
+  ];
+  for (const [flags, prefixedIsMember] of expectations) {
+    const registry = registryWith(flags);
+    assert.equal(registry.namespaceOf(TOKEN), "acme", `flags=${flags}: membership at offset 0`);
+
+    const ctx = new RedactionContext({ salt: "r2", foreignRegistry: registry });
+    const found = findSensitiveSpans(embedded, FLAGS, {
+      isProtectedToken: ctx.isProtectedToken,
+      foreignRegistry: registry,
+      coverage: null,
+    });
+    const recognised = !found.some((sp) => embedded.slice(sp.start, sp.end).includes(TOKEN));
+    assert.equal(recognised, true, `flags=${flags}: the scan must find the token mid-document`);
+
+    // And the declared membership semantics are preserved for a PREFIXED whole string.
+    const prefixedVerdict = registry.namespaceOf(embedded) !== null;
+    assert.equal(prefixedVerdict, prefixedIsMember, `flags=${flags}: membership of a prefixed string changed`);
+  }
+});
+
+test("R2-REG-002: widening the SEARCH does not widen ADMISSION [GREEN NOW]", () => {
+  // The safety property of "discovery is not authority". The scan clone is more permissive than the
+  // registry's matcher -- it drops `y` and picks up `g` -- so the re-check against the original is
+  // the only thing standing between a wider search and a wider admission.
+  //
+  // Asserted on the authority itself rather than on a span, because a span can also be produced by
+  // a strong binding, which would make the test pass for the wrong reason. An earlier version of
+  // this test did exactly that.
+  const registry = new ForeignTokenRegistry([{ name: "acme", pattern: /ACME_[A-Z0-9_]+/ }]);
+  const ctx = new RedactionContext({ salt: "r2", foreignRegistry: registry });
+
+  // Case sensitivity is the observable form: the scan finds the lower-case candidate, and the
+  // original matcher rejects it.
+  assert.equal(registry.namespaceOf("acme_abcdef_0001"), null, "the registry matcher is case-sensitive");
+  assert.equal(classifyOwnership("acme_abcdef_0001", ctx, registry).ownership, "UNKNOWN",
+    "a candidate the original rejects must not acquire foreign ownership");
+  assert.equal(ctx.isProtectedToken("acme_abcdef_0001"), false, "nor protection");
+
+  // The control: the exact-case value IS admitted, so the rejection above is about case and not
+  // about the registry being inert.
+  assert.equal(classifyOwnership(TOKEN, ctx, registry).ownership, "FOREIGN_REGISTERED");
+
+  // And a sticky registration still admits its own token -- the fix widened the SCAN only.
+  const sticky = registryWith("y");
+  const stickyCtx = new RedactionContext({ salt: "r2", foreignRegistry: sticky });
+  assert.equal(classifyOwnership(TOKEN, stickyCtx, sticky).ownership, "FOREIGN_REGISTERED");
 });
 
 test("R2-REG OBSERVATION: a capture-group matcher is evaluated on the full match [GREEN NOW]", () => {

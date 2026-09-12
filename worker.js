@@ -166,18 +166,34 @@ function namespaceMatches(matcher, value) {
 }
 
 /**
- * Every occurrence of a namespace matcher in `text`, with the cursor handled the same way.
- * `String.prototype.match` on a g/y regex ALSO reads and writes `lastIndex`, so the three call
- * sites that enumerate matches need the same treatment as the membership test.
+ * Every occurrence of a namespace matcher in `text` -- a DOCUMENT SEARCH, not a membership
+ * predicate, and the two are not the same question.
+ *
+ * `namespaceOf` asks "is this whole string a token of this namespace", so it keeps the matcher's
+ * declared semantics exactly, including a sticky matcher's "only at offset 0".
+ *
+ * Scanning a document asks "where does this namespace appear", and a sticky or stateful matcher
+ * answers that question wrongly: `y` anchors every attempt at `lastIndex`, so a token with
+ * anything before it is never found. So the SEARCH runs on a clone with `y` removed and `g`
+ * ensured, and then every candidate is re-checked against the ORIGINAL matcher.
+ *
+ * Discovery is not authority: the clone only proposes candidates, the original decides. That
+ * keeps a sticky matcher meaningful for whole-token membership without letting it blind the
+ * scan, and it means the registry's own matcher is never permanently rewritten.
  */
 function namespaceFindAll(matcher, text) {
-  matcher.lastIndex = 0;
-  try {
-    const found = text.match(matcher);
-    return found ? [...found] : [];
-  } finally {
-    matcher.lastIndex = 0;
+  const flagsWithoutSticky = matcher.flags.replace(/y/g, "");
+  const flags = flagsWithoutSticky.includes("g") ? flagsWithoutSticky : `${flagsWithoutSticky}g`;
+  const scanner = new RegExp(matcher.source, flags);
+  const out = [];
+  for (const match of text.matchAll(scanner)) {
+    const value = match[0];
+    if (!value) continue;
+    // Re-validated against the original matcher, which is what makes this safe.
+    if (!namespaceMatches(matcher, value)) continue;
+    out.push(value);
   }
+  return out;
 }
 
 // Namespaces are TRUSTED CONFIGURATION, not payload-derived data. A broad
