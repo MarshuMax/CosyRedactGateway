@@ -57,6 +57,78 @@ export function isRedactedText(value) {
 export function legacyRedactToken(hex) {
   return LEGACY_TOKEN_PREFIX + hex + "}}";
 }
+
+// ---------------------------------------------------------------- sink policy ---
+
+// Tool Sink Policy (DESIGN-v2.md section 6.8).
+//
+// An unknown token that is protected-token-LIKE is not merely "a string we could
+// not map". In assistant prose it is inert text. In a sensitive sink it is a
+// directive whose operand cannot be resolved: restoring it is impossible (no
+// mapping entry) and forwarding it unchanged sends a token downstream where it
+// has no meaning. Blocking is the only honest outcome.
+//
+// The condition requires all three at once, so ordinary identifiers -- trace ids,
+// request ids, opaque application ids, cloud resource names -- are never caught:
+//   1. the token is unknown to this request's mapping
+//   2. it is protected-token-like (see PROTECTED_TOKEN_LIKE_RE)
+//   3. the sink is sensitive
+export const SENSITIVE_SINK_KINDS = Object.freeze([
+  "shell",
+  "network_egress",
+  "database",
+  "email",
+]);
+
+// Deliberately narrow. A shape that merely looks "random" is not enough: the
+// point is to recognise our own (and a registered foreign namespace's) token
+// dialect, not to guess at opaque identifiers in general.
+export const PROTECTED_TOKEN_LIKE_RE =
+  /(?<![A-Za-z0-9_])(?:CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}|\{\{Redact:[a-f0-9]{64}\}\})(?![A-Za-z0-9_])/;
+
+export function isProtectedTokenLike(value) {
+  return typeof value === "string" && PROTECTED_TOKEN_LIKE_RE.test(value);
+}
+
+export const RESTORE_ACTION = Object.freeze({
+  RESTORE: "restore",
+  PRESERVE: "preserve",
+  BLOCK: "block",
+});
+
+export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }) {
+  if (typeof text !== "string") throw new TypeError("classifyRestore requires text");
+  const sensitive = SENSITIVE_SINK_KINDS.includes(sink.kind);
+  let known = 0;
+  const unknownTokens = [];
+
+  for (const token of text.match(REDACTED_TOKEN) || []) {
+    if (ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token)) {
+      known += 1;
+      continue;
+    }
+    if (!isProtectedTokenLike(token)) continue;
+    if (sensitive) {
+      return {
+        action: RESTORE_ACTION.BLOCK,
+        text,
+        unknownTokens: [token],
+        telemetry: { event: "restore_miss_blocked", sink: sink.kind, tokenShape: "protected" },
+      };
+    }
+    if (!unknownTokens.includes(token)) unknownTokens.push(token);
+  }
+
+  const output = ctx && typeof ctx.restoreText === "function" ? ctx.restoreText(text) : text;
+  return {
+    action: RESTORE_ACTION.RESTORE,
+    text: output,
+    unknownTokens,
+    telemetry: unknownTokens.length
+      ? { event: "restore_miss", sink: sink.kind, count: unknownTokens.length, knownCount: known }
+      : { event: "restore_ok", sink: sink.kind, count: known },
+  };
+}
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_REDACTIONS = 16384;
 const textEncoder = new TextEncoder();

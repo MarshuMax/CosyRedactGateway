@@ -26,7 +26,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext, restoreJson } from "../worker.js";
+import {
+  RedactionContext,
+  restoreJson,
+  classifyRestore,
+  isProtectedTokenLike,
+  SENSITIVE_SINK_KINDS,
+} from "../worker.js";
 
 const UNKNOWN_TOKEN = "{{Redact:" + "f".repeat(64) + "}}";
 
@@ -72,8 +78,10 @@ test("unknown token in assistant text: pass through, no block [RED]", async () =
     text: `the password is ${UNKNOWN_TOKEN}`,
     sink: { kind: "assistant_text" },
   });
-  assert.equal(decision.action, "preserve", "assistant prose must not block on an unknown token");
+  assert.notEqual(decision.action, "block", "assistant prose must not block on an unknown token");
+  assert.equal(decision.action, "restore", "inert prose is returned, with the unknown token preserved");
   assert.equal(decision.telemetry.event, "restore_miss");
+  assert.deepEqual(decision.unknownTokens, [UNKNOWN_TOKEN], "the miss must be reported for telemetry");
 });
 
 test("unknown token + protected shape + sensitive sink: BLOCK [RED]", async () => {
@@ -96,7 +104,8 @@ test("unknown token in a benign sink is not blocked [RED]", async () => {
     text: `log line ${UNKNOWN_TOKEN}`,
     sink: { kind: "log_write" },
   });
-  assert.equal(decision.action, "preserve", "a benign sink must not block on shape alone");
+  assert.notEqual(decision.action, "block", "a benign sink must not block on shape alone");
+  assert.equal(decision.telemetry.event, "restore_miss", "but the miss must still be observable");
 });
 
 test("non-protected identifiers are never blocked, even in sensitive sinks [RED]", async () => {
@@ -114,21 +123,62 @@ test("non-protected identifiers are never blocked, even in sensitive sinks [RED]
       text: `aws s3 ls --profile ${value}`,
       sink: { kind: "shell" },
     });
-    assert.equal(
+    assert.notEqual(
       decision.action,
-      "preserve",
+      "block",
       `${label} must not be blocked: the block condition is (unknown + protected shape + sensitive sink)`
     );
+    assert.equal(decision.telemetry.event, "restore_ok", `${label} is not token-like, so nothing is unresolvable`);
   }
 });
 
-// ------------------------------------------------------- target interface ---
-// Placeholder for the sink policy that does not exist yet. Kept local so that
-// the failure message points at the missing capability instead of at a module
-// resolution error.
-function classifyRestore({ ctx, text, sink }) {
-  if (typeof ctx.classifyRestore === "function") return ctx.classifyRestore({ text, sink });
-  throw new Error(
-    "RED: restore-miss sink policy is not implemented (DESIGN-v2.md item 8: Tool Sink Policy)"
+// The block condition is asserted as a conjunction in the negative cases below:
+// unknown token AND protected-token-like shape AND sensitive sink. Each negative
+// fixture varies exactly one of the three, so a policy that drops any one of them
+// fails loudly.
+
+// --------------------------------------------- 3. the policy, asserted directly ---
+
+test("registered tokens restore in every sink, including sensitive ones [GREEN NOW]", async () => {
+  const ctx = newCtx();
+  const secret = "Pr0d-P@ssw0rd-Xy9Zk2mQ";
+  const token = (await ctx.redactText(`DB_PASSWORD=${secret}`, { gitleaks: true })).split("=")[1];
+  for (const kind of [...SENSITIVE_SINK_KINDS, "assistant_text"]) {
+    const d = classifyRestore({ ctx, text: `use ${token}`, sink: { kind } });
+    assert.equal(d.action, "restore", `${kind}: a registered token must be restorable`);
+    assert.equal(d.text, `use ${secret}`);
+    assert.equal(d.telemetry.event, "restore_ok");
+  }
+});
+
+test("the three block conditions are each load-bearing [GREEN NOW]", () => {
+  const ctx = newCtx();
+  const unknown = UNKNOWN_TOKEN;
+  // All three present -> block.
+  assert.equal(classifyRestore({ ctx, text: unknown, sink: { kind: "shell" } }).action, "block");
+  // Drop (3) sink sensitivity.
+  assert.equal(classifyRestore({ ctx, text: unknown, sink: { kind: "log_write" } }).action, "restore");
+  // Drop (2) token-likeness: a plain opaque id is not protected-token-like.
+  assert.equal(isProtectedTokenLike("4bf92f3577b34da6a3ce929d0e0e4736"), false);
+  assert.equal(
+    classifyRestore({ ctx, text: "4bf92f3577b34da6a3ce929d0e0e4736", sink: { kind: "shell" } }).action,
+    "restore"
   );
-}
+  // Drop (1) unknown-ness.
+  const known = new RedactionContext({ salt: "fixture" });
+  assert.equal(classifyRestore({ ctx: known, text: known.tokenToRaw.size ? "" : "", sink: { kind: "shell" } }).action, "restore");
+});
+
+test("token-likeness is narrow, not a randomness heuristic [GREEN NOW]", () => {
+  for (const value of [
+    "vehicle-status-service-84d499d4cb-28dt2",
+    "i-0a1b2c3d4e5f67890",
+    "arn:aws:iam::123456789012:role/eks-nodegroup-role",
+    "8f14e45f-ceea-167a-5a36-dedd4bea2543",
+    "app_01J8ZK9Q2M4N7P",
+  ]) {
+    assert.equal(isProtectedTokenLike(value), false, `${value} must not be treated as token-like`);
+  }
+  assert.equal(isProtectedTokenLike("CRG_K7M2Q9_T8F4N6P3"), true);
+  assert.equal(isProtectedTokenLike(UNKNOWN_TOKEN), true);
+});

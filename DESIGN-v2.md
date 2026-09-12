@@ -363,6 +363,22 @@ Sink      { kind, restore: bool, reason }
 1. `assert.match(x, GLOBAL_RE)` **不可用**：带 `g` 的正则 `.test()` 有 `lastIndex` 语义，断言会随调用次数翻转。断言统一用 `isRedactedText()` 或非全局正则。
 2. 用 `out.includes("{{Redact:")` 之类**字面量判据**判断"是否被脱敏"，在格式迁移后会静默失真（新格式下恒为 false）。所有此类判据已改为 `isRedactedText()`。
 
+## 9.2 Tool Sink Policy（已实现）
+
+实现：`classifyRestore({ ctx, text, sink }) -> { action, text, unknownTokens, telemetry }`，动作取自 `RESTORE_ACTION`（`restore` / `preserve` / `block`），敏感 sink 集合是 `SENSITIVE_SINK_KINDS`（`shell` / `network_egress` / `database` / `email`）。
+
+阻断条件是**三个条件的合取**，缺一不可：
+
+1. token 在本请求映射中**未知**（`tokenToRaw` 查不到）
+2. token 是 **protected-token-like**（`isProtectedTokenLike`）
+3. sink **敏感**
+
+`PROTECTED_TOKEN_LIKE_RE` 刻意收窄：只认本网关的 token 方言（`CRG_<id>_<id>`）与 legacy `{{Redact:<64 hex>}}`。它**不是随机性启发式**——`i-0a1b2c3d4e5f67890`、`arn:aws:iam::123456789012:role/...`、`8f14e45f-ceea-...`、`app_01J8ZK9Q2M4N7P`、`vehicle-status-service-84d499d4cb-28dt2` 全部不匹配，因此不会被误伤。
+
+telemetry 三种：`restore_ok`（全部已登记）/ `restore_miss`（存在未知 token-like 但在非敏感 sink，原样透传并上报）/ `restore_miss_blocked`（敏感 sink 命中，阻断）。
+
+与 `restoreText` 的分工：`restoreText` 只做映射查找，不改行为；策略层独立判定。既有语义（未知 token 原样透传）因此保持不变，策略是**附加**判定而不是替换。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
