@@ -705,6 +705,62 @@ UNKNOWN token 形状  → 不享受任何豁免；strong binding / G / 其它 de
 
 header 的 `valueStart` 最初用多个长度相减推算，得到**负偏移**（尾部空白差值与值长度相减顺序错误），输出出现重叠。改为**锚定值本身**（`line.lastIndexOf(secret)`）——header 的秘密就是行尾值，最后一次出现即 span。
 
+## 9.12 Parser coverage（已实现，仅可观测）
+
+**度量单位是 parser attempt，不是"没解析的字节数"。** 后者会让每句自然语言都成为 UNKNOWN，指标失去意义。attempt = parser 能识别、因而有义务定位的结构。
+
+| 状态 | 含义 | 计入 UNKNOWN |
+|---|---|---|
+| `PARSED` | 结构被识别且完整定位 | 否 |
+| `PARTIAL` | 识别到容器/绑定起点，但存在未建模部分（YAML path 退化、shell 引号形式等） | 否 |
+| `FAILED` | 有足够证据触发尝试，但无法安全定位 | **是** |
+| `NOT_APPLICABLE` | 根本不像该格式（普通自然语言） | 否，且**完全不记录** |
+
+### 遥测内容（不含原文）
+
+```js
+{ parser: "yaml"|"env"|"shell"|"header"|"url",
+  status: "PARSED"|"PARTIAL"|"FAILED",
+  regionStart, regionEnd, bytes, jsonPath? }
+```
+
+**不记录原始内容**——只有偏移、状态、计数。测试断言 coverage 输出中不出现秘密、键名或任何片段。
+
+### 请求级汇总
+
+`RedactionContext.coverageSummary()` 返回 `attempted_regions` / `parsed_regions` / `partial_regions` / `failed_regions` / `attempted_bytes` / `located_bytes` / `unknown_bytes` / `byParser`。
+
+**字节数对 region 做 union**，因此两个 parser 看同一段文本不会 double count；per-parser 计数仍分别统计（那里相加是有意义的）。测试断言 `attempted_bytes ≤ payload 长度`。
+
+### "像某格式"的判据刻意收窄
+
+否则指标会被散文淹没：
+
+- header：需要**带连字符的头部名**或已知头前缀（`Error: connection refused` 不计）；
+- YAML：需要**单个 token + 冒号**（`my key here: value` 不计）。
+
+**已记录的语义边界**：`Error: connection refused` 会被 YAML parser 报为 `PARSED`，因为**它确实是合法 YAML**（`Error` 是键）。要求它不计入就等于要求 parser 谎报语法。真正承载信号的是 `unknown_bytes`——任何散文都不得进入 `FAILED`。
+
+### 实测基线（8 份真实形态语料，1100 字节）
+
+| corpus | bytes | att | parsed | partial | failed | attB | unkB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| K8s Secret 清单 | 114 | 8 | 8 | 0 | 0 | 107 | 0 |
+| .env 文件 | 125 | 5 | 5 | 0 | 0 | 108 | 0 |
+| Helm values | 170 | 8 | 8 | 0 | 0 | 154 | 0 |
+| 粘贴 curl + header | 153 | 3 | 3 | 0 | 0 | 152 | 0 |
+| 排错日志（含散文） | 250 | 3 | 3 | 0 | 0 | 142 | 0 |
+| **纯散文** | 190 | **0** | 0 | 0 | 0 | **0** | 0 |
+| 退化 YAML（sequence） | 98 | 5 | 2 | **3** | 0 | 94 | 0 |
+
+UNKNOWN 占比 **0.00%**（该语料无不可定位形态），attempt 覆盖率 68.8%。纯散文 0 attempt、0 字节。
+
+**第一刀只做可观测，不因 UNKNOWN 比例高而 block**。阈值/告警留待更多真实语料之后再定。
+
+### 实现期修正
+
+`unionBytes` 原以 `-1` 作哨兵，导致**从 0 开始的 region 永远不计入**，所有字节统计恒为 0；`summary()` 又把 `{regionStart,regionEnd}` 记录直接传给期望 `{start,end}` 的 `unionBytes`，过滤条件退化为 `undefined > undefined`。两处均已修，并加边界用例（重叠 / 相邻 / 乱序 / 从 0 开始）。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
@@ -713,7 +769,7 @@ header 的 `valueStart` 最初用多个长度相减推算，得到**负偏移**�
 3. **【待验证】** schema 类型受限位置（number / boolean / enum）的替换策略需要真实 API server 或 provider schema 验证，当前只有"fail-closed"这一个保守选项。
 4. **【待验证】** 跨层归属的显式声明机制：网关与外层 DLP 如何协商 EXCLUSIVE / PASS_THROUGH（响应头、部署配置或共享清单），以及不一致时的检测点。
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
-6. **【已部分落地】** Parser 覆盖率：YAML block scalar（`|` `>` 及 chomping/缩进指示符）与 URL percent-encoding 已实现并有测试；**锚点别名、shell 引号与转义、多行 `.env` 仍无实现数据**，覆盖率度量机制（"未解析区域进入 UNKNOWN"）尚未建立。
+6. **【覆盖率机制已建立，见 9.12】** 已实现 attempt 级 coverage（PARSED/PARTIAL/FAILED/NOT_APPLICABLE）与请求级 union 汇总，并有 8 份语料基线。仍**无实现数据**的部分：YAML 锚点/别名、shell 引号与转义、多行 `.env`——这些目前会体现为 PARTIAL 或不计入，需要更大语料才能定量。
 7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。

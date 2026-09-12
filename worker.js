@@ -1107,7 +1107,7 @@ export function applyObjectSchema(text, spans) {
 // (Content-Type, Accept, User-Agent, Host, X-Request-Id, ...) is left alone.
 const SENSITIVE_HEADER_RE = /^(?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|private-token|x-gitlab-token|x-vault-token|x-token)$/i;
 
-export function parseHeaderBindings(text) {
+export function parseHeaderBindings(text, coverage = null) {
   const out = [];
   if (typeof text !== "string" || !text.includes(":")) return out;
   const lines = text.split("\n");
@@ -1118,9 +1118,22 @@ export function parseHeaderBindings(text) {
     const line = lines[i];
     if (line.trim() === "" || /^\s*#/.test(line)) continue;
     const m = /^([ \t]*)([A-Za-z][A-Za-z0-9-]*)[ \t]*:[ \t]*(\S.*?)[ \t]*$/.exec(line);
-    if (!m) continue;
+    if (!m) {
+      // A header-shaped line that cannot be located. The trigger requires a HYPHENATED
+      // token name or a known header prefix: `Error: connection refused` is prose that
+      // happens to fit the grammar, and counting it would inflate the metric.
+      if (coverage && /^[ \t]*(?:[A-Za-z][A-Za-z0-9]*-[A-Za-z0-9-]+|Authorization|Accept|Content-Type|User-Agent|Host)[ \t]*:/.test(line)) {
+        coverage.record(PARSER.HEADER, COVERAGE_STATUS.FAILED, offsets[i], offsets[i] + line.length);
+      }
+      continue;
+    }
     const name = m[2];
-    if (!SENSITIVE_HEADER_RE.test(name)) continue;
+    // A hyphenated name is unambiguously a header rather than prose.
+    const headerShaped = /-/.test(name);
+    if (!SENSITIVE_HEADER_RE.test(name)) {
+      if (coverage && headerShaped) coverage.record(PARSER.HEADER, COVERAGE_STATUS.PARSED, offsets[i], offsets[i] + line.length);
+      continue;
+    }
 
     const value = m[3];
     // A scheme prefix is kept outside the span: replacing `Bearer <tok>` wholesale
@@ -1129,13 +1142,18 @@ export function parseHeaderBindings(text) {
     const scheme = /^(Bearer|Basic|Token|Digest|AWS4-HMAC-SHA256)[ \t]+/i.exec(value);
     const offset = scheme ? scheme[0].length : 0;
     const secret = value.slice(offset);
-    if (secret.length === 0) continue;
+    if (secret.length === 0) {
+      // The name is a credential name but carries no value: a partial location.
+      if (coverage) coverage.record(PARSER.HEADER, COVERAGE_STATUS.PARTIAL, offsets[i], offsets[i] + line.length);
+      continue;
+    }
 
     // Anchor on the value itself rather than deriving the offset from several
     // lengths: the arithmetic version produced negative start offsets (the trailing
     // whitespace delta and the value length were subtracted in the wrong order).
     // A header's secret is its trailing value, so the last occurrence IS the span.
     const valueStart = offsets[i] + line.lastIndexOf(secret);
+    if (coverage) coverage.record(PARSER.HEADER, COVERAGE_STATUS.PARSED, offsets[i], offsets[i] + line.length);
     out.push({
       kind: "binding",
       key: name,
@@ -1162,7 +1180,7 @@ export function parseHeaderBindings(text) {
 
 const SENSITIVE_QUERY_KEY_RE = /^(?:access[_-]?token|auth[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|token|credential|signature|sig|x-amz-signature|x-amz-credential|x-amz-security-token|sas|code)$/i;
 
-export function parseUrlBindings(text) {
+export function parseUrlBindings(text, coverage = null) {
   const out = [];
   if (typeof text !== "string" || !text.includes("?") || !text.includes("=")) return out;
   const schemeRe = /[A-Za-z][A-Za-z0-9+.-]*:\/\//g;
@@ -1175,6 +1193,8 @@ export function parseUrlBindings(text) {
     const url = text.slice(urlStart, urlEnd);
     const q = url.indexOf("?");
     if (q < 0) continue;
+    // A URL carrying a query string is an attempt, even when no parameter matches.
+    if (coverage) coverage.record(PARSER.URL, COVERAGE_STATUS.PARSED, urlStart, urlEnd);
     const hash = url.indexOf("#", q);
     const query = url.slice(q + 1, hash < 0 ? undefined : hash);
 
@@ -1186,6 +1206,10 @@ export function parseUrlBindings(text) {
         const rawValue = part.slice(eq + 1);
         let decodedKey = key;
         try { decodedKey = decodeURIComponent(key); } catch { /* keep raw */ }
+        if (rawValue.length === 0 && SENSITIVE_QUERY_KEY_RE.test(decodedKey)) {
+          // Recognised a sensitive name with no locatable value.
+          if (coverage) coverage.record(PARSER.URL, COVERAGE_STATUS.PARTIAL, urlStart, urlEnd);
+        }
         if (rawValue.length > 0 && SENSITIVE_QUERY_KEY_RE.test(decodedKey)) {
           const valueStart = urlStart + at + eq + 1;
           out.push({
@@ -1207,6 +1231,137 @@ export function parseUrlBindings(text) {
     schemeRe.lastIndex = urlEnd;
   }
   return out;
+}
+
+// ------------------------------------------------------ parser coverage --------
+//
+// Observability for the structured parsers, defined so the numbers mean something.
+//
+// NOT "how many bytes did we fail to parse": under that definition every sentence of
+// ordinary prose is UNKNOWN and the ratio is noise. The unit is a parser ATTEMPT -- a
+// construct the parser could recognise and was therefore obliged to locate.
+//
+//   PARSED          the structure was recognised and fully located
+//   PARTIAL         a container/binding start was recognised but part is unmodelled
+//                   (YAML path degraded, shell quoting not fully supported, ...)
+//   FAILED          there was enough evidence to attempt, but the parser could not
+//                   locate it safely -> counts toward unknown_bytes
+//   NOT_APPLICABLE  does not look like this format at all (prose, prose, prose)
+//                   -> does NOT count toward unknown_bytes
+//
+// No raw content is recorded. Regions are offsets only.
+
+export const PARSER = Object.freeze({
+  ENV: "env",
+  SHELL: "shell",
+  YAML: "yaml",
+  HEADER: "header",
+  URL: "url",
+});
+
+export const COVERAGE_STATUS = Object.freeze({
+  PARSED: "PARSED",
+  PARTIAL: "PARTIAL",
+  FAILED: "FAILED",
+  NOT_APPLICABLE: "NOT_APPLICABLE",
+});
+
+/** Merge overlapping/adjacent [start,end) intervals and return the covered byte count. */
+export function unionBytes(regions) {
+  const sorted = regions
+    .filter((r) => r && r.end > r.start)
+    .map((r) => [r.start, r.end])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let total = 0;
+  let curStart = 0;
+  let curEnd = 0;
+  let open = false;
+  for (const [start, end] of sorted) {
+    if (!open) {
+      curStart = start;
+      curEnd = end;
+      open = true;
+    } else if (start > curEnd) {
+      total += curEnd - curStart;
+      curStart = start;
+      curEnd = end;
+    } else if (end > curEnd) {
+      curEnd = end;
+    }
+  }
+  if (open) total += curEnd - curStart;
+  return total;
+}
+
+/** Collect per-attempt records for one payload. */
+export class ParserCoverage {
+  constructor() {
+    this.attempts = [];
+  }
+  record(parser, status, regionStart, regionEnd, extra = {}) {
+    if (status === COVERAGE_STATUS.NOT_APPLICABLE) return this;
+    const start = Math.max(0, regionStart | 0);
+    const end = Math.max(start, regionEnd | 0);
+    this.attempts.push({
+      parser,
+      status,
+      regionStart: start,
+      regionEnd: end,
+      bytes: end - start,
+      ...(extra.jsonPath ? { jsonPath: extra.jsonPath } : {}),
+    });
+    return this;
+  }
+  /**
+   * Request-level summary.
+   *
+   * `bytes` are unioned across parsers so two parsers looking at the same text cannot
+   * double count. Per-parser counts stay per-parser, where summing is meaningful.
+   */
+  summary() {
+    const of = (status) => this.attempts.filter((a) => a.status === status);
+    const statuses = [COVERAGE_STATUS.PARSED, COVERAGE_STATUS.PARTIAL, COVERAGE_STATUS.FAILED];
+    const byParser = {};
+    for (const parser of Object.values(PARSER)) {
+      const rows = this.attempts.filter((a) => a.parser === parser);
+      if (!rows.length) continue;
+      byParser[parser] = {
+        attempted: rows.length,
+        parsed: rows.filter((r) => r.status === COVERAGE_STATUS.PARSED).length,
+        partial: rows.filter((r) => r.status === COVERAGE_STATUS.PARTIAL).length,
+        failed: rows.filter((r) => r.status === COVERAGE_STATUS.FAILED).length,
+        bytes: rows.reduce((n, r) => n + r.bytes, 0),
+      };
+    }
+    // unionBytes works on {start,end}; coverage records use {regionStart,regionEnd}.
+    // Passing the records straight through made the overflow filter compare undefined
+    // against undefined, so every byte total came out zero.
+    const toInterval = (r) => ({ start: r.regionStart, end: r.regionEnd });
+    const main = (status) => ({
+      attempted: of(status).length,
+      bytes: unionBytes(of(status).map(toInterval)),
+    });
+    const located = of(COVERAGE_STATUS.PARSED).concat(of(COVERAGE_STATUS.PARTIAL));
+    const parsed = main(COVERAGE_STATUS.PARSED);
+    const partial = main(COVERAGE_STATUS.PARTIAL);
+    const failed = main(COVERAGE_STATUS.FAILED);
+    return {
+      attempted_regions: this.attempts.length,
+      parsed_regions: parsed.attempted,
+      partial_regions: partial.attempted,
+      failed_regions: failed.attempted,
+      attempted_bytes: unionBytes(this.attempts.map(toInterval)),
+      located_bytes: unionBytes(located.map(toInterval)),
+      unknown_bytes: failed.bytes,
+      byParser,
+      attempts: this.attempts,
+    };
+  }
+  /** Attach to a spans array without polluting its contents. */
+  attachTo(spans) {
+    Object.defineProperty(spans, "coverage", { value: this.summary(), enumerable: false });
+    return spans;
+  }
 }
 
 export const PATH_CONFIDENCE = Object.freeze({
@@ -1297,7 +1452,7 @@ export function findBlockScalarBody(lines, headerIndex, keyIndent) {
   return { firstContentLine: first, lastContentLine: last, contentIndent };
 }
 
-export function parseYamlBindings(text) {
+export function parseYamlBindings(text, coverage = null) {
   const out = [];
   if (typeof text !== "string" || !text) return out;
   const lines = text.split("\n");
@@ -1347,7 +1502,16 @@ export function parseYamlBindings(text) {
     // original line.
     const matchTarget = trimmedEnd.replace(/^([ \t]*)-[ \t]+/, "$1");
     const m = /^([ \t]*)([^\s:#][^:#]*?)[ \t]*:[ \t]*([\s\S]*)$/.exec(matchTarget);
-    if (!m) { lineStart += line.length + 1; continue; }
+    if (!m) {
+      // Attempted but unlocatable. The trigger has to be a SINGLE token followed by a
+      // colon (allowing quotes): without that, every English sentence containing a
+      // colon becomes a FAILED attempt and the metric drowns in prose.
+      if (coverage && /^[ \t]*["']?[^\s:"']+["']?[ \t]*:/.test(line)) {
+        coverage.record(PARSER.YAML, COVERAGE_STATUS.FAILED, lineStart, lineStart + line.length);
+      }
+      lineStart += line.length + 1;
+      continue;
+    }
 
     const rawKey = m[2].trim();
     const key = cleanBindingKey(rawKey);
@@ -1374,6 +1538,8 @@ export function parseYamlBindings(text) {
     // ---- value ----
     if (rest === "") {
       // Empty value: record the key so descendants stay attributable, emit nothing.
+      // It is still a located structure, so it counts as PARSED.
+      if (coverage) coverage.record(PARSER.YAML, COVERAGE_STATUS.PARSED, lineStart, lineStart + line.length);
       stack.push({ indent, key });
       lineStart += line.length + 1;
       continue;
@@ -1409,6 +1575,9 @@ export function parseYamlBindings(text) {
           end: lineOffsets[loc.lastContentLine] + lines[loc.lastContentLine].replace(/[ \t]+$/, "").length,
         };
 
+        if (coverage) {
+          coverage.record(PARSER.YAML, COVERAGE_STATUS.PARSED, lineOffsets[loc.firstContentLine], region.end);
+        }
         const strength = classifyKeyStrength(key);
         // Only a STRONG parent key promotes the body to redaction spans. A weak or
         // absent key leaves the decision to the content detectors, so an ordinary
@@ -1499,6 +1668,16 @@ export function parseYamlBindings(text) {
     if (looksLikeReferenceValue(raw)) evidence.push("reference_value");
     if (structural.pathConfidence === PATH_CONFIDENCE.UNKNOWN) evidence.push("path_unknown");
 
+    if (coverage) {
+      coverage.record(
+        PARSER.YAML,
+        structural.pathConfidence === PATH_CONFIDENCE.SIMPLE_MAPPING
+          ? COVERAGE_STATUS.PARSED
+          : COVERAGE_STATUS.PARTIAL,
+        lineStart,
+        lineStart + line.length
+      );
+    }
     out.push({
       kind: "binding",
       key,
@@ -1525,7 +1704,7 @@ export function parseYamlBindings(text) {
  * syntax, evidence }. Raw value span only -- quotes are excluded from the span but
  * left in the text.
  */
-export function parseBindings(text) {
+export function parseBindings(text, coverage = null) {
   const out = [];
   if (typeof text !== "string" || !text) return out;
   const lines = text.split("\n");
@@ -1576,7 +1755,16 @@ export function parseBindings(text) {
             raw = bare[1].slice(offset);
           }
         }
+        if (valueStart < 0 || raw.length === 0) {
+          // Assignment recognised, value not locatable.
+          if (coverage) {
+            coverage.record(exportMatch ? PARSER.SHELL : PARSER.ENV, COVERAGE_STATUS.FAILED, lineStart, lineStart + line.length);
+          }
+        }
         if (valueStart >= 0 && raw.length > 0) {
+          if (coverage) {
+            coverage.record(exportMatch ? PARSER.SHELL : PARSER.ENV, COVERAGE_STATUS.PARSED, lineStart, lineStart + line.length);
+          }
           const strength = classifyKeyStrength(key);
           const evidence = ["structured_binding"];
           if (strength === KEY_STRENGTH.STRONG) evidence.push("strong_secret_key");
@@ -1605,8 +1793,8 @@ export function parseBindings(text) {
  * Binding records that are safe to treat as secret evidence: strong key, and a
  * value that is not a reference to another value.
  */
-export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
-  return parser(text)
+export function bindingSpansOf(text, kind = "binding", parser = parseBindings, coverage = null) {
+  return parser(text, coverage)
     // `regionOnly` records are structural evidence and deliberately NOT spans: the
     // parser must not decide that an ordinary `notes: |` block is sensitive.
     .filter((b) => !b.regionOnly)
@@ -1674,11 +1862,16 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // the same merge as everything else and never suppresses G/H or returns early.
   // A parse failure simply contributes nothing, leaving the other detectors to
   // cover the text -- the parser is evidence, not a security boundary.
+  // Parser coverage is observability, not a gate: nothing here blocks on a high
+  // UNKNOWN ratio. A baseline has to be measured on a real corpus before any threshold
+  // is worth discussing. The object is only created when the caller asked for it, and
+  // when present it is attached to the returned array as a non-enumerable property.
+  const coverage = deps.coverage || null;
   if (flags.structuredContext !== false) {
-    c.push(...bindingSpansOf(text));
-    c.push(...bindingSpansOf(text, "binding", parseYamlBindings));
-    c.push(...bindingSpansOf(text, "binding", parseHeaderBindings));
-    c.push(...bindingSpansOf(text, "binding", parseUrlBindings));
+    c.push(...bindingSpansOf(text, "binding", parseBindings, coverage));
+    c.push(...bindingSpansOf(text, "binding", parseYamlBindings, coverage));
+    c.push(...bindingSpansOf(text, "binding", parseHeaderBindings, coverage));
+    c.push(...bindingSpansOf(text, "binding", parseUrlBindings, coverage));
   }
   // Registered foreign tokens are contributed as candidates so that the SAME
   // ownership filter that protects owned tokens also protects them. Exact
@@ -1822,7 +2015,8 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // Last step: an object-level recogniser may impose a representation on a span
   // (Kubernetes Secret.data must stay base64). It only annotates; the caller decides
   // how to publish the replacement.
-  return applyObjectSchema(text, sorted);
+  const finalSpans = applyObjectSchema(text, sorted);
+  return coverage ? coverage.attachTo(finalSpans) : finalSpans;
 }
 
 export class RedactionLimitError extends Error {}
@@ -1856,6 +2050,8 @@ export class RedactionContext {
     // Representation-constrained entities publish a surrogate instead of the bare
     // token; the ledger is what makes the round trip possible (see SurrogateLedger).
     this.ledger = new SurrogateLedger();
+    // Request-level parser coverage rollup (observability only; never gates redaction).
+    this.coverage = [];
     // Eligibility for protected spans: a token is protected only if this request
     // minted or registered it (including re-minted legacy tokens). Shape alone is
     // never sufficient, otherwise a CRG-looking label would smuggle a secret past
@@ -1917,11 +2113,15 @@ export class RedactionContext {
       const replacement = await this.tokenFor(raw);
       if (replacement !== legacy) text = text.split(legacy).join(replacement);
     }
+    const coverage = new ParserCoverage();
     const spans = findSensitiveSpans(
       text,
       { ...flags, protectedTokenPatterns: this.protectedTokenPatterns },
-      { isProtectedToken: this.isProtectedToken, foreignRegistry: this.foreignRegistry }
+      { isProtectedToken: this.isProtectedToken, foreignRegistry: this.foreignRegistry, coverage }
     );
+    // Request-level rollup. Unioned across parsers, so two parsers looking at the same
+    // text cannot double count.
+    this.coverage.push(coverage.summary());
     if (!spans.length) return text;
     let out = "", at = 0;
     for (const s of spans) {
@@ -1931,6 +2131,34 @@ export class RedactionContext {
     }
     return out + text.slice(at);
   }
+  /** Rollup of every parser attempt seen in this request. */
+  coverageSummary() {
+    const all = this.coverage;
+    const byParser = {};
+    for (const entry of all) {
+      for (const [parser, stats] of Object.entries(entry.byParser || {})) {
+        const acc = byParser[parser] || (byParser[parser] = { attempted: 0, parsed: 0, partial: 0, failed: 0, bytes: 0 });
+        acc.attempted += stats.attempted;
+        acc.parsed += stats.parsed;
+        acc.partial += stats.partial;
+        acc.failed += stats.failed;
+        acc.bytes += stats.bytes;
+      }
+    }
+    const sum = (key) => all.reduce((n, e) => n + (e[key] || 0), 0);
+    return {
+      calls: all.length,
+      attempted_regions: sum("attempted_regions"),
+      parsed_regions: sum("parsed_regions"),
+      partial_regions: sum("partial_regions"),
+      failed_regions: sum("failed_regions"),
+      attempted_bytes: sum("attempted_bytes"),
+      located_bytes: sum("located_bytes"),
+      unknown_bytes: sum("unknown_bytes"),
+      byParser,
+    };
+  }
+
   restoreText(text) {
     // Both formats are restored during the transition. Mapping lookup is the only
     // authority: an unknown token of either shape is left untouched.
