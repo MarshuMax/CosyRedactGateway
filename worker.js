@@ -192,9 +192,23 @@ export function isCredentialRisk(entityClass) {
     || entityClass === ENTITY_CLASS.CREDENTIAL;
 }
 
-export function classifyOwnership(token, ctx, registry = null) {
+/**
+ * Resolve a visible surrogate to the token it stands for. A base64 surrogate is not
+ * CRG-shaped, so every ownership check would otherwise classify it as UNKNOWN and the
+ * two paths would drift. Returns the input unchanged when it is not a surrogate.
+ */
+export function resolveSurrogate(value, ctx) {
+  if (!ctx || !ctx.ledger || typeof value !== "string") return value;
+  const entry = ctx.ledger.lookup(value);
+  return entry ? entry.token : value;
+}
+
+export function classifyOwnership(value, ctx, registry = null) {
+  // Surrogate -> underlying token, so ownership, entity class and entity policy are
+  // all evaluated on the entity rather than on its representation.
+  const token = resolveSurrogate(value, ctx);
   if (ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token)) {
-    return { ownership: TOKEN_OWNERSHIP.OWN, namespace: "own" };
+    return { ownership: TOKEN_OWNERSHIP.OWN, namespace: "own", token };
   }
   if (registry) {
     const namespace = registry.namespaceOf(token);
@@ -210,7 +224,7 @@ export function classifyOwnership(token, ctx, registry = null) {
       return { ownership: TOKEN_OWNERSHIP.FOREIGN_REGISTERED, namespace };
     }
   }
-  return { ownership: TOKEN_OWNERSHIP.UNKNOWN, namespace: null };
+  return { ownership: TOKEN_OWNERSHIP.UNKNOWN, namespace: null, token };
 }
 
 export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, registry = null }) {
@@ -258,29 +272,43 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, 
     }
   }
 
-  // A representation-constrained surrogate is judged as its underlying token, so the
-  // sink policy does not need a second set of rules for it. Without this the
-  // base64 form would fall through as "not protected-token-like" and be forwarded as
-  // an ordinary string, which is exactly the value the model would then use.
-  const ownedSurrogates = ctx && ctx.ledger
-    ? new Map(ctx.ledger.entries().map((e) => [e.visible, e.token]))
-    : new Map();
-  const surrogateTokens = [...ownedSurrogates.keys()].filter((visible) => text.includes(visible));
-  if (sensitive && !trusted && surrogateTokens.length) {
-    const visible = surrogateTokens[0];
-    return {
-      action: RESTORE_ACTION.BLOCK,
-      text,
-      blockedTokens: [visible],
-      unknownTokens: [],
-      telemetry: {
-        event: "restore_blocked_untrusted_sink",
-        sink: sink.kind,
-        tokenShape: "surrogate",
-        encodingKind: ctx.ledger.lookup(visible)?.encodingKind,
-        reason: "surrogate-into-untrusted-sink",
-      },
-    };
+  // A representation-constrained surrogate runs through EXACTLY the same policy as a
+  // bare token. It is resolved to its underlying token first (see resolveSurrogate /
+  // classifyOwnership below) rather than being handled by a shortcut branch here: a
+  // shortcut would drift the moment entityClassFor starts returning real classes, and
+  // an INFRA entity would then be treated differently depending on whether its
+  // replacement happened to be base64.
+  const visibleSurrogates = ctx && ctx.ledger
+    ? ctx.ledger.entries().map((e) => e.visible).filter((visible) => text.includes(visible))
+    : [];
+  const surrogateNote = visibleSurrogates.length
+    ? { surrogates: visibleSurrogates, encodingKinds: visibleSurrogates.map((v) => ctx.ledger.lookup(v)?.encodingKind) }
+    : {};
+
+  // A surrogate is not matched by REDACTED_TOKEN (it is base64, not CRG-shaped), so it
+  // is walked explicitly -- but through the SAME ownership and entity logic.
+  for (const visible of visibleSurrogates) {
+    const { ownership, namespace, token } = classifyOwnership(visible, ctx, registry);
+    if (ownership === TOKEN_OWNERSHIP.UNKNOWN) continue;
+    if (sensitive && !trusted && ownership === TOKEN_OWNERSHIP.OWN
+      && isCredentialRisk(ctx.entityClassFor?.(token))) {
+      return {
+        action: RESTORE_ACTION.BLOCK,
+        text,
+        blockedTokens: [visible],
+        unknownTokens: [],
+        telemetry: { event: "restore_blocked_untrusted_sink", sink: sink.kind, tokenShape: "surrogate", ...surrogateNote },
+      };
+    }
+    if (sensitive && !trusted && ownership === TOKEN_OWNERSHIP.FOREIGN_REGISTERED) {
+      return {
+        action: RESTORE_ACTION.BLOCK,
+        text,
+        blockedTokens: [visible],
+        unknownTokens: [],
+        telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace, ownership, tokenShape: "surrogate", ...surrogateNote },
+      };
+    }
   }
 
   for (const token of text.match(REDACTED_TOKEN) || []) {

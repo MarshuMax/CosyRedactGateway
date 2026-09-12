@@ -21,7 +21,11 @@ import {
   parseYamlBindings,
   findSensitiveSpans,
   bindingSpansOf,
+  classifyRestore,
+  classifyOwnership,
+  resolveSurrogate,
   PATH_CONFIDENCE,
+  SENSITIVE_SINK_KINDS,
   TOKEN_PREFIX,
 } from "../worker.js";
 
@@ -484,4 +488,76 @@ test("D2c: a generic data.password is NOT base64 [GREEN NOW]", async () => {
   const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
   assert.ok(replaced.startsWith(TOKEN_PREFIX), `expected a portable token, got: ${replaced}`);
   assert.equal(isCanonicalBase64(replaced), false, "a non-Secret data block must not get base64");
+});
+
+// ------------------------------------------------ 6. D2c.2 policy convergence ---
+
+test("D2c.2: a surrogate is judged exactly like its underlying token [GREEN NOW]", async () => {
+  // A shortcut branch here would drift the moment entityClassFor starts returning
+  // real classes: an INFRA entity would then behave differently depending on whether
+  // its replacement happened to be base64. The surrogate is resolved to its token and
+  // the SAME policy runs.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
+  const visible = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+  assert.ok(visible, "a surrogate must have been minted");
+
+  const registry = null;
+  const withSurrogate = (kind, trust = "untrusted") =>
+    classifyRestore({ ctx, registry, text: `use ${visible}`, sink: { kind, trust } });
+
+  // UNKNOWN/CREDENTIAL surrogate + untrusted sensitive sink -> block.
+  for (const kind of SENSITIVE_SINK_KINDS) {
+    const d = withSurrogate(kind);
+    assert.equal(d.action, "block", `${kind}: blocked`);
+    assert.equal(d.telemetry.event, "restore_blocked_untrusted_sink");
+    assert.deepEqual(d.blockedTokens, [visible]);
+  }
+  // assistant text and benign sinks -> restore.
+  assert.equal(withSurrogate("assistant_text").action, "restore");
+  assert.equal(withSurrogate("log_write").action, "restore");
+  // trusted sink -> restore.
+  assert.equal(withSurrogate("shell", "trusted").action, "restore");
+});
+
+test("D2c.2: the surrogate resolves to its underlying token for ownership [GREEN NOW]", async () => {
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
+  const visible = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+
+  const resolved = resolveSurrogate(visible, ctx);
+  assert.notEqual(resolved, visible, "a surrogate resolves to something else");
+  assert.equal(resolved.startsWith("CRG_"), true, "and that something is the underlying token");
+  assert.equal(ctx.tokenToRaw.has(resolved), true, "which this request owns");
+
+  const classified = classifyOwnership(visible, ctx);
+  assert.equal(classified.ownership, "OWN", "ownership is decided on the entity, not the representation");
+  assert.equal(classified.token, resolved, "and the underlying token is reported");
+  // A non-surrogate is returned unchanged.
+  assert.equal(resolveSurrogate("CRG_AAAA_AAAA", ctx), "CRG_AAAA_AAAA");
+});
+
+test("D2c.2: an INFRA-classed surrogate follows the entity policy, not a shortcut [GREEN NOW]", async () => {
+  // Proves there is no separate surrogate branch left. With entityClassFor returning
+  // INFRA, the credential-risk test is false, so the surrogate is NOT blocked in an
+  // untrusted sensitive sink -- exactly as a plain INFRA token would not be.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
+  const visible = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+
+  const before = classifyRestore({ ctx, text: visible, sink: { kind: "shell" } }).action;
+  assert.equal(before, "block", "baseline: UNKNOWN is treated as credential-grade risk");
+
+  const original = ctx.entityClassFor;
+  ctx.entityClassFor = () => "INFRA";
+  try {
+    const after = classifyRestore({ ctx, text: visible, sink: { kind: "shell" } }).action;
+    assert.equal(after, "restore", "an INFRA entity is not credential-grade, so no block");
+    // The same must hold for a plain token with the same class, or the two paths diverge.
+    const plain = Object.keys(Object.fromEntries(ctx.tokenToRaw))[0];
+    const plainResult = classifyRestore({ ctx, text: plain, sink: { kind: "shell" } }).action;
+    assert.equal(plainResult, after, "surrogate and plain token must agree under the same entity class");
+  } finally {
+    ctx.entityClassFor = original;
+  }
 });
