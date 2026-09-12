@@ -19,7 +19,6 @@ import {
   DEFAULT_PROFILE,
   DEVOPS_PROFILE,
 } from "../worker.js";
-import { readFileSync } from "node:fs";
 
 const ACME_NS = { name: "acme", pattern: /(?<![A-Za-z0-9_])ACME_[A-Z0-9_]{4,}(?![A-Za-z0-9_])/, streamPrefix: "ACME_" };
 const FOREIGN = "ACME_ABCDEF_0001";
@@ -158,17 +157,12 @@ test("R0.3: the registry and the profile are independent inputs [RED]", async ()
   assert.equal(seen, doc, "the profile preserves the resource id and the registry preserves the foreign token");
 });
 
-test("R0.3: no new environment variable was invented for the profile [GREEN NOW]", () => {
-  // The slice deliberately stops at the programmatic path. Exposing REDACT_INFRA_PROFILE (or
-  // similar) is a deployment-configuration decision for a later hardening pass, not something
-  // to smuggle in here.
-  const src = readFileSync(new URL("../worker.js", import.meta.url), "utf8");
-  const envNames = [...new Set([...src.matchAll(/env\?\.([A-Z_]+)/g)].map((m) => m[1]))];
-  assert.deepEqual(
-    envNames.filter((n) => /PROFILE|INFRA/.test(n)), [],
-    `an env var for the profile was added: ${JSON.stringify(envNames)}`
-  );
-  // The programmatic inputs are the ones that must work.
-  assert.ok(src.includes("maxRedactions,foreignRegistry,profile:options.profile"),
-    "handleRequest must pass both through to the context");
-});
+// The implementation-lock tests that used to live here were removed: asserting that worker.js
+// declares no PROFILE/INFRA environment variable, and matching a source substring to prove the
+// context wiring, both freeze an IMPLEMENTATION rather than a behaviour. The first would block
+// deployment hardening (exposing a profile through env is a legitimate future change); the
+// second is a source-string test that a refactor would break for no safety reason.
+//
+// The handleRequest E2E above is the authority on wiring: it observes the outcome, so it keeps
+// working through any refactor that preserves the behaviour and fails the moment the wiring is
+// actually dropped.

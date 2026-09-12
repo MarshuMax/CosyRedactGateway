@@ -1574,6 +1574,79 @@ registry + DEVOPS（两者独立）      → 均按各自规则
 
 没有为 profile 发明环境变量名。`REDACT_INFRA_PROFILE=devops` 之类属于**部署配置 hardening**，本刀只保证**程序化生产路径真实可用**。测试中有一条断言 `worker.js` 里没有出现 `env?.` 形式的 PROFILE / INFRA 变量。
 
+## 9.27 R1 Security Invariant Property Tests（已实现）
+
+**R1 与 R2 严格分开**：
+
+```
+R1 = 已知安全性质 + deterministic generator（本刀）
+R2 = adversarial / random exploration（探索本身是目的）
+```
+
+### harness 规则（`test/helpers/property.mjs`）
+
+- **固定 seed**（`DEFAULT_SEED = 0x5eed1234`），`mulberry32` 确定性 PRNG
+- **不使用 wall clock / crypto randomness / Math.random** —— 同一 seed 在任何机器、任何时间产生同一序列
+- **失败打印 seed（十进制+十六进制）、case 序号、精确输入，并对字符串输入给出最小复现**
+- 每条性质 120~250 组；**不追求随机撞 bug，追求性质永远成立**
+
+失败报告实测：
+
+```
+[probe] property failed
+  seed:  3735928559 (0xdeadbeef)
+  case:  42 of 100
+  input: "key7=value4"
+  minimal: "k"
+  error: deliberate failure on key7=value4
+```
+
+### 已固定的性质（`test/r1-security-invariants.property.test.js`）
+
+| 性质 | 组数 |
+|---|---|
+| 被 span **覆盖**的凭据不得明文存活 | 250 |
+| redact→restore 逐字节一致 | 250 |
+| 已脱敏的普通文档幂等 | 250 |
+| token 形状的输入**永不获得豁免** | 250 |
+| 未被拥有的 token 永不被替换 | 250 |
+| 硬凭据在**任何 profile** 下都被脱敏 | 250 |
+| 已验证 infra 标识跟随 profile（而非检测器） | 120 |
+| 替换后不残留半开宿主语法 | 150 |
+| 发出的 token 形状良好且自识别 | 250 |
+| 输出中不存在截断的 `CRG_` 前缀 | 250 |
+| 已登记 foreign token 被保留、永不解析 | 120 |
+| **generator 自身产出所需形态**（防空转） | 250 |
+
+最后一条是**防止整套性质空转**的守卫：性质套件若 generator 不再产出有趣输入，会永远通过却什么都没测。
+
+### 写这套性质时暴露的 5 处**我的断言错误**（全部先验证再改，无一是实现问题）
+
+1. `AKIAIOSFODNN7EXAMPLE` 是 **gitleaks 规则显式 allowlist 的占位符**（`allowRegexes:[/.+EXAMPLE$/]`）——规则正确工作时不报。用它当"必须被检出"的夹具，失败信息与网关无关。
+2. "claimed" 不能由**键强**推断，必须是 **span 覆盖**。强键 + 检测器不接受的值（`Pr0d-P@ssw0rd-Xy9Zk2mQ`）**本就不该被脱敏**。
+3. 不能在整个输出里搜被覆盖文本：generator 会把同一明文放在两行，而弱键那处**有意不 claim**（低熵解析无法区分）。
+4. `${` 与 `{{` 在 `${{` 中**重叠**，朴素 `split("${")` 计数会误报不平衡。
+5. token 语法是 `[A-Z0-9]{4,}`（两段都是），`{6}`/`{4}` 只是**当前分配器**的宽度，不是语法。
+
+### R1 FINDING：base64 surrogate 在第二轮被重新包装
+
+surrogate 的可见形态是 **base64(CRG token)**——`Q1JHXzhIRFYzVl8wMDAx` 解码为 `CRG_8HDV3V_0001`。因此对上一轮**输出**再脱敏时，它看到一个 base64 块、其明文是便携 token，于是再包一层：
+
+```
+pass 1 → Q1JHXzhIRFYzVl8wMDAx
+pass 2 → Q1JHX1BISlg1U18wMDAx
+```
+
+**严重性（实测而非假设）**：
+
+- 两次输出**都不含明文**；
+- 两次往返都正确（pass 2 的 restore 回到 pass 1 输出）；
+- ⇒ **不是 confidentiality fail-open**。
+
+它**是**：representation-constrained 字段的输出**不稳定**；且可见 surrogate 对任何做 base64 解码的人**暴露一个便携 token**——后者是 surrogate 方案本身的性质，在此被显式记录而非留到对抗性阶段才发现。
+
+已写成测试（断言两侧往返、无明文、形态确实改变），并在幂等性质中**排除** surrogate 文档、注明原因。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
