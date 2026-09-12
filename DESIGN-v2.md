@@ -1139,6 +1139,57 @@ tool_argument   → preserve ✅
 trusted broker  → restore  ✅
 ```
 
+## 9.20 G0.2 + G1.1（已实现）
+
+### G0.2 Anthropic `tool_use.input` 递归 operand walker
+
+原实现只遍历第一层 string 键，因此**嵌套一层的 operand 会被当作正文还原**：
+
+```json
+{"headers": {"auth": "<token>"}}   // 漏
+{"args": ["a", "<token>", {...}]}  // 漏
+```
+
+改为递归 walker（`applyOperandPolicy`）：对象与数组任意深度遍历，只改写字符串，就地修改以保持 wire 形状。非字符串标量（数字、布尔）不动。
+
+### G1.1 holdback 区分三类，不再一律当 prefix anchor
+
+| 类别 | 来源 | 语义 |
+|---|---|---|
+| OWN exact surrogate | ledger | **exact literal** |
+| exact registered foreign token | registry.tokens | **exact literal** |
+| namespace `streamPrefix` | registry.namespaces | **open-ended anchor** |
+
+**exact literal**：
+
+```
+proper prefix 到达   → HOLD
+完整 literal 到达    → RELEASE（policy 已可执行）
+完整 literal + 普通字符 → 更应 RELEASE
+```
+
+**不得因为 exact literal 曾出现于 buffer 就一直 hold 到 stream finish。** 这是上一版的真实缺陷：`partialPrefixLength("v CRG_GKLIDD_0001")` 返回 15，通道被拖到 `finish()` 才交付。
+
+**namespace 需要显式声明边界**（不从 regex 推导，继续"由 registry 声明 streaming contract"的原则）：
+
+```js
+{ streamPrefix: "ACME_", streamContinuation: /[A-Z0-9_]/, streamMaxLength: 128 }
+```
+
+```
+ACME_ABCD              → 仍可能继续 → HOLD
+ACME_ABCDEF_0001 + 空格 → continuation 结束 → 交完整 matcher 判 ownership → RELEASE
+ACME_ + 10MB 的体        → 达到 streamMaxLength → RELEASE（否则整个 channel 积压到流结束）
+```
+
+**`streamMaxLength` 是必须的**：没有它，`ACME_` 后跟任意长的 continuation 字符会把整个 channel 缓冲到流结束。
+
+本层方言（CRG / legacy）仍走原有的 shape-aware suffix 逻辑（`possibleTokenSuffixLength`），不并入 exact-literal matcher——它是**带结构的**，`CRG_` 只是结构的一部分。
+
+### 增量交付测试（关键）
+
+只 `await response.text()` 的测试**无法区分**"增量交付"与"全部拖到 finish 再一次性输出"——后者也会全绿。因此新增一条测试：upstream 发送"完整 surrogate + 空格"后**保持连接不关闭**，gateway 的 reader 必须在 2 秒内读到输出。实测通过。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

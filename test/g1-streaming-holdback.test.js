@@ -109,30 +109,43 @@ test("G1: holdback prefixes come from the ledger and the registry, not from shap
   const surrogate = await ctx.emit(token, "base64");
   const registry = new ForeignTokenRegistry([ACME_NS]).registerTokens(["opaque-vendor-token"]);
 
-  const prefixes = streamHoldbackPrefixes(ctx, registry);
-  assert.ok(prefixes.includes(surrogate), "the minted surrogate is a holdback prefix");
-  assert.ok(prefixes.includes("opaque-vendor-token"), "an exact registration is one too");
-  assert.ok(prefixes.includes("ACME_"), "and so is a declared namespace prefix");
-  assert.ok(prefixes.includes("CRG_"), "plus our own dialect");
+  const holdbacks = streamHoldbackPrefixes(ctx, registry);
+  const literals = holdbacks.filter((h) => h.kind === "literal").map((h) => h.value);
+  const anchors = holdbacks.filter((h) => h.kind === "namespace").map((h) => h.value);
+  assert.ok(literals.includes(surrogate), "the minted surrogate is an exact literal");
+  assert.ok(literals.includes("opaque-vendor-token"), "an exact registration is one too");
+  assert.ok(literals.includes("CRG_"), "plus our own dialect");
+  assert.ok(anchors.includes("ACME_"), "while a namespace prefix is an open-ended anchor");
 
   // An unrelated base64 string is NOT in the set, so it cannot cause a stall.
-  assert.equal(prefixes.includes("YWJjZGVmZ2hpams="), false);
-  assert.equal(partialPrefixLength("YWJjZGVmZ2hpams=", prefixes), 0, "unrelated base64 is not held back");
+  assert.equal(literals.includes("YWJjZGVmZ2hpams="), false);
+  assert.equal(partialPrefixLength("YWJjZGVmZ2hpams=", holdbacks), 0, "unrelated base64 is not held back");
 });
 
-test("G1: partialPrefixLength is a pure prefix matcher [GREEN NOW]", () => {
-  const prefixes = ["CRG_", "ACME_", "opaque-vendor-token"];
-  assert.equal(partialPrefixLength("x CR", prefixes), 2, "a partial CRG prefix is held");
-  assert.equal(partialPrefixLength("x ACME", prefixes), 4);
-  assert.equal(partialPrefixLength("x opaque-vendor", prefixes), 13);
-  assert.equal(partialPrefixLength("x CRGX", prefixes), 0, "no prefix begins with X");
-  assert.equal(partialPrefixLength("nothing here", prefixes), 0);
-  assert.equal(partialPrefixLength("x e", prefixes), 0);
-  assert.equal(partialPrefixLength("x C", prefixes), 1, "the first character of CRG_ is ambiguous");
-  // A COMPLETE prefix is ambiguous too, because the token may continue: `x CRG_ABC` holds
-  // 7 characters, not 1. An earlier version of this assertion expected 1 and was wrong --
-  // it under-counted exactly the case that lets a token be emitted in halves.
-  assert.equal(partialPrefixLength("x CRG_ABC", prefixes), 7, "the whole run after the anchor is ambiguous");
+test("G1.1: exact literals release on completion, namespace anchors stay open [GREEN NOW]", () => {
+  // The distinction the two kinds exist for. Conflating them either stalls a finished
+  // token until the stream ends (literal treated as open-ended) or splits an unfinished
+  // one (anchor treated as complete as soon as the matcher is satisfied).
+  const literal = [{ kind: "literal", value: "Q1JHX0hQQzNKT18wMDAx" }];
+  assert.equal(partialPrefixLength("v Q1JH", literal), 4, "a proper prefix is held");
+  assert.equal(partialPrefixLength("v Q1JHX0hQQzNKT18wMDAx", literal), 0, "the complete literal is released");
+  assert.equal(partialPrefixLength("v Q1JHX0hQQzNKT18wMDAx done", literal), 0, "and text after it cannot extend it");
+
+  const anchor = [{
+    kind: "namespace",
+    value: "ACME_",
+    continuation: /[A-Z0-9_]/,
+    maxLength: 32,
+  }];
+  assert.equal(partialPrefixLength("v ACME", anchor), 4, "a partial anchor is held");
+  assert.equal(partialPrefixLength("v ACME_", anchor), 5, "the anchor with no body is held");
+  assert.equal(partialPrefixLength("v ACME_ABCD", anchor), 9, "and so is the body while it continues");
+  assert.equal(partialPrefixLength("v ACME_ABCDEF_0001 done", anchor), 0, "a space ends the token");
+  assert.equal(partialPrefixLength(`v ACME_${"A".repeat(40)}`, anchor), 0, "the declared max length bounds the hold");
+
+  // Our own dialect stays with its shape-aware suffix logic, not this literal matcher.
+  const dialect = [{ kind: "literal", value: "CRG_" }];
+  assert.equal(partialPrefixLength("v CR", dialect), 2, "a partial dialect prefix is held");
 });
 
 // -------------------------------------------- 2. every split position, three forms ----
@@ -292,12 +305,72 @@ test("G1: a fragment ending in a ledger prefix is held until it resolves [GREEN 
   const prefixes = streamHoldbackPrefixes(ctx, null);
 
   assert.equal(partialPrefixLength(`x ${surrogate.slice(0, 6)}`, prefixes), 6, "held while incomplete");
-  // A COMPLETE surrogate is still held by the prefix matcher (the first six characters are
-  // a prefix of it); what releases it is the separate check that a complete value now ends
-  // the buffer. Both halves are asserted so the division of labour is explicit.
-  assert.equal(partialPrefixLength(`x ${surrogate}`, prefixes), surrogate.length, "still ambiguous by prefix alone");
-  // With trailing non-token characters the anchor is no longer at the tail, so the
-  // ambiguous run is what follows it. 22 is the honest number here, not 0: an earlier
-  // assertion expected 0 and was simply wrong about what the function measures.
-  assert.equal(partialPrefixLength(`x ${surrogate}  `, prefixes), 22);
+  // A COMPLETE surrogate is released: it is an exact literal, so the policy can run and
+  // holding it would stall the channel until the stream ends.
+  assert.equal(partialPrefixLength(`x ${surrogate}`, prefixes), 0, "released once complete");
+  assert.equal(partialPrefixLength(`x ${surrogate}  `, prefixes), 0, "and text after it cannot extend it");
+});
+
+// ------------------------------------------------ 4.增量交付（不是最终结果） -------
+
+test("G1.1: a completed literal plus a delimiter is readable BEFORE the stream closes [RED]", async () => {
+  // The failure this exists to catch: an implementation that holds everything until
+  // finish() also passes every test that awaits response.text(). Here the upstream stays
+  // OPEN after sending a complete surrogate and a delimiter, so the gateway must already
+  // have delivered the resolvable text. A reader that blocks is the bug.
+  const doc = docFor(B64_SECRET);
+
+  let release;
+  const upstreamGate = new Promise((resolve) => { release = resolve; });
+  let sent = null;
+  const fetchImpl = async (_u, init) => {
+    const seen = JSON.parse(init.body);
+    const own = surrogateFrom(seen, "password");
+    sent = own;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+      async start(controller) {
+        const first = { type: "response.output_text.delta", delta: `value ${own} ` };
+        controller.enqueue(encoder.encode(`event: ${first.type}\ndata: ${JSON.stringify(first)}\n\n`));
+        await upstreamGate; // deliberately NOT closed yet
+        controller.close();
+      },
+    });
+    return new Response(body, { headers: { "content-type": "text/event-stream" } });
+  };
+
+  const request = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(responsesBody(doc)),
+  });
+  const response = await handleRequest(request, {}, { fetchImpl, salt: "fixed" });
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+
+  const firstChunk = await Promise.race([
+    reader.read(),
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 2000)),
+  ]);
+  const deliveredEarly = firstChunk.timedOut ? "" : decoder.decode(firstChunk.value);
+
+  // Tear the stream down so the test cannot hang either way.
+  release();
+  let rest = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rest += decoder.decode(value);
+    }
+  } catch { /* the reader may already be released */ }
+  const everything = deliveredEarly + rest;
+
+  assert.ok(sent, "fixture must mint a surrogate");
+  assert.equal(
+    deliveredEarly.length > 0, true,
+    "the gateway must emit before the upstream closes once the literal is complete and delimited"
+  );
+  assert.ok(deliveredEarly.includes(B64_SECRET), "and the resolvable value is already delivered");
+  assert.ok(everything.includes(B64_SECRET), "the full stream restores too");
 });

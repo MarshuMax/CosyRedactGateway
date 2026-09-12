@@ -2826,66 +2826,101 @@ function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.t
 // the v2 prefix and the legacy prefix, since the latter is still recognised on
 // input during the transition.
 /**
- * The prefixes a stream must hold back, from the AUTHORITIES that can vouch for them:
+ * The holdback contracts a stream obeys, from the AUTHORITIES that can vouch for them:
  *
- *   - this layer's own dialect (CRG / legacy), always;
- *   - the surrogate LEDGER, which is the only source of surrogate eligibility -- a string
- *     that merely *looks* base64 is not held back, because "looks like" is not ownership;
- *   - the foreign REGISTRY, via exact registrations and the explicit `streamPrefix` of a
- *     namespace. Deriving a prefix from an arbitrary regex is not reliable, and a partial
- *     matcher is not worth writing.
+ *   - this layer's own dialect (CRG / legacy) -- exact literals of known length;
+ *   - the surrogate LEDGER -- exact literals; a string that merely *looks* base64 is not
+ *     held back, because "looks like" is not ownership;
+ *   - the foreign REGISTRY -- exact registrations (literals) and namespace `streamPrefix`
+ *     anchors, which are open-ended and therefore need a declared end condition.
+ *
+ * The two kinds behave differently and must not be conflated:
+ *
+ *   literal    proper prefix -> HOLD; complete literal -> RELEASE; anything after it is
+ *              ordinary text and must not extend the hold.
+ *   namespace  open-ended while the body characters are inside the declared continuation
+ *              set and the declared maximum length has not been reached.
  */
 export function streamHoldbackPrefixes(ctx, registry = null, sinks = null) {
-  const prefixes = [TOKEN_PREFIX, LEGACY_TOKEN_PREFIX];
+  const entries = [
+    { kind: "literal", value: TOKEN_PREFIX },
+    { kind: "literal", value: LEGACY_TOKEN_PREFIX },
+  ];
   if (ctx && ctx.ledger) {
     // Exact visible surrogates: ledger-driven, never shape-driven. Whether a surrogate is
-    // usable in this channel does not change whether it must be held back -- a split
-    // token is broken regardless of the policy applied to it later.
-    for (const entry of ctx.ledger.entries()) prefixes.push(entry.visible);
+    // usable in this channel does not change whether it must be held back -- a split token
+    // is broken regardless of the policy applied to it later.
+    for (const entry of ctx.ledger.entries()) entries.push({ kind: "literal", value: entry.visible });
   }
-  if (registry && typeof registry.streamPrefixes === "function") {
-    for (const prefix of registry.streamPrefixes()) if (prefix && prefix.length > 0) prefixes.push(prefix);
+  if (registry) {
+    for (const token of registry.tokens) entries.push({ kind: "literal", value: token });
+    for (const ns of registry.namespaces) {
+      if (!ns.streamPrefix) continue;
+      entries.push({
+        kind: "namespace",
+        value: ns.streamPrefix,
+        continuation: ns.streamContinuation || null,
+        maxLength: ns.streamMaxLength || null,
+      });
+    }
   }
   void sinks;
-  return prefixes;
+  return entries;
+}
+
+/** Accepts bare strings (exact literals) or descriptors. */
+function normalizeHoldbacks(holdbacks) {
+  return (holdbacks || [])
+    .map((entry) => (typeof entry === "string" ? { kind: "literal", value: entry } : entry))
+    .filter((entry) => entry && entry.value);
+}
+
+/** An EXACT literal: hold a proper prefix, release the moment the literal is complete. */
+function heldForLiteral(text, literal) {
+  if (!literal || literal.length < 2) return 0;
+  const max = Math.min(literal.length, text.length);
+  for (let k = max; k > 0; k--) {
+    if (!text.endsWith(literal.slice(0, k))) continue;
+    // k === literal.length means the literal itself ends the buffer: it is COMPLETE, so the
+    // policy can already run. Holding it would stall the channel until finish() even though
+    // nothing more is expected. Only a proper prefix is ambiguous.
+    return k === literal.length ? 0 : k;
+  }
+  return 0;
 }
 
 /**
- * Length of a trailing fragment that could still grow into one of `prefixes`.
- * A pure prefix matcher, so it is exact rather than heuristic.
+ * A namespace anchor is open-ended, so it is held only while the token can still grow: its
+ * body characters stay inside the declared continuation set and the declared maximum length
+ * has not been reached.
  */
-export function partialPrefixLength(text, prefixes) {
-  let longest = 0;
-  for (const prefix of prefixes) {
-    if (!prefix) continue;
-    // Two ways a protected string can be mid-flight at the end of the buffer:
-    //
-    //   a) a proper prefix of it is the tail: `v Q1JH` for a base64 surrogate, or `v ACM`
-    //      for a declared `ACME_`. Hold exactly that tail.
-    //   b) the COMPLETE prefix (or exact token) has arrived and the value may continue:
-    //      `v ACME_` and `v ACME_AB` are both an unfinished token. Hold everything from
-    //      the last occurrence of the anchor to the end.
-    //
-    // Case (b) is why a pure prefix matcher is insufficient: after `ACME_` there is no
-    // partial prefix left, yet whether the token continues is unknowable until the next
-    // chunk arrives. A `streamPrefix` is declared precisely because that issuer's tokens
-    // do continue.
-    // (a) a proper prefix of the target is the tail.
+function heldForNamespace(text, entry) {
+  const prefix = entry.value;
+  if (!prefix || prefix.length < 2) return 0;
+  const anchorAt = text.lastIndexOf(prefix);
+  if (anchorAt < 0) {
     const max = Math.min(prefix.length - 1, text.length);
-    for (let k = max; k > 0; k--) {
-      if (text.endsWith(prefix.slice(0, k))) { if (k > longest) longest = k; break; }
-    }
-    // (b) the anchor itself has arrived, so the token may be mid-flight after it. This is
-    // checked separately from (a): for `v ACME_AB` the longest proper prefix match is
-    // `ACME_AB` (7 characters), and looking only at that match misses the anchor
-    // entirely, which under-holds and lets the token be emitted in halves.
-    if (prefix.length > 1) {
-      const anchorAt = text.lastIndexOf(prefix);
-      if (anchorAt >= 0) {
-        const held = text.length - anchorAt;
-        if (held > longest) longest = held;
-      }
-    }
+    for (let k = max; k > 0; k--) if (text.endsWith(prefix.slice(0, k))) return k;
+    return 0;
+  }
+  const body = text.slice(anchorAt + prefix.length);
+  // The declared bound is what stops `ACME_` + 10 MB of body from buffering the whole
+  // stream: past it, the token is handed to the matcher and released.
+  if (entry.maxLength && body.length >= entry.maxLength) return 0;
+  if (!entry.continuation) return text.length - anchorAt;
+  for (const ch of body) if (!entry.continuation.test(ch)) return 0; // the token ended
+  return text.length - anchorAt;
+}
+
+/**
+ * Length of a trailing fragment that could still grow into a protected string. Exact, not
+ * heuristic: every contract is declared rather than derived from a regex.
+ */
+export function partialPrefixLength(text, holdbacks) {
+  let longest = 0;
+  for (const entry of normalizeHoldbacks(holdbacks)) {
+    const held = entry.kind === "namespace" ? heldForNamespace(text, entry) : heldForLiteral(text, entry.value);
+    if (held > longest) longest = held;
   }
   return longest;
 }
@@ -3218,18 +3253,38 @@ function applyAnthropicContent(content, ctx, trusted, registry = null) {
     if (!block || typeof block !== "object") continue;
     if (block.type === "text" && typeof block.text === "string") {
       block.text = applySinkPolicy(block.text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted, registry).text;
+    } else if (block.type === "tool_use" && Array.isArray(block.content)) {
+      // Newer Anthropic tool results carry their payload as content blocks.
+      applyAnthropicContent(block.content, ctx, trusted, registry);
     } else if (block.type === "tool_use" && block.input && typeof block.input === "object") {
-      // Tool inputs are structured, so each string leaf is an operand.
-      for (const key of Object.keys(block.input)) {
-        if (typeof block.input[key] !== "string") continue;
-        block.input[key] = applySinkPolicy(
-          block.input[key], ctx,
-          { kind: SINK_KIND.TOOL_ARGUMENT, toolName: block.name },
-          trusted, registry
-        ).text;
-      }
+      // Tool inputs are structured. EVERY string leaf is an operand, at any depth: a
+      // one-level loop missed `{headers:{auth:"<token>"}}` and `{args:["<token>"]}`, so an
+      // operand nested one level down was resolved like prose.
+      applyOperandPolicy(block.input, ctx, trusted, registry, block.name);
     }
   }
+}
+
+/**
+ * Apply the operand policy to every string leaf of a structured value, at any depth.
+ * Objects and arrays are traversed; only strings are rewritten, and the tree is mutated in
+ * place so the wire shape is preserved.
+ */
+export function applyOperandPolicy(value, ctx, trusted, registry, toolName = null) {
+  if (typeof value === "string") {
+    return applySinkPolicy(value, ctx, { kind: SINK_KIND.TOOL_ARGUMENT, toolName }, trusted, registry).text;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) value[i] = applyOperandPolicy(value[i], ctx, trusted, registry, toolName);
+    return value;
+  }
+  if (value && typeof value === "object") {
+    for (const key of Object.keys(value)) {
+      value[key] = applyOperandPolicy(value[key], ctx, trusted, registry, toolName);
+    }
+    return value;
+  }
+  return value;
 }
 
 /** Walk a parsed non-stream response and return it with the policy applied. */
