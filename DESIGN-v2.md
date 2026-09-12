@@ -1034,6 +1034,56 @@ tool_calls（不得泄漏）        → 不含明文 ✅
 trusted broker（可还原）      → 含明文 ✅
 ```
 
+## 9.18 G0.1 Protocol + Ownership Closure（已实现）
+
+G0 之后剩下两个 P0 gap，本刀收口。
+
+### ① Responses SSE 的 operand 路由
+
+原实现：「字段名叫 `delta`」⇒ `assistant_text`。于是 `response.function_call_arguments.delta` 被当正文还原。**字段名不构成关于 sink 的陈述**——同一信封里 `.output_text.delta` 是正文、`.function_call_arguments.delta` 是 shell 命令。
+
+改为 **event type × field path** 决定 sink：
+
+| 事件 | sink | 字段 |
+|---|---|---|
+| `response.output_text.delta` / `refusal.delta` / `reasoning_text.delta` / `reasoning_summary_text.delta` | assistant_text | `delta` |
+| `response.function_call_arguments.delta` | tool_argument | `delta` |
+| `response.function_call_arguments.done` | tool_argument | `arguments` |
+| `response.mcp_call_arguments.delta` / `.done` | tool_argument | `delta` / `arguments` |
+| `response.custom_tool_call_input.delta` / `.done` | tool_argument | `delta` / `input` |
+| **未识别事件** | **tool_argument（保守默认）** | 全部字符串叶子 |
+
+**未识别事件不得因字段名叫 `delta` 自动获得 RESTORE 权限**——这是本刀明确固定的一条。
+
+### ② ownership 三分法回到交付策略
+
+G0 把 `ForeignTokenRegistry` 从实际路径弄掉了：`classifyRestore()` 收参数、`applySinkPolicy()` 不读、`handleRequest()` 无 plumbing。三分法只在单元测试里可达——正是 G0 本身要修掉的"helper 正确、生产没接线"形态。
+
+**两个实现缺陷**（都会让 registry 静默失效）：
+
+1. `applySinkPolicy` 从未接收 registry；
+2. `classifyTokensIn` 用 `REDACTED_TOKEN` 正则找 token，而**外来 token 不是 CRG 形状**，根本匹配不到——即使参数传到了也永远判不出 FOREIGN_REGISTERED。现在同时按 `registry.tokens` 与 namespace matcher 扫描。
+
+契约（实测穿过生产路径）：
+
+```
+FOREIGN_REGISTERED + assistant_text                 → PRESERVE（不重写）
+FOREIGN_REGISTERED + untrusted tool_argument        → BLOCK
+FOREIGN_REGISTERED + shell/network/database/email   → BLOCK
+FOREIGN_REGISTERED + trusted broker                 → PRESERVE
+                                                      （本层无 mapping，故不能 restore）
+```
+
+`handleRequest` 现在从 `options.foreignRegistry` 取值并下传到**两条**响应路径、`applyResponsePolicy`、`SseRestorer` 的通道策略。
+
+### 修正一条名实不符的测试
+
+`a registered foreign token is blocked in an untrusted sensitive sink` 原本断言「token 仍被交付」——测试名说 blocked、断言说 delivered。G0.1 之后它确实被 refuse，测试名与断言已一致。
+
+### 端到端测试
+
+`test/g01-protocol-ownership.test.js` 共 8 条，全部穿 `handleRequest()`，覆盖三种 operand delta、三种 operand done、未识别 delta 事件、registered foreign 在正文/操作数/trusted 三种通道、以及**未登记的 token 形状值在操作数里必须被拒**。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
