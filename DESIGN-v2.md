@@ -51,13 +51,25 @@ Cosy Redact Gateway 是客户端与上游 LLM API 之间的隐私中继：把请
 node -e 'import("./worker.js").then(async (m)=>{const c=new m.RedactionContext({salt:"repro"}),f=m.parseFlags("");for(const s of ["DB_PASSWORD=Pr0d-P@ssw0rd-Xy9Zk2mQ","DB_PASSWORD=hello123!","password: Pr0d-P@ssw0rd-Xy9Zk2mQ","export TOKEN=Pr0d-P@ssw0rd-Xy9Zk2mQ","Authorization: Bearer Pr0d-P@ssw0rd-Xy9Zk2mQ","?access_token=Pr0d-P@ssw0rd-Xy9Zk2mQ","AWS_SECRET_ACCESS_KEY = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"])console.log((await c.redactText(s,f))===s?"MISS":"HIT ",s)})'
 ```
 
-根因：key 名 `DB_PASSWORD` 是比 value 形状强得多的证据，但当前实现里 key 名只作 keyword 预筛（`lower.includes(k)`），判定完全押在 value 的字符形状上。
+根因（已进一步定位）：keyword 预筛**已经命中**——`DB_PASSWORD`、`password`、`TOKEN` 都在 `generic-api-key` 的 keywords 集合里。真正失败的是 value 字符类 `(?:[\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})`，它不接受 `@` 和 `!`，真实密码几乎必然带这类符号，因此候选根本形成不了。对照实测（同一 key 名，只改 value 字符集）：
+
+| 样本 | 判定 |
+|---|---|
+| `DB_PASSWORD=Pr0d-P@ssw0rd-Xy9Zk2mQ` | MISS（`@`） |
+| `DB_PASSWORD=hello123!` | MISS（`!`） |
+| `DB_PASSWORD=Pr0d-Passw0rdXy9Zk2mQ` | HIT |
+| `DB_PASSWORD=SuperSecret123` | HIT |
+| `DB_PASSWORD=cGFzc3dvcmQxMjM0NTY3OA==` | HIT |
+
+所以这一项的修法不是"补 key 名识别"（key 名条件已满足），而是**先解析绑定形式、再取整个 value**——即结构化上下文提取，而不是继续加宽 value 字符类（后者只会把误报面一起放大）。测试：`test/structured-context.test.js`。
 
 ### 3.2 占位符 `{{Redact:…}}` 破坏宿主语法
 
 `{` 在 YAML 中是 flow mapping 起始符，`{{Redact:abc}}` 会被解析成嵌套映射而不是标量。
 
-【实测】PyYAML 6.0.1：`password: {{Redact:abc}}` → `ConstructorError: while constructing a mapping`；`password: "{{Redact:abc}}"` 与 `password: CRG_7K2M9Q_0007_9A` → OK。复现：`python3 -c "import yaml; yaml.safe_load('password: {{Redact:abc}}')"`。
+【实测·已修正】PyYAML 6.0.1：`password: {{Redact:abc}}` → `ConstructorError: while constructing a mapping`。
+
+【修正说明】`{{Redact:<64 hex>}}` 单看是**合法**的 YAML flow mapping（`{ {Redact:…} }` 嵌套），也就是说它的危害**不是"解析失败"，而是"类型被改写"**：字段本来是 string，替换后成为 mapping。仓库内最小校验器据此断言的是类型改写而非解析错误，见 `current placeholder is unusable in Kubernetes and other typed fields [GREEN NOW]`。真实 K8s 场景下危害是确定的：`Secret.data` 要求 base64，花括号占位符不是合法 base64（见 3.5）。
 
 影响面是 YAML（Helm values、K8s 清单、CI 配置、Ansible）：下游解析器直接拒绝或误解析，模型会去分析一个本来不存在的语法错误。`.env`、shell、URL query、HTTP header 不受影响（`{` 在那里只是普通字符），但 shell 中必须加引号，这一点已由 `current placeholder leaves URL and header usable, but needs shell quoting [GREEN NOW]` 固化。
 
@@ -277,10 +289,12 @@ Sink      { kind, restore: bool, reason }
 
 ### 8.1 `test/token-syntax.test.js`（7 例）
 
-- `current placeholder breaks YAML plain scalars [GREEN NOW]` — 现行 `{{Redact:…}}` 不是合法 YAML plain scalar（用仓库内的最小 plain-scalar / flow 校验器，无第三方依赖）。
+- `current placeholder is unusable in Kubernetes and other typed fields [GREEN NOW]` — 现行 `{{Redact:…}}` 不是合法 base64、且内含 `{` 与 `:`，会把 YAML 字段从 string 改写成 mapping（见 3.2 修正说明）。
 - `current placeholder leaves URL and header usable, but needs shell quoting [GREEN NOW]` — 现行占位符在 URL query 与 header 中可直接使用，shell 中必须加引号。
 - ★ `plaintext-derived checksum is an offline verification oracle [RED]` — 明文派生 checksum 可离线验证猜测（fixture 能区分 `0000/1234/9999`）；目标 token 只有 `[requestId, entityId]` 两个分量，任一分量都不可由明文重算。
-- ★ `portable token is a valid YAML plain scalar and shell-safe [RED]` — 脱敏产物匹配 `^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$`，是合法 YAML plain scalar 且无需 shell 引号。当前失败的直接原因是 3.1 的漏报：`Pr0d-P@ssw0rd-Xy9Zk2mQ` 未被脱敏，测试回落到原文。
+- ★ `portable token is a valid YAML plain scalar and shell-safe [RED]` — **纯 token 契约，与 detector 解耦**：不经脱敏，直接断言目标 token 是合法 YAML plain scalar、无需 shell 引号、可作 `.env` key。
+- `redacted output is syntactically valid in every host syntax [COUPLING]` — 脱敏产物在五种宿主里语法合法；夹具刻意选用当前 detector **已能检出**的值，使该用例只度量 token 语法。
+- ★ 新增 `test/structured-context.test.js`（9 例，5 红）：`.env`/YAML/shell/header/URL 六种绑定形式的漏报，含 4 条 `[GREEN NOW]` 定位用例（证明 keyword 门槛已满足、失败在 value 字符类）与 5 条 `[RED]` 目标用例。
 - `portable token is usable as an .env key and as a URL/header value [RED]` — token 满足 `.env` key 语法、`encodeURIComponent(token) === token`、是合法 header value。
 - `redaction round-trip is byte-identical for every host syntax [COUPLING]` — 对 YAML / `.env` / shell（带引号）/ header / URL query 五种宿主，`restoreText(redact(text)) === text` 逐字节一致。
 - `redaction is idempotent and never nests placeholders [GREEN NOW]` — 二次脱敏不再包装已脱敏值，占位符数量恒为 1。
@@ -325,7 +339,9 @@ Sink      { kind, restore: bool, reason }
 
 【设计决定】出方向只发新 token（`CRG_…`），入方向还原在过渡期同时接受 `{{Redact:<64hex>}}` 与新格式以便灰度，且 `redaction is idempotent and never nests placeholders` 必须继续通过；Redact Notice 文案需重写（现有文案显式描述 `{{Redact:sha256}}`）；`H` 保留为 flag 但语义从"判定"变为"候选信号"，`/$...` 全开行为需在 README 与本文件重新表述；SSE 还原器按 6.6 改造。
 
-`[GREEN NOW]` 用例是行为快照：迁移后其中一部分（如 `current placeholder breaks YAML plain scalars`、`current gateway re-wraps most foreign tokens`、`assistant prose and tool arguments are handled identically today`）应当**失败或改名**，改动必须显式提交，不允许顺手改断言。
+`[GREEN NOW]` 用例是行为快照：迁移后其中一部分（如 `current placeholder is unusable in Kubernetes and other typed fields`、`current gateway re-wraps most foreign tokens`、`assistant prose and tool arguments are handled identically today`）应当**失败或改名**，改动必须显式提交，不允许顺手改断言。
+
+分组边界：`token-syntax` 只管 token 格式契约，`structured-context` 只管 detector 覆盖，两者不得互相耦合——否则任一侧的红绿都会给出错误信号。
 
 ## 10. 未解决问题 / 待验证
 

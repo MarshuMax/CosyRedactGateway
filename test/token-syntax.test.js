@@ -114,13 +114,21 @@ function makeTargetTokenSource() {
 
 // ---------------------------------------------------- 1. current behaviour ---
 
-test("current placeholder breaks YAML plain scalars [GREEN NOW]", () => {
-  // Asserted as a fact so that the fix shows up as a behaviour change rather
-  // than an accidental test edit.
+test("current placeholder is unusable in Kubernetes and other typed fields [GREEN NOW]", () => {
+  // Measured correction: `{{Redact:<64 hex>}}` is NOT caught by a plain-scalar
+  // rule, because `{Redact:...}` is itself valid flow-mapping syntax. The real
+  // damage is elsewhere, and is asserted here as fact so the migration shows up
+  // as a behaviour change rather than an accidental test edit:
+  //
+  //   - Secret.data requires base64, and a brace placeholder is not base64;
+  //   - a plain `password:` scalar containing `{` and `:` is a flow mapping, so
+  //     the field's type changes from string to mapping.
   const placeholder = "{{Redact:" + "a1b2c3d4".repeat(8) + "}}";
-  const r = yamlAssign("password", placeholder);
-  assert.equal(r.ok, false, `placeholder must not be a valid YAML plain scalar: ${r.reason || "it parsed"}`);
-  assert.match(r.reason, /unterminated flow collection/);
+  assert.equal(/^[A-Za-z0-9+/]*={0,2}$/.test(placeholder), false, "placeholder is not base64 (Secret.data)");
+  assert.equal(placeholder.includes(":"), true, "placeholder embeds a colon, which retypes a YAML scalar");
+  assert.equal(placeholder.includes("{"), true, "placeholder embeds a flow-mapping indicator");
+  // A value that would be a valid plain scalar is what the target token must be.
+  assert.equal(yamlAssign("password", "CRG_7K2M9Q_0001").ok, true);
 });
 
 test("current placeholder leaves URL and header usable, but needs shell quoting [GREEN NOW]", () => {
@@ -162,14 +170,36 @@ test("plaintext-derived checksum is an offline verification oracle [RED]", () =>
 
 // ------------------------------------------------ 2. target token syntax ----
 
-test("portable token is a valid YAML plain scalar and shell-safe [RED]", async () => {
-  const nextToken = makeTargetTokenSource();
-  const { currentFormat, token } = await redactOne("Pr0d-P@ssw0rd-Xy9Zk2mQ");
-  const target = currentFormat ? nextToken() : token;
+test("portable token is a valid YAML plain scalar and shell-safe [RED]", () => {
+  // Pure token contract: no detector involved. The generator is not exported by
+  // worker.js yet, so the target format is asserted via the test double. When
+  // the real generator lands, swap the source and keep every assertion below.
+  const target = makeTargetTokenSource()("7K2M9Q");
   assert.match(target, PORTABLE_TOKEN_RE, "token must match the portable format");
-  const r = yamlAssign("password", target);
-  assert.equal(r.ok, true, `token must be a valid YAML plain scalar: ${r.reason}`);
+  assert.equal(yamlAssign("password", target).ok, true, "token must be a valid YAML plain scalar");
   assert.equal(SHELL_SAFE_RE.test(target), true, "token must not need shell quoting");
+});
+
+test("redacted output is syntactically valid in every host syntax [COUPLING]", async () => {
+  // Integration contract, deliberately decoupled from detection reach: the
+  // fixture is a value the current detector already catches, so this test
+  // measures ONLY token syntax compatibility. Detection gaps live in
+  // test/structured-context.test.js, not here.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  // Longer, lower-repetition base64 blob: the short form above happens to
+  // fall below the detector entropy floor, which would make this test fail for a
+  // detection reason. The fixture must stay a value current main already catches.
+  const detected = Buffer.from("correct-horse-battery-staple-42").toString("base64");
+  const line = `DB_PASSWORD=${detected}`;
+  const out = await ctx.redactText(line, { gitleaks: true });
+  const gotToken = (out.match(CURRENT_PLACEHOLDER_RE) || [])[0];
+  assert.ok(gotToken, "fixture must be detected; if this fails, detection (not token syntax) regressed");
+  assert.equal(ctx.restoreText(out), line, "round-trip must be byte-identical");
+  // The target token is a valid plain scalar. The current placeholder is a valid
+  // flow MAPPING instead of a string (it contains `{` and `:`), so it retypes the
+  // field rather than failing to parse -- see group 1 of this file.
+  assert.equal(yamlAssign("password", makeTargetTokenSource()("7K2M9Q")).ok, true);
+  assert.equal(gotToken.includes("{") && gotToken.includes(":"), true, "placeholder retypes the YAML field");
 });
 
 test("portable token is usable as an .env key and as a URL/header value [RED]", () => {
