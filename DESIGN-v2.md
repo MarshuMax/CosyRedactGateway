@@ -1337,9 +1337,36 @@ blob: "{{ <64hex> }}"                    → blob: "CRG_..."
 token: "{{ <PAT> }}"  # rotate quarterly → token: "CRG_..."  # rotate quarterly（注释与引号保留）
 ```
 
-### 一处夹具教训
+## 9.23.1 R0.1.1 Fixture sanity：一处**未经验证的归因**
 
-`DB_PASSWORD=$(op read op://vault/db/password)` 我最初列为"pure reference"，实测**被替换**——因为 `op://vault/db/password` 是真实的 INTERNAL_HOSTNAME 命中。这不是缺陷，正是"有 hit 则整体替换"规则在生效。夹具与结论混在一起是这类测试最容易犯的错，因此该 case 单独成条并注明理由。
+9.23 初稿把 `DB_PASSWORD=$(op read op://vault/db/password)` 被替换归因于"`op://vault/db/password` 是 INTERNAL_HOSTNAME 命中"。**这个归因是错的，且我从未验证过。**
+
+打印真实判定链后：
+
+```
+findSensitiveSpans  → []                      无任何 detector 命中
+recogniseInfra("op://vault/db/password")        → null（不是以 .internal/.local/.svc 结尾的点分主机名）
+recogniseInfra("//vault/db/password)")          → null
+recogniseInfra("vault.db.local")                → INTERNAL_HOSTNAME / VERIFIED
+policy               → 无决策
+out                  → 原样
+```
+
+**真实根因是 YAML parser 把 shell 赋值当成了 YAML mapping。** 旧正则 `^([ \t]*)([^\s:#][^:#]*?)[ \t]*:[ \t]*([\s\S]*)$` 在 URL 的 `op:` 处切分：
+
+```js
+'DB_PASSWORD=$(op read op://vault/db/password)'
+→ yaml: key = 'DB_PASSWORD', raw = '//vault/db/password)'   ← 完全错的
+→ strength = strong → binding span → 脱敏
+```
+
+即**一个指向密钥的引用被当成密钥明文脱敏了**，而且只覆盖了行的一部分。
+
+修正：**`:` 后没有空白就不是 mapping 分隔符**（YAML 规范）。例外是 unquoted scalar 不得以 `/` 或 `$` 起头，这条把 `token:ghp_xxx`（紧凑 mapping）与命令代换区分开。
+
+修正后该样本**保持原样**——这正是应有的目标行为（secret reference ≠ secret plaintext）。
+
+`R0.1.1 fixture sanity` 测试把这条链逐项断言（含 `parseYamlBindings(line).length === 0` 与 `bindingSpansOf` 为 0），使归因不能再漂移。
 
 ## 10. 未解决问题 / 待验证
 

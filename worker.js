@@ -2058,6 +2058,23 @@ export function parseYamlBindings(text, coverage = null) {
     // original line.
     const matchTarget = trimmedEnd.replace(/^([ \t]*)-[ \t]+/, "$1");
     const m = /^([ \t]*)([^\s:#][^:#]*?)[ \t]*:[ \t]*([\s\S]*)$/.exec(matchTarget);
+    // A mapping separator needs whitespace after the colon, or the line is not a block
+    // mapping. Without this the SHELL assignment
+    //
+    //   DB_PASSWORD=$(op read op://vault/db/password)
+    //
+    // parsed as YAML with `op` as an inner key: the split landed on the `op:` of the URL,
+    // producing key=DB_PASSWORD and a value of `//vault/db/password)`. A strong key then
+    // made it a binding span, so a reference to a secret was redacted as if it were the
+    // secret -- and only a fragment of the line was covered.
+    //
+    // The exception is an unquoted scalar, which may not begin with `/` or `$`: that is what
+    // separates `token:ghp_xxx` (a real compact mapping) from a command substitution.
+    if (m && !/:[ \t]/.test(m[0]) && /^[\/$]/.test(m[3])) {
+      if (coverage) coverage.record(PARSER.YAML, COVERAGE_STATUS.NOT_APPLICABLE, lineStart, lineStart + line.length);
+      lineStart += line.length + 1;
+      continue;
+    }
     if (!m) {
       // Attempted but unlocatable. The trigger has to be a SINGLE token followed by a
       // colon (allowing quotes): without that, every English sentence containing a

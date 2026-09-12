@@ -23,7 +23,15 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext, referenceEnvelopes } from "../worker.js";
+import {
+  RedactionContext,
+  referenceEnvelopes,
+  recogniseInfra,
+  findSensitiveSpans,
+  parseBindings,
+  parseYamlBindings,
+  bindingSpansOf,
+} from "../worker.js";
 
 const ALL = { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true, identity: true, bank: true };
 const PAT = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
@@ -52,15 +60,59 @@ test("R0.1: a reference with no detector hit is unchanged [RED]", async () => {
   }
 });
 
-test("R0.1: a reference whose body a detector recognises is still replaced whole [RED]", async () => {
-  // `op://vault/db/password` inside `$( )` is a real INTERNAL_HOSTNAME hit, so this is not a
-  // pure reference: the rule is "no detector hit -> unchanged", and this one has a hit. It is
-  // listed separately from the pure cases because conflating the two is how the boundary
-  // gets confused with the verdict.
+test("R0.1.1 fixture sanity: the op:// sample has NO detector hit and stays unchanged [GREEN NOW]", async () => {
+  // This sample previously carried a WRITTEN-DOWN attribution ("it is an INTERNAL_HOSTNAME
+  // hit") that was never verified. It was wrong. The real chain, asserted here so it cannot
+  // drift again:
+  //
+  //   findSensitiveSpans  -> []            (no detector hit at all)
+  //   recogniseInfra      -> null          (op://… is not a dotted hostname ending in
+  //                                         .internal/.local/.svc, so the recogniser
+  //                                         correctly declines it)
+  //   action              -> none          (nothing to act on)
+  //
+  // The redaction that used to happen had a different cause entirely: the YAML parser split
+  // the SHELL assignment on the `op:` of the URL, producing key=DB_PASSWORD with the value
+  // `//vault/db/password)`. A strong key made that a binding span, so a REFERENCE to a secret
+  // was redacted as if it were the secret. A `:` without following whitespace is not a
+  // mapping separator, so the parser no longer claims the line.
   const line = "DB_PASSWORD=$(op read op://vault/db/password)";
+
+  // The recogniser declines it, for the stated reason.
+  assert.equal(recogniseInfra("op://vault/db/password"), null, "not a dotted internal hostname");
+  assert.equal(recogniseInfra("//vault/db/password)"), null, "nor is the mis-split fragment");
+  assert.equal(recogniseInfra("vault.db.local")?.infraType, "INTERNAL_HOSTNAME", "while a real one is recognised");
+
+  // No detector produces a span, so nothing is redacted.
+  assert.deepEqual(findSensitiveSpans(line, ALL), [], "no span, no action");
+
+  // The YAML parser must not claim a shell assignment.
+  assert.equal(parseYamlBindings(line).length, 0, "a shell assignment is not a YAML mapping");
+  assert.equal(bindingSpansOf(line, "binding", parseYamlBindings).length, 0);
+  // The shell parser sees the reference and declines it, as designed.
+  const shell = parseBindings(line);
+  assert.equal(shell.length, 1, "the assignment is recognised structurally");
+  assert.ok(shell[0].evidence.includes("reference_value"), "and marked as a reference");
+  assert.equal(bindingSpansOf(line, "binding", parseBindings).length, 0, "so it is not a candidate");
+
+  // End to end: a secret REFERENCE is not secret PLAINTEXT.
   const { out } = await redact(line);
-  assert.equal(out.includes("op://vault/db/password"), false, "the recognised value goes");
-  assert.equal(out.includes("$("), false, "and the construct goes with it");
+  assert.equal(out, line, "unchanged");
+
+  // ...but a compact mapping with the same shape IS a mapping, and is still caught.
+  const realMapping = "DB_PASSWORD: op://vault/db/password";
+  const yamlRecords = parseYamlBindings(realMapping);
+  assert.equal(yamlRecords.length, 1, "whitespace after the colon makes it a mapping");
+});
+
+test("R0.1: a reference whose body holds a real credential is replaced whole [RED]", async () => {
+  // The counterpart to the sample above: when the body DOES contain a hard detector hit, the
+  // construct is the mutation boundary. `$( )` with content other than a bare reference is
+  // not a pure reference either, so the binding still reaches the merge.
+  const line = `DB_PASSWORD=$(printf ${PAT})`;
+  const { out } = await redact(line);
+  assert.equal(out.includes(PAT), false, "the credential goes");
+  assert.equal(out.includes("$("), false, "and so does the construct");
   assert.equal(out.includes(")"), false, "no half-open command substitution");
   assert.match(out, /^DB_PASSWORD=\S+$/);
 });
