@@ -308,5 +308,38 @@
       "next_step": "Instrument inside the two detector functions on this corpus: count tokenizeBlocks output, time the per-block scoring loop, count candidate matches per rule, and time the post-match filtering. Fresh process per point. Then localise before any change -- the same rule that produced two wrong guesses this session already.",
       "measurement_note": "Every point came from a separate process invocation with only one flag enabled. The corpus generator is deterministic and is recorded in full so the reproducer is exact."
     }
-  ]
+  ],
+  "r3_3_baselines": {
+    "request_corpus_a_clean_AUTHORITATIVE": {
+      "method": "Real handleRequest E2E with a fake fetchImpl returning a tiny response, so the measured body is the request forward path. One fresh process per size point.",
+      "note": "Supersedes the earlier hand-copied pipeline measurement, which used request.arrayBuffer() instead of readBodyCapped() and dropped redactJson's return value. redactJson BUILDS A NEW TREE, so that version stringified the original object and misreported heap, stringify time and output size.",
+      "points": {
+        "64KiB": "60.2ms 963.1 ms/MiB 1.04 MiB/s peakRSS 69MiB peakHeap 12MiB",
+        "256KiB": "99.1ms 396.2 ms/MiB 2.52 MiB/s peakRSS 87MiB peakHeap 18MiB",
+        "1MiB": "201.0ms 201.0 ms/MiB 4.98 MiB/s peakRSS 126MiB peakHeap 37MiB",
+        "4MiB": "582.9ms 145.7 ms/MiB 6.86 MiB/s peakRSS 274MiB peakHeap 167MiB",
+        "8MiB": "1005.2ms 125.6 ms/MiB 7.96 MiB/s peakRSS 300MiB peakHeap 184MiB",
+        "16MiB": "2113.9ms 132.1 ms/MiB 7.57 MiB/s peakRSS 849MiB peakHeap 688MiB"
+      },
+      "x4_ratios": "1.65 / 2.03 / 2.90 / 1.72 / 2.10 -- at or below 2.9 throughout, so scaling stays healthy",
+      "comparison_to_superseded": "1MiB 288ms -> 201ms, 4MiB 1021ms -> 583ms, 16MiB 3922ms -> 2114ms: the corrected path is FASTER, which is what you would expect when the original was stringifying an uncontaminated tree. Peak RSS changed materially in the other direction: 16MiB was 481MiB and is now 849MiB, because the real path holds the original parsed tree, the REDACTED tree (a separate allocation, not a mutation) and the stringified output at once. Peak heap 349MiB -> 688MiB.",
+      "conclusion": "Scaling stays linear (x4 ratios under 3, ms/MiB flat from 4MiB) and throughput reaches 7.6 MiB/s. The resource picture has changed enough to matter: peak RSS is about 53x the body at 16 MiB, not the 30x the superseded measurement suggested. The SCALING conclusion is unchanged; the RESOURCE conclusion is revised upward."
+    },
+    "request_corpus_b_parser_heavy": "BLOCKED by R3-BODY-002; not measured to full size.",
+    "response": {
+      "nonstream_json": "16M 153.3ms 104.4 MiB/s peakRSS 217MiB (13.6x) ratios <= 2.00",
+      "nonstream_text": "16M 81.3ms 185.2 MiB/s peakRSS 161MiB (10.7x) ratios <= 1.69",
+      "binary_passthrough": "16M 51.0ms 313.6 MiB/s peakRSS 152MiB",
+      "sse": "16M 461.4ms 34.7 MiB/s peakRSS 306MiB ratios <= 2.69"
+    },
+    "harness_defects_found_and_fixed": [
+      "response path built the response INLINE and skipped restoreNonStreamResponse entirely (0.2ms reported vs 153ms real)",
+      "SSE corpus emitted ONE 4096-byte event regardless of size, and the SSE branch was unreachable behind the binary/text branch",
+      "request path dropped redactJson's return value, measuring an uncontaminated tree",
+      "request path used request.arrayBuffer() instead of readBodyCapped()",
+      "the clean corpus rounded its padding UP and produced a body 18 bytes over the 16 MiB cap, so the 16 MiB row was a 413 refusal reported as a 38ms request",
+      "`total` summed the E2E run and the instrumented phase run, double-counting both",
+      "the request object was reused across measurements, but request.body is a ONE-SHOT stream, so the second read saw an empty body"
+    ]
+  }
 }

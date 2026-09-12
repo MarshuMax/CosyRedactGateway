@@ -9,12 +9,22 @@ const { kind, bytes } = spec;
 // ---------------------------------------------------------------- corpus builders ---
 function corpus(targetBytes) {
   if (kind === "clean") {
-    // Pad a simple message so the JSON envelope is most of the body.
+    // Pad by content, never by slicing -- a truncated body is invalid JSON -- and land AT OR BELOW
+    // the target. The previous version rounded the repeat count UP and produced a body 18 bytes
+    // OVER the 16 MiB default cap, which handleRequest correctly answered with 413; the harness then
+    // reported 38ms for a whole 16 MiB request because the body was refused, not processed.
+    const PAD = "lorem ipsum dolor sit amet ";
     const head = { model: "g", messages: [{ role: "user", content: "" }] };
-    const base = JSON.stringify(head).length;
-    head.messages[0].content = "lorem ipsum dolor sit amet ".repeat(Math.ceil((targetBytes - base) / 27));
-    // Pad by content, never by slicing: a truncated body is invalid JSON.
-    return JSON.stringify(head);
+    const overhead = JSON.stringify(head).length;
+    const needed = Math.max(0, targetBytes - overhead);
+    head.messages[0].content = PAD.repeat(Math.floor(needed / PAD.length));
+    let body = JSON.stringify(head);
+    // Top up with single characters while staying inside the target.
+    while (body.length + 1 <= targetBytes) {
+      head.messages[0].content += "x";
+      body = JSON.stringify(head);
+    }
+    return body;
   }
   if (kind === "parser") {
     // Parser-heavy: many short config lines, which is what the structured-context parsers chew on.
@@ -27,7 +37,8 @@ function corpus(targetBytes) {
     }
     // Build to at least the target by LINE, then keep the JSON valid -- slicing the stringified
     // body would produce invalid JSON and measure the parse failure instead of the parser.
-    return JSON.stringify({ model: "g", messages: [{ role: "user", content: lines.join("\n") }] });
+    const body = JSON.stringify({ model: "g", messages: [{ role: "user", content: lines.join("\n") }] });
+    return body;
   }
   if (kind === "redaction") {
     // Redaction-heavy: every line carries a claimable secret.
@@ -38,7 +49,8 @@ function corpus(targetBytes) {
       lines.push(line);
       n += line.length + 1;
     }
-    return JSON.stringify({ model: "g", messages: [{ role: "user", content: lines.join("\n") }] });
+    const body = JSON.stringify({ model: "g", messages: [{ role: "user", content: lines.join("\n") }] });
+    return body;
   }
   if (kind === "text") return "plain text body ".repeat(Math.ceil(targetBytes / 17)).slice(0, targetBytes);
   if (kind === "binary") return "BINARY".repeat(Math.ceil(targetBytes / 6)).slice(0, targetBytes);
@@ -81,24 +93,51 @@ const sampler = setInterval(() => {
 
 let result;
 if (spec.side === "request") {
-  // capped read, then decode, parse, redact, stringify -- mirroring handleRequest's own order.
-  const stream = new ReadableStream({
-    start(c) {
-      const CH = 1 << 16;
-      for (let at = 0; at < encoded.length; at += CH) c.enqueue(encoded.subarray(at, at + CH));
-      c.close();
-    },
+  // TWO tracks, because one cannot serve both purposes honestly.
+  //
+  // E2E: the real request path through handleRequest, with a fake fetchImpl that answers
+  // immediately, so the measured cost IS the forward path. This is the authoritative baseline for
+  // total time, peak heap, peak RSS and output size. It deliberately does NOT re-implement
+  // handleRequest: an earlier version copied the pipeline by hand, used request.arrayBuffer()
+  // instead of readBodyCapped(), and dropped redactJson's return value -- and redactJson BUILDS A
+  // NEW TREE rather than mutating in place, so that version stringified the ORIGINAL object and
+  // reported the wrong heap, stringify time and output size.
+  //
+  // PHASES: a separate instrumented run over the same corpus, kept only for phase attribution.
+  // It parses the body itself, so its read/decode numbers are indicative rather than production
+  // (the production read is a counted streaming read with a cap).
+  // A FRESH Request per measurement. `request.body` is a one-shot stream, so reusing one object
+  // meant the second read saw an exhausted body and returned early -- the 16 MiB run reported 6.8ms
+  // for the whole E2E path because the stream had already been consumed.
+  const makeRequest = () => {
+    const stream = new ReadableStream({
+      start(c) {
+        const CH = 1 << 16;
+        for (let at = 0; at < encoded.length; at += CH) c.enqueue(encoded.subarray(at, at + CH));
+        c.close();
+      },
+    });
+    return new Request("https://p/H$https://api.example/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json" }, body: stream, duplex: "half",
+    });
+  };
+  const e2eOut = await stageAsync("handleRequestE2E", async () => {
+    const res = await handleRequest(makeRequest(), {}, {
+      // A tiny response, so the measured body is the REQUEST forward path.
+      fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), { headers: { "content-type": "application/json" } }),
+      salt: "perf",
+    });
+    return (await res.text()).length;
   });
-  const request = new Request("https://p/H$https://api.example/v1/chat/completions", {
-    method: "POST", headers: { "content-type": "application/json" }, body: stream, duplex: "half",
-  });
-  const bytesRead = await stageAsync("read", async () => new Uint8Array(await request.arrayBuffer()).length);
+
+  // Phase attribution over a fresh parse of the same corpus.
   const text = await stageAsync("decode", async () => new TextDecoder().decode(encoded));
-  const data = stage("jsonParse", () => JSON.parse(text));
+  const parsed = stage("jsonParse", () => JSON.parse(text));
   const ctx = new RedactionContext({ salt: "perf", maxRedactions: 1e9 });
-  await stageAsync("redactJson", () => redactJson(data, ctx, { gitleaks: true, highEntropy: true, email: true }));
-  const out = stage("stringify", () => JSON.stringify(data));
-  result = { bytesRead, outBytes: out.length, tokens: ctx.rawToToken.size };
+  // ASSIGN the result: redactJson returns a new tree.
+  const redacted = await stageAsync("redactJson", () => redactJson(parsed, ctx, { gitleaks: true, highEntropy: true, email: true }));
+  const out = stage("stringify", () => JSON.stringify(redacted));
+  result = { e2eOutBytes: e2eOut, outBytes: out.length, tokens: ctx.rawToToken.size };
 } else if (spec.sse) {
   // SSE: build a stream of delta events whose deltas total the target size, then drive it through
   // handleRequest so restoreSseStream, streamFields and the per-event policy all run for real.
@@ -145,9 +184,16 @@ const m = process.memoryUsage();
 if (m.rss > peakRss) peakRss = m.rss;
 if (m.heapUsed > peakHeap) peakHeap = m.heapUsed;
 
+// `total` must be the AUTHORITATIVE path cost, not the sum of every measurement taken.
+// On the request side the E2E run and the instrumented phase run are SEPARATE executions of the
+// same corpus, so summing them double-counts and made the 16 MiB row look like 3803ms when the
+// real request path was 6.7ms + its own work. phases is attribution only.
+const total = phases.handleRequestE2E !== undefined
+  ? phases.handleRequestE2E
+  : Object.values(phases).reduce((a, b) => a + b, 0);
 process.stdout.write(JSON.stringify({
   kind, side: spec.side, requested: bytes, bodyBytes: body.length,
-  phases, total: Object.values(phases).reduce((a, b) => a + b, 0),
+  phases, total,
   peakRssMiB: peakRss / 1048576, peakHeapMiB: peakHeap / 1048576,
   baselineRssMiB: baselineRss / 1048576, baselineHeapMiB: baselineHeap / 1048576,
   result,
