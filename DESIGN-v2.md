@@ -546,9 +546,15 @@ apiVersion == v1  AND  kind == Secret  AND  path under root `stringData` → 普
 | D1 | assignment family | 已实现 |
 | D1.1 | 共享 evidence 层加固 | 已实现 |
 | D2a | 简单 YAML scalar mapping | 已实现 |
-| D2b | block scalar / 注释裁剪 / path evidence | 待做 |
-| D2c | K8s Secret schema + base64 surrogate | 待做 |
-| D3 | HTTP header + URL query | 待做 |
+| D2b | block scalar / 注释裁剪 | 已实现 |
+| D2c | K8s Secret schema + base64 surrogate | 已实现 |
+| D2c.1 | ownership hardening（shape ≠ ownership） | 已实现 |
+| D2c.2 | surrogate policy convergence | 已实现 |
+| D3a | 粘贴的 HTTP header | 已实现 |
+| D3b | URL query raw-span | 已实现 |
+| D3c | JSON `url` 字段覆盖 | 已实现 |
+
+**structured-context D 组全部收口**（162 tests / 162 pass）。
 
 ## 9.8 D2b-1 / D2b-2（已实现）与 D2c 基线
 
@@ -658,6 +664,47 @@ UNKNOWN token 形状  → 不享受任何豁免；strong binding / G / 其它 de
 
 `CRG_` 形状的值是否透传，**只由 ownership 决定**（见 9.8.4b）。早期版本在 binding 层按形状跳过，那是安全回归，已删除。
 
+## 9.10 D2c.2 surrogate policy convergence（已实现）
+
+`classifyRestore()` 曾给 surrogate 留了一个**独立快捷分支**（敏感 sink + untrusted → 无条件 BLOCK）。那不是"与 underlying token 同等对待"：等 `entityClassFor` 真接进来后，被判成 `INFRA` 的实体，其普通 token 会按 entity policy 走，而 base64 surrogate 仍会被无条件阻断——两条路径漂移。
+
+**修法**：删掉快捷分支。
+
+- `resolveSurrogate(value, ctx)` 把可见 surrogate 解析为 underlying token；
+- `classifyOwnership` 在**解析后的 token** 上判定，因此 ownership / entityClass / entity policy 全部针对实体而非其表示形式；
+- surrogate 仍被显式遍历（base64 不是 CRG 形状，`REDACTED_TOKEN` 找不到它），但走**同一条** ownership × entityClass × sink × trust 判定。
+
+回归用例含一条关键断言：把 `entityClassFor` 临时改成返回 `INFRA` 后，**surrogate 与普通 token 必须给出相同动作**——这正是"没有残留快捷分支"的证明。
+
+## 9.11 D3 粘贴的 HTTP header 与 URL query（已实现）
+
+### 两个层级必须分开
+
+| 层级 | 处理 |
+|---|---|
+| **粘贴进 prompt 的 header 文本**（`Authorization: Bearer <secret>`） | **脱敏** |
+| **网关发给 upstream 的传输头**（`filteredRequestHeaders()` 构造） | **原样转发**，上游需要真实凭据认证；该路径根本不经过文本脱敏 |
+
+测试同时固定两侧：粘贴文本被脱敏，且传输头的 `Authorization` / `x-api-key` / provider 头**必须逐字保留**——否则一次错误的"加固"会打断所有已认证调用。
+
+### URL：raw span，不 decode 不 re-encode
+
+只替换 query value 的原始 span。百分号转义、`+`、参数顺序、重复参数、fragment **全部逐字节保留**；decode → 修改 → re-encode 会把这些静默规范化掉。query **名**允许 decode 后匹配（`access%5Ftoken`），**值**一律保持原样。敏感名集合：`access_token` `auth_token` `api_key` `key` `secret` `client_secret` `password` `token` `credential` `signature` `sig` `x-amz-*` `sas` `code` 等；非敏感参数（`page` `limit` `q` `sort`）不动。
+
+### D3c：JSON `url` 字段不再被整串跳过
+
+`shouldSkipString()` 原先对任何 `url` / `image_url` 键直接 `return true`，字符串**根本到不了 `redactText`**：
+
+```json
+{"url": "https://api.example.com/?access_token=SECRET"}   → 原样转发
+```
+
+现在只跳 `image_url`（它常承载 base64 data URL，不是文本），普通 `url` 字段照常扫描，由 URL query 解析器产出 raw span。嵌套的 `image_url.url` 也会被扫描出 query 秘密。
+
+### 实现期修正
+
+header 的 `valueStart` 最初用多个长度相减推算，得到**负偏移**（尾部空白差值与值长度相减顺序错误），输出出现重叠。改为**锚定值本身**（`line.lastIndexOf(secret)`）——header 的秘密就是行尾值，最后一次出现即 span。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
@@ -666,7 +713,8 @@ UNKNOWN token 形状  → 不享受任何豁免；strong binding / G / 其它 de
 3. **【待验证】** schema 类型受限位置（number / boolean / enum）的替换策略需要真实 API server 或 provider schema 验证，当前只有"fail-closed"这一个保守选项。
 4. **【待验证】** 跨层归属的显式声明机制：网关与外层 DLP 如何协商 EXCLUSIVE / PASS_THROUGH（响应头、部署配置或共享清单），以及不一致时的检测点。
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
-6. **【待验证】** Parser 覆盖率下限：YAML block scalar（`|` / `>`）、锚点别名、shell 引号与转义、URL percent-encoding、多行 `.env` 目前只有设计描述，无实现数据。
+6. **【已部分落地】** Parser 覆盖率：YAML block scalar（`|` `>` 及 chomping/缩进指示符）与 URL percent-encoding 已实现并有测试；**锚点别名、shell 引号与转义、多行 `.env` 仍无实现数据**，覆盖率度量机制（"未解析区域进入 UNKNOWN"）尚未建立。
+7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。
 9. **【待替换】测试内的实现占位**：`token-syntax` 的 `targetToken()`（`djb2(明文)` 派生 entity slot）与 `k8s-surrogate` 的 `base64Surrogate()`、`restore-miss` 的 `classifyRestore()` 都是形态占位；前者的派生方式正是 8.1 所禁止的 checksum oracle 形态，worker.js 实现时必须用 CSPRNG，不得复用测试里的推导。

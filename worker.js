@@ -1095,6 +1095,120 @@ export function applyObjectSchema(text, spans) {
   ));
 }
 
+// ------------------------------------------------- D3a pasted HTTP headers -----
+//
+// Scope note that matters: this is about HTTP header TEXT the user pastes into a
+// prompt. It is NOT about the transport headers this gateway sends upstream -- those
+// are built in filteredRequestHeaders() and never pass through text redaction, and
+// they must keep carrying the real Authorization / x-api-key values, because the
+// upstream needs them to authenticate.
+
+// Header names whose value is a credential by convention. Everything else
+// (Content-Type, Accept, User-Agent, Host, X-Request-Id, ...) is left alone.
+const SENSITIVE_HEADER_RE = /^(?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key|private-token|x-gitlab-token|x-vault-token|x-token)$/i;
+
+export function parseHeaderBindings(text) {
+  const out = [];
+  if (typeof text !== "string" || !text.includes(":")) return out;
+  const lines = text.split("\n");
+  const offsets = [];
+  for (let i = 0, at = 0; i < lines.length; i++) { offsets.push(at); at += lines[i].length + 1; }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || /^\s*#/.test(line)) continue;
+    const m = /^([ \t]*)([A-Za-z][A-Za-z0-9-]*)[ \t]*:[ \t]*(\S.*?)[ \t]*$/.exec(line);
+    if (!m) continue;
+    const name = m[2];
+    if (!SENSITIVE_HEADER_RE.test(name)) continue;
+
+    const value = m[3];
+    // A scheme prefix is kept outside the span: replacing `Bearer <tok>` wholesale
+    // would delete the scheme, and a header whose scheme disappeared is no longer the
+    // same header.
+    const scheme = /^(Bearer|Basic|Token|Digest|AWS4-HMAC-SHA256)[ \t]+/i.exec(value);
+    const offset = scheme ? scheme[0].length : 0;
+    const secret = value.slice(offset);
+    if (secret.length === 0) continue;
+
+    // Anchor on the value itself rather than deriving the offset from several
+    // lengths: the arithmetic version produced negative start offsets (the trailing
+    // whitespace delta and the value length were subtracted in the wrong order).
+    // A header's secret is its trailing value, so the last occurrence IS the span.
+    const valueStart = offsets[i] + line.lastIndexOf(secret);
+    out.push({
+      kind: "binding",
+      key: name,
+      normalizedKey: normalizeBindingKey(name),
+      valueStart,
+      valueEnd: valueStart + secret.length,
+      syntax: "http-header",
+      evidence: ["structured_binding", "sensitive_header_name"].concat(scheme ? ["scheme_preserved"] : []),
+      strength: KEY_STRENGTH.STRONG,
+      raw: secret,
+      headerName: name,
+      scheme: scheme ? scheme[1] : null,
+    });
+  }
+  return out;
+}
+
+// --------------------------------------------------- D3b URL query values ------
+//
+// Raw span only: the query value is replaced as-is, with no decoding and no
+// re-encoding. Percent-escapes, `+`, parameter order and duplicate parameters are
+// therefore preserved byte for byte, which a decode -> modify -> re-encode pipeline
+// would silently normalise away.
+
+const SENSITIVE_QUERY_KEY_RE = /^(?:access[_-]?token|auth[_-]?token|api[_-]?key|apikey|key|secret|client[_-]?secret|password|passwd|token|credential|signature|sig|x-amz-signature|x-amz-credential|x-amz-security-token|sas|code)$/i;
+
+export function parseUrlBindings(text) {
+  const out = [];
+  if (typeof text !== "string" || !text.includes("?") || !text.includes("=")) return out;
+  const schemeRe = /[A-Za-z][A-Za-z0-9+.-]*:\/\//g;
+  let match;
+  while ((match = schemeRe.exec(text))) {
+    const urlStart = match.index;
+    // The URL runs to whitespace, a quote or a closing delimiter.
+    let urlEnd = urlStart;
+    while (urlEnd < text.length && !/[\s"'<>)\]}]/.test(text[urlEnd])) urlEnd++;
+    const url = text.slice(urlStart, urlEnd);
+    const q = url.indexOf("?");
+    if (q < 0) continue;
+    const hash = url.indexOf("#", q);
+    const query = url.slice(q + 1, hash < 0 ? undefined : hash);
+
+    let at = q + 1;
+    for (const part of query.split("&")) {
+      const eq = part.indexOf("=");
+      if (eq > 0) {
+        const key = part.slice(0, eq);
+        const rawValue = part.slice(eq + 1);
+        let decodedKey = key;
+        try { decodedKey = decodeURIComponent(key); } catch { /* keep raw */ }
+        if (rawValue.length > 0 && SENSITIVE_QUERY_KEY_RE.test(decodedKey)) {
+          const valueStart = urlStart + at + eq + 1;
+          out.push({
+            kind: "binding",
+            key: decodedKey,
+            normalizedKey: normalizeBindingKey(decodedKey),
+            valueStart,
+            valueEnd: valueStart + rawValue.length,
+            syntax: "url-query",
+            evidence: ["structured_binding", "sensitive_query_name", "raw_span_no_reencode"],
+            strength: KEY_STRENGTH.STRONG,
+            raw: rawValue,
+            queryName: decodedKey,
+          });
+        }
+      }
+      at += part.length + 1; // + the `&`
+    }
+    schemeRe.lastIndex = urlEnd;
+  }
+  return out;
+}
+
 export const PATH_CONFIDENCE = Object.freeze({
   SIMPLE_MAPPING: "simple-mapping",
   UNKNOWN: "unknown",
@@ -1563,6 +1677,8 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   if (flags.structuredContext !== false) {
     c.push(...bindingSpansOf(text));
     c.push(...bindingSpansOf(text, "binding", parseYamlBindings));
+    c.push(...bindingSpansOf(text, "binding", parseHeaderBindings));
+    c.push(...bindingSpansOf(text, "binding", parseUrlBindings));
   }
   // Registered foreign tokens are contributed as candidates so that the SAME
   // ownership filter that protects owned tokens also protects them. Exact
@@ -1843,8 +1959,15 @@ function shouldSkipString(path) {
   const key = path[path.length - 1] || "";
   if (CONTROL_KEYS.has(key)) return true;
   const p = path.join(".").toLowerCase();
-  if (/(?:image_url|input_image|input_audio|audio|file_data|b64_json|source\.data|image\.data)/.test(p)) return true;
-  if (key === "url" || key === "image_url") return true;
+  // Binary/payload fields stay skipped: base64 image and audio bodies are not text and
+  // must not be rewritten.
+  if (/(?:input_image|input_audio|audio|file_data|b64_json|source\.data|image\.data)/.test(p)) return true;
+  // `image_url` is an image payload carrier, not a link a user pasted, so it stays
+  // skipped. A plain `url` field is NOT skipped any more: skipping it meant
+  // `{"url": "https://x/?access_token=SECRET"}` was forwarded verbatim, because the
+  // string never reached redactText at all. The URL query parser now produces a raw
+  // span for the sensitive value, so the field is scanned like any other string.
+  if (key === "image_url") return true;
   return false;
 }
 

@@ -99,7 +99,7 @@ test("key-name evidence is what closes the value-class gap [GREEN NOW]", async (
   assert.equal((await redact(dotted)).includes(SECRET), false, "structured binding covers it");
 });
 
-test("D1+D2a cover the assignment and YAML-scalar families; header/URL remain [GREEN NOW]", async () => {
+test("D1+D2a+D3 cover every binding family in the fixture [GREEN NOW]", async () => {
   // Slice baseline. D1 closed env/shell, D2a closed the simple YAML scalar
   // mapping (`password: xxx` and both quote styles). What is left is D2b (block
   // scalar), D2c (K8s Secret schema), and D3 (header + URL).
@@ -109,11 +109,8 @@ test("D1+D2a cover the assignment and YAML-scalar families; header/URL remain [G
     if (!out.includes(SECRET)) continue; // covered
     missed.push(form.name);
   }
-  // The nested `data:\n  password: x` form is ALSO covered by D2a -- not because
-  // base64 semantics are understood (that is D2c), but because a nested key is
-  // still a simple scalar mapping and its span is the plain value. The base64
-  // question is about the replacement FORMAT, not about whether the span is found.
-  assert.deepEqual(missed, ["HTTP header", "URL query"]);
+  assert.deepEqual(missed, [], "every binding family in the fixture must now be covered");
+  assert.equal(BINDING_FORMS.length, 7, "fixture covers env/shell/YAML/header/URL/nested/spaced");
 });
 
 test("the fix is attributable to structured context, not another detector [GREEN NOW]", async () => {
@@ -142,13 +139,9 @@ test("D1: assignment-family bindings are redacted [GREEN NOW]", async () => {
   assert.equal(D1_FORMS.length, 3, "fixture must cover .env, shell export and spaced assignment");
 });
 
-test("D3: header and URL bindings are not covered yet [RED]", async () => {
-  // Baseline for the remaining slice. YAML scalar mapping moved to the D2a test
-  // above when it landed; D2b (block scalar) and D2c (Secret schema) are about
-  // span kinds and replacement FORMAT rather than key detection, and are tracked in
-  // test/d2a-yaml.test.js.
+test("D3: header and URL bindings are covered [GREEN NOW]", async () => {
   const pending = D2_D3_FORMS.filter((f) => !["YAML mapping", "YAML base64 field"].includes(f.name));
-  assert.ok(pending.length >= 3, "fixture must still hold the pending forms");
+  assert.equal(pending.length, 2, "header + URL");
   for (const form of pending) {
     const out = await redact(form.line);
     assert.equal(out.includes(SECRET), false, `${form.name} must not forward the secret verbatim`);
