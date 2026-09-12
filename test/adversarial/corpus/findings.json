@@ -354,7 +354,8 @@
       "fix": "Return early when `padded.length === 0`, placed AFTER the coverage-bearing parsers have run and BEFORE referenceEnvelopes. The coverage contract is preserved rather than short-circuited: `const empty = []; return coverage ? coverage.attachTo(empty) : empty;` -- returning a bare [] would silently drop coverage on exactly the inputs where coverage matters most, a document the detectors found nothing in.",
       "differential": "Exact comparison against the pre-change implementation, over 14 case/flag combinations covering all four requested shapes: no detector hit with many valid refs, no detector hit with malformed/unclosed refs, no detector hit on ordinary clean text, and WITH a hit so the fast path must not fire. Compared spans by start/end/type/priority/ruleId/classifiedText/evidence, the coverage summary, and the ARRAY'S OWN PROPERTY NAMES (the returned array carries a non-enumerable coverage property). 0 differences. Run twice, once against HEAD and once against the pre-BODY-002 commit 1aad949, so the check also proves that Phase 1 and Phase 3 together are equivalent to the behaviour before either change.",
       "explicitly_not_a_fix_for_redos_002": "This narrows R3-REDOS-002's reachability but must NOT be recorded as fixing it. The moment a single span survives, referenceEnvelopes() runs again and the repeated failed forward scan over unclosed constructs is unchanged. A document with one secret and one unclosed construct still pays it.",
-      "regression": "Covered by the existing coverage and reference suites; the differential above is the acceptance evidence."
+      "regression": "Covered by the existing coverage and reference suites; the differential above is the acceptance evidence.",
+      "config": "default detectors; corpus B (one reference construct per line, zero surviving spans)"
     }
   ],
   "r3_3_baselines": {
