@@ -20,6 +20,7 @@ import {
   RedactionContext,
   parseYamlBindings,
   findSensitiveSpans,
+  bindingSpansOf,
   PATH_CONFIDENCE,
   TOKEN_PREFIX,
 } from "../worker.js";
@@ -174,7 +175,7 @@ const BLOCK_INDICATORS = ["|", "|-", "|+", ">", ">-", ">+", "|2", "|+2", "|2+"];
 
 test("D2b-2: every block indicator form is recognised [GREEN NOW]", () => {
   for (const indicator of BLOCK_INDICATORS) {
-    const doc = [`key: ${indicator}`, "  body line"].join("\n");
+    const doc = [`secret: ${indicator}`, "  body line"].join("\n");
     const binding = parseYamlBindings(doc).find((b) => b.bodyCandidate);
     assert.ok(binding, `${indicator}: the body must be located`);
     assert.equal(binding.raw, "body line", `${indicator}: the span is the body text`);
@@ -255,14 +256,20 @@ test("D2b-2: round-trip is byte-identical for every indicator [GREEN NOW]", asyn
   }
 });
 
-test("D2b-2: a key whose value is only a reference is still inert [GREEN NOW]", async () => {
-  const doc = ["password: |", "  ${{ secrets.DB_PASSWORD }}"].join("\n");
-  const binding = parseYamlBindings(doc).find((b) => b.bodyCandidate);
-  // The reference rule applies to plain scalars; a block body is opaque text, so the
-  // body candidate stays available for a content detector but the key tier is not
-  // what drives it.
-  assert.ok(binding, "the body is still offered to the detectors");
-  assert.equal(binding.strength, "none", "a body candidate never carries key strength");
+test("D2b-3: a block body that is only a reference stays untouched [GREEN NOW]", async () => {
+  // The previous version of this test asserted only the evidence layer
+  // (`strength === none`) and passed while the final behaviour was wrong: the body
+  // candidate was an unconditional redaction span, so the template reference was
+  // replaced with a token and the indirection it exists to provide was destroyed.
+  const docs = [
+    ["password: |", "  ${{ secrets.DB_PASSWORD }}"].join("\n"),
+    ["password: |", "  ${{ secrets.A }}", "  ${{ secrets.B }}"].join("\n"),
+    ["password: |", "  ${DB_PASSWORD}"].join("\n"),
+  ];
+  for (const doc of docs) {
+    const out = await redact(doc, { gitleaks: true, highEntropy: true });
+    assert.equal(out, doc, `a reference-only body must not be rewritten: ${JSON.stringify(doc)}`);
+  }
 });
 
 // Minimal structural re-parse: returns the top-level keys of a block mapping, and
@@ -289,6 +296,70 @@ function parseSimpleMappingShape(doc) {
   }
   return keys;
 }
+
+// ------------------------------------------------- 4c. D2b-3 precision -------
+
+// A block body is a REGION the parser records, not a redaction span. Emitting every
+// body line as a span turned each block scalar into a redaction surface: `notes: |`,
+// `description: |` and `script: |` are common in README/Helm/K8s annotations and none
+// of them are secret. The decision belongs to key strength or to a content detector.
+
+const LONG_PEM_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKjM5bGZkZ2Fh";
+
+test("D2b-3: an ordinary documentation block is untouched [GREEN NOW]", async () => {
+  const docs = [
+    ["notes: |", "  deployment completed successfully", "  restart the service after upgrade"].join("\n"),
+    ["description: |", "  This chart deploys the API.", "  See README for details."].join("\n"),
+    ["script: |", "  echo hello", "  echo world"].join("\n"),
+    ["message: |", "  Rollback finished at 12:04.", "  No action required."].join("\n"),
+  ];
+  for (const doc of docs) {
+    const out = await redact(doc, { gitleaks: true, highEntropy: true });
+    assert.equal(out, doc, `must stay inert: ${JSON.stringify(doc)}`);
+  }
+});
+
+test("D2b-3: a weak/absent key yields a region record and zero spans [GREEN NOW]", () => {
+  const doc = ["notes: |", "  ordinary documentation", "  second line"].join("\n");
+  const records = parseYamlBindings(doc);
+  assert.equal(records.length, 1, "the region is recorded");
+  assert.equal(records[0].regionOnly, true, "and it is marked region-only");
+  assert.ok(records[0].evidence.includes("block_scalar_region"));
+  assert.equal("strength" in records[0] && records[0].strength, "none");
+  // The decisive assertion: a region record contributes no redaction span.
+  assert.deepEqual(bindingSpansOf(doc, "binding", parseYamlBindings), []);
+});
+
+test("D2b-3: a strong parent key protects every body line [GREEN NOW]", async () => {
+  const doc = ["password: |", "  lowentropy", "  anotherline"].join("\n");
+  const out = await redact(doc, { gitleaks: true, highEntropy: true });
+  assert.equal(out.includes("lowentropy"), false, "first line protected on key evidence");
+  assert.equal(out.includes("anotherline"), false, "second line protected on key evidence");
+  assert.equal(out.includes("password: |"), true, "the indicator survives");
+  const ctx = new RedactionContext({ salt: "fixture" });
+  assert.equal(ctx.restoreText(out) === doc || out.split("\n").length === doc.split("\n").length, true);
+});
+
+test("D2b-3: a PEM under a weak key is redacted by the provider rule, not the parser [GREEN NOW]", async () => {
+  // Attribution guard. Without the second half, an unconditional body candidate
+  // would keep this green and hide the fact that the parser was doing the work.
+  const doc = ["notes: |", "  -----BEGIN PRIVATE KEY-----", `  ${LONG_PEM_BODY}`, "  -----END PRIVATE KEY-----"].join("\n");
+
+  const withG = await redact(doc, { gitleaks: true, highEntropy: false });
+  assert.notEqual(withG, doc, "with the provider rule on, the key material is redacted");
+
+  const withoutG = await redact(doc, { gitleaks: false, highEntropy: false });
+  assert.equal(withoutG, doc, "with the provider rule off, the structured layer must NOT redact it");
+});
+
+test("D2b-3: the PEM body length matters (fixture legality) [GREEN NOW]", async () => {
+  // A control for the guard above: the private-key rule needs >= 64 characters of
+  // body, so a short fixture is not detected even with the rule on. Recorded because
+  // an illegal fixture previously produced a wrong conclusion about this code path.
+  const shortDoc = ["notes: |", "  -----BEGIN PRIVATE KEY-----", "  MIIEvQIBADANBgkq", "  -----END PRIVATE KEY-----"].join("\n");
+  assert.equal(await redact(shortDoc, { gitleaks: true, highEntropy: false }), shortDoc,
+    "an under-length body does not satisfy the provider rule");
+});
 
 // ------------------------------------------------- 5. D2c known gap (base64) ---
 

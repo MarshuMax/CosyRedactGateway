@@ -1091,74 +1091,74 @@ export function parseYamlBindings(text) {
         // A single-line body can be spanned directly. A multi-line body must NOT be
         // spanned as a whole: replacing lines with one unindented token violates the
         // block's indentation requirement and yields invalid YAML.
-        // Per-LINE candidates: a span that crosses lines cannot be replaced
-        // without breaking the block's indentation requirement, which produces
-        // invalid YAML (measured: `ScannerError`). Every line therefore gets its
-        // own span with its own indentation left outside it. The weak-key gate
-        // does not apply here -- a TLS key under `notes: |` is still a key.
-        for (let i = loc.firstContentLine; i <= loc.lastContentLine; i++) {
-          const lineText = lines[i];
-          const lineIndent = lineText.match(/^[ \t]*/)[0].length;
-          const lineBody = lineText.slice(lineIndent).replace(/[ \t]+$/, "");
-          if (lineBody.length === 0) continue;
-          const lineStartOffset = startOfLine(i);
-          // The body starts right after the indentation. `indexOf(lineBody, ...)`
-          // returns a LINE-RELATIVE index, and adding it to the line start offset
-          // double-counted the indentation, shifting every span right by `lineIndent`
-          // (and, on a line whose text repeated earlier in the line, by more).
-          const bodyOffset = lineIndent;
-          out.push({
-            kind: "binding",
-            key,
-            normalizedKey: normalizeBindingKey(key),
-            valueStart: lineStartOffset + bodyOffset,
-            valueEnd: lineStartOffset + bodyOffset + lineBody.length,
-            syntax: "yaml",
-            evidence: ["block_scalar_body"],
-            strength: KEY_STRENGTH.NONE,
-            raw: lineBody,
-            indent: structural.indent,
-            pathSegments: structural.pathSegments,
-            pathConfidence: structural.pathConfidence,
-            bodyCandidate: true,
-          });
-        }
+        // Region vs span, kept separate. The parser records WHERE the body is;
+        // whether anything is redacted is decided by key strength or by a content
+        // detector. Emitting every body line as a redaction span turned every
+        // block scalar into a redaction surface: `notes: |`, `description: |` and
+        // `script: |` are common in README/Helm/K8s and none of them are secret.
+        const bodyIndent = lines[loc.firstContentLine].match(/^[ \t]*/)[0].length;
+        const region = {
+          firstLine: loc.firstContentLine,
+          lastLine: loc.lastContentLine,
+          indent: bodyIndent,
+          start: lineOffsets[loc.firstContentLine] + bodyIndent,
+          end: lineOffsets[loc.lastContentLine] + lines[loc.lastContentLine].replace(/[ \t]+$/, "").length,
+        };
 
-        // A STRONG key adds a direct binding, but only for a single-line body:
-        // spanning a multi-line body as one unit is exactly the invalid-YAML case
-        // above. Multi-line bodies are covered by the per-line candidates plus the
-        // content detectors.
-        if (!multiLine) {
-          const valueStart = firstLineStart + indentOfFirst;
-          const valueEnd = startOfLine(loc.lastContentLine) + lastLine.replace(/[ \t]+$/, "").length;
-          const body = text.slice(valueStart, valueEnd);
-          const strength = classifyKeyStrength(key);
-          const evidence = ["structured_binding", "block_scalar"];
-          if (strength === KEY_STRENGTH.STRONG) evidence.push("strong_secret_key");
-          if (docShapeKnown) {
-            structural.pathSegments = [...stack.map((e) => e.key), key];
-            structural.pathConfidence = PATH_CONFIDENCE.SIMPLE_MAPPING;
-          } else {
-            structural.pathSegments = [];
-            structural.pathConfidence = PATH_CONFIDENCE.UNKNOWN;
-            evidence.push("path_unknown");
+        const strength = classifyKeyStrength(key);
+        // Only a STRONG parent key promotes the body to redaction spans. A weak or
+        // absent key leaves the decision to the content detectors, so an ordinary
+        // documentation block is untouched while a real key under `notes: |` is
+        // still caught by the provider rule.
+        if (strength === KEY_STRENGTH.STRONG) {
+          for (let i = loc.firstContentLine; i <= loc.lastContentLine; i++) {
+            const lineText = lines[i];
+            const lineIndent = lineText.match(/^[ \t]*/)[0].length;
+            const lineBody = lineText.slice(lineIndent).replace(/[ \t]+$/, "");
+            if (lineBody.length === 0) continue;
+            // A reference is not a literal secret even inside a block body.
+            // Without this, `password: |\n  ${{ secrets.X }}` was replaced with a
+            // token, destroying the indirection the template exists to provide.
+            if (looksLikeReferenceValue(lineBody)) continue;
+            out.push({
+              kind: "binding",
+              key,
+              normalizedKey: normalizeBindingKey(key),
+              valueStart: lineOffsets[i] + lineIndent,
+              valueEnd: lineOffsets[i] + lineIndent + lineBody.length,
+              syntax: "yaml",
+              evidence: ["block_scalar_body", "strong_secret_key"],
+              strength,
+              raw: lineBody,
+              indent: structural.indent,
+              pathSegments: structural.pathSegments,
+              pathConfidence: structural.pathConfidence,
+              bodyCandidate: true,
+              bodyRegion: region,
+            });
           }
+        } else {
+          // Region only: no redaction span, but the structure is available as
+          // evidence (and to a future object-level recogniser).
           out.push({
             kind: "binding",
             key,
             normalizedKey: normalizeBindingKey(key),
-            valueStart,
-            valueEnd,
+            valueStart: region.start,
+            valueEnd: region.end,
             syntax: "yaml",
-            evidence,
+            evidence: ["block_scalar_region"],
             strength,
-            raw: body,
+            raw: text.slice(region.start, region.end),
             indent: structural.indent,
             pathSegments: structural.pathSegments,
             pathConfidence: structural.pathConfidence,
+            bodyRegion: region,
+            regionOnly: true,
           });
         }
       }
+
       stack.push({ indent, key });
       lineStart += line.length + 1;
       continue;
@@ -1303,6 +1303,9 @@ export function parseBindings(text) {
  */
 export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
   return parser(text)
+    // `regionOnly` records are structural evidence and deliberately NOT spans: the
+    // parser must not decide that an ordinary `notes: |` block is sensitive.
+    .filter((b) => !b.regionOnly)
     .filter((b) => b.bodyCandidate === true
       || (b.strength === KEY_STRENGTH.STRONG && !b.evidence.includes("reference_value")))
     .map((b) => ({

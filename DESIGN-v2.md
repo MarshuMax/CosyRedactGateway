@@ -569,13 +569,15 @@ password: abc123!  # note  # 注释，span 只覆盖 abc123!
 
 识别指示符族：`|` `|-` `|+` `>` `>-` `>+` 以及显式缩进指示符的**两种顺序**（`|2+` 与 `|+2`）。body 定位遵循 YAML 9.1.1：内容缩进由首个非空行决定，块在首个缩进更小的非空行结束。
 
-**关键实测结论：跨行 span 不能用来替换多行块体。** 把多行体替换成单个无缩进的 token 会产生非法 YAML（PyYAML `ScannerError: while scanning a simple key`）——因为块体必须保持缩进。四种形态实测全部失败，这个结论是测出来的，不是推出来的。
+**关键实测结论（措辞已修正）：要求不是"禁止跨行 span"，而是"replacement 必须维持 block scalar 的缩进与结构"。**
 
-因此：
+把一个多行体替换成**单个无缩进的 token** 会产生非法 YAML（PyYAML `ScannerError: while scanning a simple key`），四种形态实测全部失败。但**从首行内容开始、覆盖整个块体的 provider span 是可行的**——它替换后仍带有首行的缩进，YAML 依然合法，这也是 provider 规则（PEM 的 BEGIN..END）实际在做的事。真正会坏的是**跨越行边界却只覆盖部分块体**的 span：它会把值切成半行，缩进结构随之破坏。
 
-- 块体的每一行**各自成为一个候选**（`block_scalar_body`，优先级 55），每行自己的缩进留在 span 之外；
-- 单行体才允许由 key 强度直接产出 binding；
-- 多行体由逐行候选 + 内容检测器共同覆盖。
+所以实现上：
+
+- 块体每一行**各自成为一个候选**（`block_scalar_body`），每行缩进留在 span 之外；
+- 完整覆盖块体的 provider span 允许胜出（YAML 合法性由"首行缩进被保留"保证）；
+- 弱键下不产 span，由内容检测器决定（见 9.9）。
 
 实测验证（13 种形态，真实 PyYAML 解析 + restore 逐字节比对）：全部输出仍是合法 YAML，且 round-trip 全部一致，包含 `|`/`|-`/`|+`/`>`/`|2`/`|+2`/`|-2`、嵌套块、空行、注释、`abc#123`、同一文档两个块。
 
@@ -606,6 +608,42 @@ data:
 - 普通 `data.password`（非 Secret 对象）→ **不得**被判为 base64
 
 D2c 的判据必须是对象级：`apiVersion == v1` AND `kind == Secret` AND path under root `data`。仅凭 path 相同不够。
+
+## 9.9 D2b-3 block scalar 精度收口（已实现）
+
+**问题**：D2b-2 把块体的每个非空行都产出为 `bodyCandidate: true`，而 `bindingSpansOf` 的过滤条件是 `bodyCandidate === true || strong binding`——于是 bodyCandidate 不是"交给内容检测器的候选"，而是**直接的 redaction span**。后果是一个巨大的误删面：
+
+```
+notes: |                                    ← 弱键，内容无任何命中
+  deployment completed successfully
+  restart the service after upgrade
+```
+
+实测会被整块脱敏。`description: |`、`script: |`、`message: |` 同理，而它们在 README/Helm/K8s 里极其常见。
+
+**同时暴露一个假绿测试**：`password: |\n  ${{ secrets.DB_PASSWORD }}` 那条只断言了 `strength === none`（evidence 层），而最终行为其实是错的——模板引用被替换成 token，它存在的意义（保持间接）被摧毁。
+
+### 概念拆分
+
+```
+block body region  = parser evidence / structural region
+                   ≠ redaction span
+```
+
+- **strong parent key**：每个 body line 升为 redaction span（`block_scalar_body` + `strong_secret_key`）。
+- **weak / none parent key**：只产出 `block_scalar_region`（`regionOnly: true`），**不产 span**；是否脱敏完全由 `G`/`H`/其它 detector 决定。
+- body 行同样走 `reference_value` 判定，引用不被替换。
+
+### 归因守卫
+
+测试 `a PEM under a weak key is redacted by the provider rule, not the parser` 双向断言：
+
+```
+gitleaks=true  → 脱敏
+gitleaks=false → 原样
+```
+
+若 bodyCandidate 是无条件兜底，第二条会失败。附带一条夹具合法性控制用例：私有钥规则要求 body ≥ 64 字符，**过短夹具即使开着规则也不命中**——这个坑在本项目已经踩过一次（见 3.4 样本合法性）。
 
 ## 10. 未解决问题 / 待验证
 
