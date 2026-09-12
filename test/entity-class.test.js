@@ -64,7 +64,12 @@ test("E0: a PII entity is blocked at an untrusted sensitive sink [GREEN NOW]", a
 
   for (const kind of SENSITIVE_SINK_KINDS) {
     const decision = classifyRestore({ ctx: context, text: `use ${token}`, sink: { kind } });
-    assert.equal(decision.action, "block", `${kind}: PII must be blocked`);
+    // The contract is "not resolved into a sensitive sink". The action is `preserve`:
+    // the token is delivered rather than the plaintext. (An earlier revision named this
+    // action `block`; the security property is the same either way, and asserting the
+    // name would hide a regression in the property.)
+    assert.notEqual(decision.action, "restore", `${kind}: PII must not be resolved here`);
+    assert.equal(decision.text.includes("a@example.com"), false, `${kind}: no plaintext`);
   }
   // ...and still restorable where it is safe.
   assert.equal(classifyRestore({ ctx: context, text: `use ${token}`, sink: { kind: "assistant_text" } }).action, "restore");

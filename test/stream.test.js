@@ -105,15 +105,36 @@ test("Chat reasoning_content deltas restore placeholders across SSE events", asy
   assert.equal(events.map(x=>x.choices?.[0]?.delta?.reasoning_content||"").join(""),raw);
 });
 
-test("Anthropic partial_json deltas restore placeholders across SSE events", async()=>{
+test("Anthropic partial_json deltas keep the token: a tool operand is not restored [GREEN NOW]", async()=>{
+  // This previously asserted that an `input_json_delta` was RESTORED to the plaintext.
+  // That fixed the behaviour the sink policy exists to prevent: a tool argument is a
+  // value the model is about to hand to a tool, so substituting the secret there moves it
+  // outside the restoration boundary. The token is preserved instead.
   const raw="a@example.com";
+  let seenToken=null;
   const fetchImpl=async(_u,init)=>{
     const b=JSON.parse(init.body), token=b.messages[0].content.match(TOKEN)[0], cut=27;
+    seenToken=token;
     const a={type:"content_block_delta",index:1,delta:{type:"input_json_delta",partial_json:token.slice(0,cut)}};
     const z={type:"content_block_delta",index:1,delta:{type:"input_json_delta",partial_json:token.slice(cut)}};
     return chunkedResponse(`event: content_block_delta\ndata: ${JSON.stringify(a)}\n\nevent: content_block_delta\ndata: ${JSON.stringify(z)}\n\n`);
   };
   const r=await handleRequest(request("https://p/E$https://api.example/v1/messages",{model:"c",stream:true,max_tokens:20,messages:[{role:"user",content:raw}]}),{}, {fetchImpl,salt:"fixed"});
   const events=sseData(await r.text());
-  assert.equal(events.map(x=>x.delta?.partial_json||"").join(""),raw);
+  const joined=events.map(x=>x.delta?.partial_json||"").join("");
+  assert.equal(joined,seenToken,"the token survives fragment reassembly");
+  assert.equal(joined.includes(raw),false,"and the plaintext is not substituted");
+});
+
+test("Anthropic text_delta still restores, so the stream layer is not blanket-preserving [GREEN NOW]", async()=>{
+  const raw="a@example.com";
+  const fetchImpl=async(_u,init)=>{
+    const b=JSON.parse(init.body), token=b.messages[0].content.match(TOKEN)[0], cut=27;
+    const a={type:"content_block_delta",index:0,delta:{type:"text_delta",text:token.slice(0,cut)}};
+    const z={type:"content_block_delta",index:0,delta:{type:"text_delta",text:token.slice(cut)}};
+    return chunkedResponse(`event: content_block_delta\ndata: ${JSON.stringify(a)}\n\nevent: content_block_delta\ndata: ${JSON.stringify(z)}\n\n`);
+  };
+  const r=await handleRequest(request("https://p/E$https://api.example/v1/messages",{model:"c",stream:true,max_tokens:20,messages:[{role:"user",content:raw}]}),{}, {fetchImpl,salt:"fixed"});
+  const events=sseData(await r.text());
+  assert.equal(events.map(x=>x.delta?.text||"").join(""),raw,"prose still restores");
 });

