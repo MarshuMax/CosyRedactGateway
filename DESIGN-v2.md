@@ -929,6 +929,47 @@ secret=<bare64>                    → redact
 hard provider detector + OCI 形状   → redact
 ```
 
+## 9.16 F4.2 certainty 与 disposition 解耦（已实现）
+
+此前 `recogniseInfra()` **返回 `disposition`**，`decideSpanAction()` 读它——等于 recognizer 知道 policy。现在：
+
+```js
+recogniseInfra() → { entityClass: "INFRA", infraType, certainty, evidence, confidence }
+decideSpanAction({ detector, ruleId, infra, profile })   // profile 在此才被查询
+```
+
+- `hard` 改名 **`certainty: "VERIFIED" | "AMBIGUOUS"`**：`hard` 极易与 `HARD_SECRET` 混淆，而两者含义相反（VERIFIED 的 infra 标识**根本不是秘密**）。
+- recognizer 返回值里**不存在 `disposition`**，测试断言字段集恰好是那五项。
+
+**判定规则（固定）**：
+
+```
+HARD_SECRET                          → 永远 REDACT
+VERIFIED infra + profile=PRESERVE    → PRESERVE
+AMBIGUOUS infra + profile=PRESERVE   → 拒绝豁免，仍 REDACT
+profile=REDACT                       → REDACT
+```
+
+**profile v1 只有 PRESERVE / REDACT，不暴露 MASK。** 目前没有 mask 实现，`MASK` 会是一个"表现得像 REDACT 的谎言"。真正的 mask 需要逐类型的保真决策——ARN 保留 service/resource 还是只遮 account id？IP 保留网段？hostname 保留后缀还是 pseudonymise？——没有单一字符串级 mask 能正确回答。测试断言 `INFRA_DISPOSITION` 恰好只有两个值。
+
+`certainty` 按形状是否自证分配：
+
+| VERIFIED | AMBIGUOUS |
+|---|---|
+| `sha256:<64hex>` | 裸 64hex |
+| `commit <40hex>`（锚定） | 裸 40hex |
+| `trace_id: <32hex>`（锚定） | 裸 32hex |
+| `span_id: <16hex>`（锚定） | （裸 16hex **不 claim**） |
+| `arn:aws:…` | 12 位 account id |
+| `i-`/`subnet-`/`sg-`… 前缀 | 私网 IP |
+
+**ARN 尤其说明为什么必须拆**：它被判 VERIFIED（"是不是 ARN"毫无疑义），而默认 profile 选择 REDACT（"能否发给模型"是策略）。若为了默认脱敏而把 recognizer 写成 AMBIGUOUS，就是**把策略决定伪装成身份存疑**。
+
+### 两条实测记录的限制
+
+1. **disposition 只对"某个 detector 已产出 span"的值生效。** infra recognizer 是注解层，自身不产候选：一个不含任何凭据的裸 ARN 在**任何 profile 下都原样通过**（含默认 profile，其 `AWS_ARN` disposition 是 REDACT）。让 infra 成为独立 detector 是另一个决定，本刀刻意不做。
+2. **前缀落在 span 外时需要逐类型变体。** `i-0a1b2c3d4e5f67890` 整串是 VERIFIED，但熵检测器只圈住 hex 段、把 `i-` 留在 span 外，而裸 hex 是 AMBIGUOUS ⇒ 实例 ID 今天仍会被脱敏。OCI 的同类问题由变体 B（`contextBefore`）解决，EC2 前缀尚无对应变体。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
@@ -939,7 +980,7 @@ hard provider detector + OCI 形状   → redact
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
 6. **【覆盖率机制已建立，见 9.12】** 已实现 attempt 级 coverage（PARSED/PARTIAL/FAILED/NOT_APPLICABLE）与请求级 union 汇总，并有 8 份语料基线。仍**无实现数据**的部分：YAML 锚点/别名、shell 引号与转义、多行 `.env`——这些目前会体现为 PARTIAL 或不计入，需要更大语料才能定量。
 7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
-8. **【已实现，见 9.14】** Infra Recognizer：10 个 subtype，4 个在 preserve allowlist。**未做**：profile 机制（让 mask 类 subtype 按组织策略改成 preserve）、`INTERNAL_HOSTNAME` 对 K8s `svc` 短名的覆盖（当前需要完整 FQDN）。
+8. **【已实现，见 9.14 / 9.16】** Infra Recognizer：10 个 subtype，certainty 与 disposition 解耦，profile 可切换。**未做**：`MASK` 语义（需要逐类型保真定义）、infra 自身产出 span（当前只注解 detector 已产出的 span，因此未被任何 detector 命中的 ARN 不会脱敏）、EC2 前缀的 `contextBefore` 变体（实例 ID 仍会被熵检测器吃掉）、`INTERNAL_HOSTNAME` 对 K8s `svc` 短名的覆盖（当前需完整 FQDN）。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。
 9. **【待替换】测试内的实现占位**：`token-syntax` 的 `targetToken()`（`djb2(明文)` 派生 entity slot）与 `k8s-surrogate` 的 `base64Surrogate()`、`restore-miss` 的 `classifyRestore()` 都是形态占位；前者的派生方式正是 8.1 所禁止的 checksum oracle 形态，worker.js 实现时必须用 CSPRNG，不得复用测试里的推导。

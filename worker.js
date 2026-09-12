@@ -998,29 +998,54 @@ export const INFRA_TYPE = Object.freeze({
   EC2_RESOURCE_ID: "EC2_RESOURCE_ID",
 });
 
-// Dispositions. Deliberately tiny for a first revision: only correlation identifiers
-// whose loss is what motivated this slice are preserved. Everything else is classified
-// but still redacted, because in some organisations account ids, ARNs, internal
-// hostnames and resource names are sensitive infrastructure metadata -- that call
-// belongs to a profile, not to a pattern matcher.
+// How sure the recogniser is about WHAT the value is. This is a statement about
+// classification only -- it says nothing about what should happen to it.
+//
+// Named `certainty` rather than `hard` on purpose: `hard` reads as "hard secret" and the
+// two mean opposite things (a VERIFIED infra identifier is not a secret at all).
+export const INFRA_CERTAINTY = Object.freeze({
+  VERIFIED: "VERIFIED",
+  AMBIGUOUS: "AMBIGUOUS",
+});
+
+// What the deployment wants done with each type. Kept OUT of the recogniser so that
+// "what is this" and "may this leave" stay separate questions.
+//
+// Only PRESERVE and REDACT exist in v1. A MASK disposition is deliberately NOT exposed
+// yet: there is no mask implementation, so it would be a lie that happens to behave like
+// REDACT. Real masking needs per-type fidelity decisions -- does an ARN keep the
+// service/resource and hide only the account id? does an IP keep the subnet? does a
+// hostname keep its suffix or get pseudonymised? -- and no single string-level mask
+// answers those correctly.
 export const INFRA_DISPOSITION = Object.freeze({
   PRESERVE: "preserve",
-  MASK: "mask",
   REDACT: "redact",
 });
 
-export const INFRA_POLICY = Object.freeze({
+/** Default profile: the four correlation identifiers, and nothing else. */
+export const DEFAULT_PROFILE = Object.freeze({
   [INFRA_TYPE.GIT_SHA]: INFRA_DISPOSITION.PRESERVE,
   [INFRA_TYPE.OCI_DIGEST]: INFRA_DISPOSITION.PRESERVE,
   [INFRA_TYPE.TRACE_ID]: INFRA_DISPOSITION.PRESERVE,
   [INFRA_TYPE.SPAN_ID]: INFRA_DISPOSITION.PRESERVE,
-  [INFRA_TYPE.AWS_ACCOUNT_ID]: INFRA_DISPOSITION.MASK,
-  [INFRA_TYPE.AWS_ARN]: INFRA_DISPOSITION.MASK,
-  [INFRA_TYPE.PRIVATE_IP]: INFRA_DISPOSITION.MASK,
-  [INFRA_TYPE.INTERNAL_HOSTNAME]: INFRA_DISPOSITION.MASK,
-  [INFRA_TYPE.K8S_RESOURCE_NAME]: INFRA_DISPOSITION.MASK,
-  [INFRA_TYPE.EC2_RESOURCE_ID]: INFRA_DISPOSITION.MASK,
+  [INFRA_TYPE.AWS_ACCOUNT_ID]: INFRA_DISPOSITION.REDACT,
+  [INFRA_TYPE.AWS_ARN]: INFRA_DISPOSITION.REDACT,
+  [INFRA_TYPE.PRIVATE_IP]: INFRA_DISPOSITION.REDACT,
+  [INFRA_TYPE.INTERNAL_HOSTNAME]: INFRA_DISPOSITION.REDACT,
+  [INFRA_TYPE.K8S_RESOURCE_NAME]: INFRA_DISPOSITION.REDACT,
+  [INFRA_TYPE.EC2_RESOURCE_ID]: INFRA_DISPOSITION.REDACT,
 });
+
+/** A profile that preserves every infra type it can identify, for environments that want
+ *  infrastructure context to reach the model. It still cannot override a hard secret. */
+export const DEVOPS_PROFILE = Object.freeze(
+  Object.fromEntries(Object.values(INFRA_TYPE).map((type) => [type, INFRA_DISPOSITION.PRESERVE]))
+);
+
+export function profileDisposition(profile, infraType) {
+  const chosen = (profile || DEFAULT_PROFILE)[infraType];
+  return chosen === INFRA_DISPOSITION.PRESERVE ? INFRA_DISPOSITION.PRESERVE : INFRA_DISPOSITION.REDACT;
+}
 
 const HEX32 = "[0-9a-fA-F]{32}";
 const HEX40 = "[0-9a-fA-F]{40}";
@@ -1044,11 +1069,17 @@ const rawInfraRules = [
   //              `sha256:` because the entropy detector only circled the hex
   //
   // A bare 64-hex run with neither is SOFT: classified, never preserved.
-  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(sha256:${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.99 },
-  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, contextBefore: /sha256:\s*$/i },
-  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, hard: false, confidence: 0.5 },
-  { type: INFRA_TYPE.AWS_ARN, re: /(?<![A-Za-z0-9_])arn:aws[a-z-]*:[A-Za-z0-9-]+:[A-Za-z0-9-]*:\d{0,12}:[^\s"',)]+/g, group: 0, hard: false, confidence: 0.9 },
-  { type: INFRA_TYPE.EC2_RESOURCE_ID, re: new RegExp(`${LB}(?:i|ami|vol|snap|subnet|sg|vpc|eni|rtb|acl)-[0-9a-f]{8,17}${RB}`, "g"), group: 0, hard: false, confidence: 0.85 },
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(sha256:${HEX64})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.99 },
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.95, contextBefore: /sha256:\s*$/i },
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.5 },
+    // VERIFIED: `arn:aws:` is an unambiguous prefix, so "this is an ARN" is certain. Whether
+  // it may be SENT is a separate question answered by the profile -- the default redacts
+  // it, and that policy choice must not be smuggled into the recogniser as a doubt about
+  // what the value is.
+  { type: INFRA_TYPE.AWS_ARN, re: /(?<![A-Za-z0-9_])arn:aws[a-z-]*:[A-Za-z0-9-]+:[A-Za-z0-9-]*:\d{0,12}:[^\s"',)]+/g, group: 0, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.9 },
+    // VERIFIED: the `i-`/`subnet-`/`sg-` prefixes are distinctive, so the identity is not in
+  // doubt; the profile decides whether it may leave.
+  { type: INFRA_TYPE.EC2_RESOURCE_ID, re: new RegExp(`${LB}(?:i|ami|vol|snap|subnet|sg|vpc|eni|rtb|acl)-[0-9a-f]{8,17}${RB}`, "g"), group: 0, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.85 },
   // `hard` here means the SHAPE is unambiguous, not that the finding is dangerous: a fixed
   // length with boundary assertions, and excluded from the longer digest/git-sha forms by
   // the earlier rules. That is what makes suppressing an entropy-only hit safe. A secret
@@ -1058,27 +1089,27 @@ const rawInfraRules = [
   // Deliberately NOT hard: shapes that only narrow the odds (a 16-hex run, a 12-digit
   // number, a bare 40-hex commit that could equally be a random token). Those are
   // classified as INFRA but stay redacted until a profile opts in.
-  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, confidence: 0.6 },
-  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, anchor: /(?:trace[_-]?id|traceparent|trace)\s*[:=]/i },
-  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, confidence: 0.6 },
-  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, anchor: /(?:commit|git[_-]?sha|revision|rev)\s*[:=]?/i },
+  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.6 },
+  { type: INFRA_TYPE.TRACE_ID, re: new RegExp(`${LB}(${HEX32})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.95, anchor: /(?:trace[_-]?id|traceparent|trace)\s*[:=]/i },
+  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.6 },
+  { type: INFRA_TYPE.GIT_SHA, re: new RegExp(`${LB}(${HEX40})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.95, anchor: /(?:commit|git[_-]?sha|revision|rev)\s*[:=]?/i },
   // Anchored AND hard. The anchor is what makes it safe: an unanchored 16-hex run is not
   // claimed at all, because the shape is exactly a bank card's and releasing a card number
   // is a far worse outcome than redacting a span id. With `span_id:` in front, the shape
   // is doing the work the context already did.
-  { type: INFRA_TYPE.SPAN_ID, re: new RegExp(`${LB}(${HEX16})${RB}`, "g"), group: 1, hard: true, confidence: 0.9, anchor: /span[_-]?id\s*[:=]/i },
-  { type: INFRA_TYPE.AWS_ACCOUNT_ID, re: new RegExp(`${LB}(\\d{12})${RB}`, "g"), group: 1, hard: false, confidence: 0.5 },
+  { type: INFRA_TYPE.SPAN_ID, re: new RegExp(`${LB}(${HEX16})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.9, anchor: /span[_-]?id\s*[:=]/i },
+  { type: INFRA_TYPE.AWS_ACCOUNT_ID, re: new RegExp(`${LB}(\\d{12})${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.5 },
   // The ranges need DIFFERENT numbers of trailing octets, which is why the branches
   // cannot share one tail: `10` fixes one octet (two more follow), while `192.168` and
   // `172.16-31` fix two (one more follows). A single shared tail made `10.244.0.11`
   // silently fail -- only the two-octet prefixes matched.
-  { type: INFRA_TYPE.PRIVATE_IP, re: new RegExp(`${LB}((?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|(?:192\\.168|172\\.(?:1[6-9]|2\\d|3[01]))\\.\\d{1,3}\\.\\d{1,3}))${RB}`, "g"), group: 1, hard: false, confidence: 0.8 },
+  { type: INFRA_TYPE.PRIVATE_IP, re: new RegExp(`${LB}((?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|(?:192\\.168|172\\.(?:1[6-9]|2\\d|3[01]))\\.\\d{1,3}\\.\\d{1,3}))${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.8 },
   // Sequential labels, each with its OWN quantifier. The previous form nested a `*`
   // inside a `*` (`(?:[a-z0-9-]*)*`), which backtracks catastrophically: matching a
   // 71-character hex digest against it ran past a 60-second timeout. This is ReDoS, and
   // it also made the rule silently absorb inputs far longer than any hostname.
-  { type: INFRA_TYPE.INTERNAL_HOSTNAME, re: new RegExp(`${LB}((?:[a-z0-9][a-z0-9-]*\\.)+(?:internal|local|svc|svc\\.cluster\\.local|cluster\\.local))${RB}`, "g"), group: 1, hard: false, confidence: 0.8 },
-  { type: INFRA_TYPE.K8S_RESOURCE_NAME, re: new RegExp(`${LB}([a-z0-9][a-z0-9-]*-(?:[0-9a-f]{8,10}|[0-9a-f]{5})-[a-z0-9]{5})${RB}`, "g"), group: 0, hard: false, confidence: 0.7 },
+    { type: INFRA_TYPE.INTERNAL_HOSTNAME, re: new RegExp(`${LB}((?:[a-z0-9][a-z0-9-]*\\.)+(?:internal|local|svc|svc\\.cluster\\.local|cluster\\.local))${RB}`, "g"), group: 1, certainty: INFRA_CERTAINTY.VERIFIED, confidence: 0.8 },
+  { type: INFRA_TYPE.K8S_RESOURCE_NAME, re: new RegExp(`${LB}([a-z0-9][a-z0-9-]*-(?:[0-9a-f]{8,10}|[0-9a-f]{5})-[a-z0-9]{5})${RB}`, "g"), group: 0, certainty: INFRA_CERTAINTY.AMBIGUOUS, confidence: 0.7 },
 ];
 
 const INFRA_RULES = rawInfraRules.map((rule) => ({
@@ -1119,7 +1150,11 @@ export function recogniseInfra(value, context = null) {
   // Hard variants are tried FIRST. Several types have both a soft shape and an anchored,
   // hard variant (a bare 40-hex run versus `commit <40-hex>`), and table order meant the
   // soft rule always won, so the anchor never had a chance to upgrade the finding.
-  const ordered = [...INFRA_RULES].sort((a, b) => Number(Boolean(b.hard)) - Number(Boolean(a.hard)));
+  // VERIFIED variants are tried first: several types have both a soft shape and an
+  // anchored, verified variant, and table order let the soft one win so the anchor never
+  // had a chance to upgrade the finding.
+  const ordered = [...INFRA_RULES].sort((a, b) =>
+    Number(b.certainty === INFRA_CERTAINTY.VERIFIED) - Number(a.certainty === INFRA_CERTAINTY.VERIFIED));
   for (const rule of ordered) {
     if (!hasAnchor(rule, context)) continue;
     rule.re.lastIndex = 0;
@@ -1134,10 +1169,9 @@ export function recogniseInfra(value, context = null) {
       entityClass: ENTITY_CLASS.INFRA,
       infraType: rule.type,
       evidence: ["infra_shape", `infra_rule:${rule.type.toLowerCase()}`]
-        .concat(rule.hard && (rule.anchor || rule.contextBefore) ? ["infra_anchored"] : []),
+        .concat(rule.certainty === INFRA_CERTAINTY.VERIFIED && (rule.anchor || rule.contextBefore) ? ["infra_anchored"] : []),
       confidence: rule.confidence,
-      hard: Boolean(rule.hard),
-      disposition: INFRA_POLICY[rule.type] || INFRA_DISPOSITION.REDACT,
+      certainty: rule.certainty,
     };
   }
   return null;
@@ -1156,25 +1190,29 @@ const HARD_SECRET_DETECTORS = new Set(["gitleaks", "secret", "binding", "http-he
  * This is the ONLY place that turns a classification into an action, which is what keeps
  * the recogniser honest: it cannot preserve anything by itself.
  */
-export function decideSpanAction({ detector, ruleId, infra }) {
+export function decideSpanAction({ detector, ruleId, infra, profile = null }) {
   // ANY deterministic detector match is hard secret evidence. PII detectors belong here
   // too: without them a bank card whose digits happen to look like a 16-hex run was
   // classified SPAN_ID and RELEASED -- a payment card number, preserved, because a shape
   // matched. Fixed-length numeric shapes are exactly where infra and PII collide.
   const hardSecret = Boolean(ruleId) || HARD_SECRET_DETECTORS.has(detector);
   if (hardSecret) {
-    // Monotonic: hard evidence is never downgraded by an infra label.
+    // Monotonic: hard evidence is never downgraded by an infra label, and no profile can
+    // ask for it either.
     return { action: "redact", hardSecret: true, reason: "hard-secret" };
   }
-  if (infra && infra.hard && infra.disposition === INFRA_DISPOSITION.PRESERVE) {
-    // Soft signal suppressed by high-precision infra evidence.
-    return { action: "preserve", hardSecret: false, reason: `infra:${infra.infraType}` };
+  if (!infra) return { action: "redact", hardSecret: false, reason: "default" };
+
+  // The profile is consulted HERE, not inside the recogniser.
+  if (profileDisposition(profile, infra.infraType) !== INFRA_DISPOSITION.PRESERVE) {
+    return { action: "redact", hardSecret: false, reason: `profile-redact:${infra.infraType}` };
   }
-  if (infra && !infra.hard && infra.disposition === INFRA_DISPOSITION.PRESERVE) {
-    // Ambiguous shape: classify it, but the exemption needs stronger grounds.
-    return { action: "redact", hardSecret: false, reason: `infra-uncertain:${infra.infraType}` };
+  if (infra.certainty !== INFRA_CERTAINTY.VERIFIED) {
+    // The profile wants it preserved, but the finding is only a shape guess. An exemption
+    // needs both.
+    return { action: "redact", hardSecret: false, reason: `infra-ambiguous:${infra.infraType}` };
   }
-  return { action: "redact", hardSecret: false, reason: "default" };
+  return { action: "preserve", hardSecret: false, reason: `infra:${infra.infraType}` };
 }
 
 // ------------------------------------------------------------- entity ledger ----
@@ -2360,8 +2398,11 @@ function randomTokenChars(n) {
 export function createRequestId() { return randomTokenChars(TOKEN_REQUEST_ID_WIDTH); }
 
 export class RedactionContext {
-  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS, requestId = null, foreignRegistry = null } = {}) {
+  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS, requestId = null, foreignRegistry = null, profile = null } = {}) {
     this.salt = salt;
+    // Which infra types this deployment is willing to let through. Consulted by the
+    // policy, never by the recogniser.
+    this.profile = profile || DEFAULT_PROFILE;
     // Registered foreign namespaces participate in INPUT ownership too, not only in
     // the restore policy. Without this the registry only governed the return path,
     // while the forward path still re-tokenised a foreign token it should preserve.
@@ -2496,11 +2537,12 @@ export class RedactionContext {
       // Context is what lets an anchored form be recognised: `commit <40-hex>` is a git
       // sha, while a bare 40-hex run is shape-ambiguous and must not be preserved.
       const infra = recogniseInfra(raw, text.slice(Math.max(0, s.start - 64), s.start));
-      const decision = decideSpanAction({ detector, ruleId: s.ruleId, infra });
+      const decision = decideSpanAction({ detector, ruleId: s.ruleId, infra, profile: this.profile });
       this.spanActions.push({
         detector,
         ruleId: s.ruleId ?? null,
         infraType: infra?.infraType ?? null,
+        certainty: infra?.certainty ?? null,
         action: decision.action,
         reason: decision.reason,
         bytes: raw.length,
