@@ -54,7 +54,7 @@ test("ownership is three-way, not token-shaped [GREEN NOW]", async () => {
   const ctx = ctxWithSecret();
   const own = await mintOwnToken(ctx);
   const registry = new ForeignTokenRegistry([ACME]);
-  const unknown = "{{Redact:" + "f".repeat(64) + "}}";
+  const unknown = "CRG_UNKNOWN_0001";
 
   assert.equal(classifyOwnership(own, ctx, registry).ownership, TOKEN_OWNERSHIP.OWN);
   assert.equal(classifyOwnership(FOREIGN, ctx, registry).ownership, TOKEN_OWNERSHIP.FOREIGN_REGISTERED);
@@ -152,7 +152,7 @@ test("a trusted sink is the exception for foreign tokens too [GREEN NOW]", () =>
 test("UNKNOWN is not collapsed into FOREIGN or OWN [GREEN NOW]", async () => {
   const ctx = ctxWithSecret();
   const registry = new ForeignTokenRegistry([ACME]);
-  const unknown = "{{Redact:" + "f".repeat(64) + "}}";
+  const unknown = "CRG_UNKNOWN_0001";
   const d = classifyRestore({ ctx, registry, text: `v ${unknown}`, sink: { kind: "assistant_text" } });
   assert.equal(d.telemetry.event, "restore_miss", "an unclaimed token is a miss, not a pass-through success");
   assert.deepEqual(d.unknownTokens, [unknown]);
@@ -176,9 +176,14 @@ test("registry construction rejects unusable configuration [GREEN NOW]", () => {
 });
 
 test("foreign tokens are not protected-token-like unless they match our dialect [GREEN NOW]", () => {
-  // Documents a known limitation rather than pretending it is handled: an
-  // unregistered foreign token that cannot be detected by any gateway rule is
-  // invisible to the UNKNOWN branch, because that branch requires our dialect.
+  // Documents a real limitation rather than pretending it is handled: a foreign token that
+  // no gateway rule can detect is invisible to the UNKNOWN branch, because that branch
+  // requires OUR dialect.
   assert.equal(isProtectedTokenLike(FOREIGN), false);
-  assert.equal(isProtectedTokenLike("{{Redact:" + "f".repeat(64) + "}}"), true);
+
+  // The dialect is the v2 shape and only the v2 shape. The legacy `{{Redact:…}}` shape used
+  // to answer `true` here, which was the bypass: a forgeable shape that bought an exemption.
+  // It is ordinary text now (test/legacy-token-removal.test.js).
+  assert.equal(isProtectedTokenLike("{{Redact:" + "f".repeat(64) + "}}"), false);
+  assert.equal(isProtectedTokenLike("CRG_UNKNOWN_0001"), true, "the current dialect is still claimed");
 });

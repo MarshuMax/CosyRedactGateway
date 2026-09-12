@@ -34,7 +34,10 @@ import {
   SENSITIVE_SINK_KINDS,
 } from "../worker.js";
 
-const UNKNOWN_TOKEN = "{{Redact:" + "f".repeat(64) + "}}";
+// An unregistered token of the CURRENT dialect: it is token-like, and this request does
+// not own it. The legacy `{{Redact:…}}` shape is gone entirely (see
+// test/legacy-token-removal.test.js).
+const UNKNOWN_TOKEN = "CRG_UNKNOWN_0001";
 
 function newCtx() {
   return new RedactionContext({ salt: "fixture" });

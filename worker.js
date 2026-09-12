@@ -32,31 +32,19 @@ export const TOKEN_ENTITY_ID_WIDTH = 4;
 // request degrades to a 502 with an empty stream).
 export const TOKEN_LENGTH = TOKEN_PREFIX.length + TOKEN_REQUEST_ID_WIDTH + 1 + TOKEN_ENTITY_ID_WIDTH;
 
-// Legacy v1 placeholder, recognised on input only during the transition.
-// Generation must never emit this format again. Removed once every test and
-// main-path consumer has migrated; see test/legacy-token-compat.test.js.
-export const LEGACY_TOKEN_PREFIX = "{{Redact:";
-export const LEGACY_TOKEN_RE = /\{\{Redact:[a-f0-9]{64}\}\}/g;
-export const LEGACY_TOKEN_LENGTH = LEGACY_TOKEN_PREFIX.length + 64 + 2;
-
-// Prefixes that may appear in an already-redacted payload. Protected-span
-// eligibility is NOT "matches a CRG-shaped regex" -- see RedactionContext.
-const PROTECTED_TOKEN_PREFIXES = [TOKEN_PREFIX, LEGACY_TOKEN_PREFIX];
+// Prefixes that may appear in an already-redacted payload. Protected-span eligibility is
+// NOT "matches a CRG-shaped regex" -- see RedactionContext.
 
 // Format-agnostic helpers for callers and tests, so that neither has to hardcode
 // a token shape. REDACTED_TOKEN is global; REDACTED_TOKEN_ONE is not.
-export const REDACTED_TOKEN = /(?<![A-Za-z0-9_])(?:CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}|\{\{Redact:[a-f0-9]{64}\}\})(?![A-Za-z0-9_])/g;
-export const REDACTED_TOKEN_ONE = /(?:(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])|\{\{Redact:[a-f0-9]{64}\}\})/;
+export const REDACTED_TOKEN = /(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])/g;
+export const REDACTED_TOKEN_ONE = /(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])/;
 export function isRedactedText(value) {
   if (typeof value !== "string") return false;
   REDACTED_TOKEN_ONE.lastIndex = 0;
   return REDACTED_TOKEN_ONE.test(value);
 }
 
-// Test/diagnostic helper for the legacy format. Generation never emits it.
-export function legacyRedactToken(hex) {
-  return LEGACY_TOKEN_PREFIX + hex + "}}";
-}
 
 // ---------------------------------------------------------------- sink policy ---
 
@@ -84,7 +72,7 @@ export const SENSITIVE_SINK_KINDS = Object.freeze([
 // point is to recognise our own (and a registered foreign namespace's) token
 // dialect, not to guess at opaque identifiers in general.
 export const PROTECTED_TOKEN_LIKE_RE =
-  /(?<![A-Za-z0-9_])(?:CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}|\{\{Redact:[a-f0-9]{64}\}\})(?![A-Za-z0-9_])/;
+  /(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])/;
 
 export function isProtectedTokenLike(value) {
   return typeof value === "string" && PROTECTED_TOKEN_LIKE_RE.test(value);
@@ -115,7 +103,7 @@ export const TOKEN_OWNERSHIP = Object.freeze({
 // "protected-token-like" for the unknown-token branch of the restore policy.
 function isOwnDialectToken(value) {
   return typeof value === "string"
-    && (PROTECTED_TOKEN_LIKE_RE.test(value) || LEGACY_TOKEN_RE.test(value));
+    && PROTECTED_TOKEN_LIKE_RE.test(value);
 }
 
 // A registered foreign namespace may legitimately use its OWN issuer-specific
@@ -2313,7 +2301,7 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   }
   // Predicate form: eligibility can also be answered per candidate, which is what
   // the request-local mapping actually provides. This matters when a token is
-  // minted *during* the current pass (a legacy token re-minted to v2): a static
+  // minted *during* the current pass: a static
   // registry snapshot would not know about it yet, and the fresh token would be
   // re-detected and nested.
   const isProtectedValue = typeof deps.isProtectedToken === "function" ? deps.isProtectedToken : null;
@@ -2593,13 +2581,9 @@ export class RedactionContext {
     // makes a preserve auditable rather than invisible.
     this.spanActions = [];
     // Eligibility for protected spans: a token is protected only if this request
-    // minted or registered it (including re-minted legacy tokens). Shape alone is
+    // minted or registered it. Shape alone is
     // never sufficient, otherwise a CRG-looking label would smuggle a secret past
     // detection.
-    this.protectedTokenPatterns = [
-      // Legacy: shape-based, because v1 tokens carry no request-local namespace.
-      LEGACY_TOKEN_RE,
-    ];
     // A token is protected iff this layer OWNS it or a registered foreign namespace
     // claims it. Shape alone is never sufficient.
     this.isProtectedToken = (value) => {
@@ -2682,16 +2666,6 @@ export class RedactionContext {
   }
 
   async redactText(text, flags) {
-    // A legacy v1 token arriving in the payload (multi-turn history, or a client
-    // that cached a pre-migration response) is re-minted as a v2 token rather
-    // than forwarded as-is, so the transcript converges on one format.
-    const legacySeen = [...new Set(text.match(LEGACY_TOKEN_RE) || [])];
-    for (const legacy of legacySeen) {
-      const raw = this.tokenToRaw.get(legacy);
-      if (raw === undefined) continue;
-      const replacement = await this.tokenFor(raw);
-      if (replacement !== legacy) text = text.split(legacy).join(replacement);
-    }
     const coverage = new ParserCoverage();
     const spans = findSensitiveSpans(
       text,
@@ -2813,7 +2787,7 @@ export class RedactionContext {
     }
     return out
       .replace(TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token)
-      .replace(LEGACY_TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token);
+
   }
 }
 
@@ -2947,12 +2921,11 @@ function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.t
 
 // Returns the length of a trailing fragment that could still become a protected
 // token, so the stream layer holds it back instead of emitting it. Handles both
-// the v2 prefix and the legacy prefix, since the latter is still recognised on
-// input during the transition.
+// the v2 prefix.
 /**
  * The holdback contracts a stream obeys, from the AUTHORITIES that can vouch for them:
  *
- *   - this layer's own dialect (CRG / legacy) -- exact literals of known length;
+ *   - this layer's own dialect (CRG) -- one exact literal of known length;
  *   - the surrogate LEDGER -- exact literals; a string that merely *looks* base64 is not
  *     held back, because "looks like" is not ownership;
  *   - the foreign REGISTRY -- exact registrations (literals) and namespace `streamPrefix`
@@ -2966,10 +2939,7 @@ function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.t
  *              set and the declared maximum length has not been reached.
  */
 export function streamHoldbackPrefixes(ctx, registry = null, sinks = null) {
-  const entries = [
-    { kind: "literal", value: TOKEN_PREFIX },
-    { kind: "literal", value: LEGACY_TOKEN_PREFIX },
-  ];
+  const entries = [{ kind: "literal", value: TOKEN_PREFIX }];
   if (ctx && ctx.ledger) {
     // Exact visible surrogates: ledger-driven, never shape-driven. Whether a surrogate is
     // usable in this channel does not change whether it must be held back -- a split token
@@ -3052,7 +3022,7 @@ export function partialPrefixLength(text, holdbacks) {
 /**
  * The prefixes a stream must hold back, from the AUTHORITIES that can vouch for them:
  *
- *   - this layer's own dialect (CRG / legacy), always;
+ *   - this layer's own dialect (CRG), always;
  *   - the surrogate LEDGER, which is the only source of surrogate eligibility -- a string
  *     that merely *looks* base64 is not held back, because "looks like" is not ownership;
  *   - the foreign REGISTRY, via exact registrations and the explicit `streamPrefix` of a
@@ -3080,21 +3050,19 @@ function endsWithCompleteRegistration(text, registry) {
 }
 
 function possibleTokenSuffixLength(s) {
-  for (const prefix of PROTECTED_TOKEN_PREFIXES) {
-    const isLegacy = prefix === LEGACY_TOKEN_PREFIX;
-    const full = isLegacy ? LEGACY_TOKEN_LENGTH : TOKEN_LENGTH;
-    const body = isLegacy ? /^[a-f0-9]{0,64}}?$/ : /^[A-Z0-9_]{0,11}$/;
-    const start = s.lastIndexOf(prefix);
-    if (start >= 0) {
-      const tail = s.slice(start);
-      if (tail.length < full) {
-        const rest = tail.slice(prefix.length);
-        if (tail.length <= prefix.length || body.test(rest)) return s.length - start;
-      }
+  // One dialect, one shape: `CRG_` plus the two identifier segments. A tail that could still
+  // grow into one is held back.
+  const prefix = TOKEN_PREFIX;
+  const start = s.lastIndexOf(prefix);
+  if (start >= 0) {
+    const tail = s.slice(start);
+    const body = /^[A-Z0-9_]{0,11}$/;
+    if (tail.length < TOKEN_LENGTH && (tail.length <= prefix.length || body.test(tail.slice(prefix.length)))) {
+      return s.length - start;
     }
-    const max = Math.min(prefix.length - 1, s.length);
-    for (let k = max; k > 0; k--) if (s.endsWith(prefix.slice(0, k))) return k;
   }
+  const max = Math.min(prefix.length - 1, s.length);
+  for (let k = max; k > 0; k--) if (s.endsWith(prefix.slice(0, k))) return k;
   return 0;
 }
 
@@ -3278,7 +3246,7 @@ class SseRestorer {
    * Whether the channel tail could still grow into a protected string.
    *
    * Three cases, in increasing subtlety:
-   *   1. the dialect shapes (CRG / legacy) may yet complete;
+   *   1. the dialect shape (CRG) may yet complete;
    *   2. the tail is a PARTIAL prefix of a holdback string (`v Q1JH`);
    *   3. the tail ENDS WITH a complete declared prefix or exact token (`v ACME_`).
    *

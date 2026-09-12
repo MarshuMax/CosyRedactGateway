@@ -1246,6 +1246,46 @@ devops profile:
 
 F4.2 那条 limitation 测试（"前缀在 span 外需要逐类型变体"）已改写为 G2 契约：实例 ID 现在被整体解析。
 
+## 9.22 G3 Legacy dialect 完整移除（已实现）
+
+**半兼容状态本身就是弱点。** 之前 legacy `{{Redact:<64hex>}}` 是"输入时豁免的形状"——而该形状**可任意伪造**，等于任何人写一层壳就能让检测跳过其中的值。这与前面修掉的 `CRG_AAAA_AAAA` 形状绕过是同一个错误。
+
+### 已删除（生产代码中不再存在）
+
+```
+LEGACY_TOKEN_PREFIX / LEGACY_TOKEN_RE / LEGACY_TOKEN_LENGTH
+legacyRedactToken()
+protectedTokenPatterns 的 legacy 条目
+legacy re-mint 通道
+legacy restore 分支
+legacy stream holdback
+REDACTED_TOKEN / REDACTED_TOKEN_ONE / PROTECTED_TOKEN_LIKE_RE 的 legacy 分支
+```
+
+`own dialect = CRG v2 only`，`shape ≠ ownership`。
+
+### 验收
+
+```
+worker.js 中 '{{Redact:'      0 处
+worker.js 中 'LEGACY_TOKEN'   0 处
+worker.js 中 'legacyRedactToken' 0 处
+```
+
+关键回归：`DB_PASSWORD={{Redact:<64hex>}}` 现在**只是普通输入**，是否脱敏完全由正常 detector / structured context 决定（实测：被 `binding` 检出并脱敏，无豁免）。`isRedactedText("{{Redact:...}}")` → `false`；SSE `{{Reda` / `{{Redact:` → 不 holdback。
+
+### 测试改造
+
+`legacy-token-compat.test.js` → `legacy-token-removal.test.js`，只证明两件事：**generation 只有 v2**、**legacy-looking payload 没有特殊权限**（含不在导出中、`isRedactedText` false、不 holdback、operand 通道不因它 block）。删除全部"legacy restore / dual dialect restore / re-mint"兼容测试。
+
+其他文件中把 `{{Redact:...}}` 当"未知 token 形状"用的夹具，改为未登记的 v2 形状 `CRG_UNKNOWN_0001`——它们测的是"本层不拥有的 token"，与方言无关。
+
+`nested-dlp` 里那条 **KNOWN TRANSITIONAL GAP** 测试改为"该 gap 已关闭"。
+
+### 附带发现（记入 Release Hardening）
+
+对 `DB_PASSWORD={{Redact:<64hex>}}` 这种输入，entropy/binding 的 span 是 `[21,87)`——**把结尾的 `}}` 也包含进去了**，因此输出为 `DB_PASSWORD={{Redact:CRG_...`。安全上没有问题（原值已删除、无豁免），但交付文本不整洁，且说明 detector 边界会跨过 `}}` 这类标点。这不是 legacy 方言的性质（方言已删），而是 detector 的一般边界行为，留待 hardening 处理。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

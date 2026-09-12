@@ -71,21 +71,17 @@ test("an UNREGISTERED token-shaped literal is redacted, not exempted [GREEN NOW]
   }
 });
 
-test("KNOWN TRANSITIONAL GAP: the legacy v1 shape is still exempt on input [GREEN NOW]", async () => {
-  // Recorded as a fact, NOT as desired behaviour. During the dual-format transition
-  // `protectedTokenPatterns` still contains the legacy shape, because a v1 token
-  // carries no request-local namespace and therefore cannot be checked against the
-  // mapping. The consequence is the same bypass shape that was just fixed for v2:
-  // anyone can write `{{Redact:<64 hex>}}` and have that value skipped.
-  //
-  // Removal condition already noted in DESIGN-v2 9.1: when the legacy restore branch
-  // is deleted, this exemption goes with it. Until then the gap is documented here so
-  // it cannot be forgotten.
+test("the legacy v1 shape is no longer exempt on input [GREEN NOW]", async () => {
+  // This test used to record a KNOWN GAP: the legacy `{{Redact:<64 hex>}}` shape was still
+  // exempt, which was the same bypass this file closed for v2 -- the shape is trivially
+  // forgeable, so anyone could wrap a value in it and have detection skip it. The dialect has
+  // been removed from the production code, so the gap is closed rather than documented.
   const ctx = newCtx();
   const forgedLegacy = "{{Redact:" + "a".repeat(64) + "}}";
   const inbound = `DB_PASSWORD=${forgedLegacy}`;
-  assert.equal(await ctx.redactText(inbound, ALL), inbound, "still exempt today");
-  assert.equal(ctx.tokenToRaw.has(forgedLegacy), false, "and the request does not own it");
+  const out = await ctx.redactText(inbound, ALL);
+  assert.notEqual(out, inbound, "it is ordinary input now, so the binding redacts it");
+  assert.equal(out.includes(forgedLegacy), false, "and the forged shape does not survive");
 });
 
 test("an OWNED token is preserved on the input path [GREEN NOW]", async () => {

@@ -32,7 +32,8 @@ import assert from "node:assert/strict";
 import { handleRequest } from "../worker.js";
 
 const SECRET = "Pr0d-P@ssw0rd-Xy9Zk2mQ";
-const UNKNOWN_TOKEN = "{{Redact:" + "f".repeat(64) + "}}";
+// An unregistered token of the current dialect: nothing minted it, so it cannot be resolved.
+const UNKNOWN_TOKEN = "CRG_UNKNOWN_0001";
 
 function gatewayUrl(path, flags) {
   return `https://proxy.example/${flags}$https://api.example${path}`;
