@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import {
   RedactionContext,
   ForeignTokenRegistry,
+  classifyOwnership,
   DEFAULT_PROFILE,
   DEVOPS_PROFILE,
   TOKEN_PREFIX,
@@ -135,67 +136,95 @@ test("R1: redact then restore is byte-identical for every generated document [GR
   }
 });
 
-test("R1: a REDACTED plain document is idempotent [GREEN NOW]", async () => {
-  // Scope: documents with no representation-constrained field. The property applies once
-  // something has actually been redacted -- a document that passes through untouched is not
-  // eligible, because the generator deliberately injects token-shaped LITERALS and such a
-  // literal is ordinary text on the first pass and legitimately claimed on the second.
+test("R1: a REDACTED document is idempotent within the same context [GREEN NOW]", async () => {
+  // Idempotence is asserted on ONE context, because ownership is request-local: a fresh context
+  // mints a different request-id, so the same plaintext legitimately yields a different token
+  // and cross-context byte equality was never the property. An earlier revision normalised
+  // tokens before comparing, which measured "no new redaction" rather than idempotence.
   //
-  // Surrogate fields are EXCLUDED and covered by the finding below, which is a real
-  // reproducibility gap rather than a confidentiality one.
-  const blank = (t) => t.replace(/CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}/g, "<TOKEN>");
-  const cases = generate({ seed: DEFAULT_SEED + 2, count: CASES, gen: (rng) => genWorkload(rng) })
-    .filter(({ text }) => !text.includes("kind: Secret"));
-  assert.ok(cases.length > 100, `fixture must keep most cases: ${cases.length}`);
+  // Surrogate documents are included: with representation-aware ownership in the protection
+  // layer, a surrogate this request minted is recognised on the way back in and is NOT wrapped
+  // again. That is the R1.1 fix, and this property is what keeps it fixed.
+  const cases = generate({ seed: DEFAULT_SEED + 2, count: CASES, gen: (rng) => genWorkload(rng) });
   let exercised = 0;
+  let surrogateCases = 0;
   for (let i = 0; i < cases.length; i++) {
     const { text, flags } = cases[i];
-    const first = (await redact(text, flags)).out;
-    if (blank(first) === blank(text)) continue; // nothing was redacted: not eligible
-    const second = (await redact(first, flags)).out;
-    at(i, text, () => assert.equal(blank(second), blank(first), "a second pass changed an already-redacted document"));
+    const ctx = new RedactionContext({ salt: "property" });
+    const first = await ctx.redactText(text, flags);
+    // Eligible only if the pass actually redacted something: an untouched document is not
+    // idempotent-eligible, because the generator injects token-shaped LITERALS that are ordinary
+    // text on the first pass and legitimately claimed on the second.
+    if (first === text) continue;
+    const second = await ctx.redactText(first, flags);
+    at(i, text, () => assert.equal(second, first, "a second pass on the SAME context changed the document"));
+    if (text.includes("kind: Secret")) surrogateCases++;
     exercised++;
   }
   assert.ok(exercised > 50, `the property must actually be exercised: only ${exercised}`);
+  assert.ok(surrogateCases > 0, "the generator must produce representation-constrained documents");
 });
 
-test("R1 FINDING: a base64 surrogate is re-wrapped on a second pass [GREEN NOW]", async () => {
-  // Recorded because it is real, reproducible, and NOT what the design intended.
+test("R1.1: cross-context re-wrapping is the CONTRACT, not a defect [GREEN NOW]", async () => {
+  // Corrected attribution. An earlier version of this test presented cross-request re-wrapping
+  // as a finding. It is not: ownership is request-local, a fresh request mints a new request-id,
+  // and making a surrogate from a previous request resolve would break cross-request
+  // unlinkability. What WAS a defect is the same-context case, which is asserted separately
+  // below.
   //
-  // A surrogate's visible form is base64(CRG_<request>_<entity>): `Q1JHXzhIRFYzVl8wMDAx` decodes
-  // to `CRG_8HDV3V_0001`. Redacting the OUTPUT of a previous pass therefore sees a base64 blob
-  // whose plaintext is a portable token, and wraps it again. The visible value changes across
-  // passes for the same input:
-  //
-  //   pass 1 -> Q1JHXzhIRFYzVl8wMDAx
-  //   pass 2 -> Q1JHX1BISlg1U18wMDAx
-  //
-  // Severity, measured rather than assumed:
-  //   - no plaintext appears in either output;
-  //   - both round trips are correct (pass 2 restores to pass 1's output);
-  //   - so this is NOT a confidentiality fail-open.
-  // What it IS: output is not stable for a representation-constrained field, and the visible
-  // surrogate discloses a portable token to anyone who base64-decodes it -- which is a property
-  // of the surrogate scheme itself, surfaced here rather than in an adversarial pass.
+  // The other half of the correction: the plain-token idempotence property normalises tokens
+  // before comparing, while this one compared raw base64, so the two properties were held to
+  // different standards. They are now consistent -- both assert byte equality, on ONE context.
   const doc = ["apiVersion: v1", "kind: Secret", "metadata:", "  name: app", "data:", "  password: cGFzc3dvcmQxMjM0NTY3OA=="].join("\n");
   const flags = { gitleaks: true, highEntropy: true, email: true };
+  const visibleOf = (t) => (t.match(/password: (\S+)/) || [])[1];
 
   const ctx1 = new RedactionContext({ salt: "property" });
   const first = await ctx1.redactText(doc, flags);
+
   const ctx2 = new RedactionContext({ salt: "property" });
   const second = await ctx2.redactText(first, flags);
 
-  const visibleOf = (t) => (t.match(/password: (\S+)/) || [])[1];
-  assert.ok(visibleOf(first), "pass 1 must produce a surrogate");
-  assert.notEqual(visibleOf(second), visibleOf(first), "the visible surrogate changes on a second pass");
-  assert.equal(
-    Buffer.from(visibleOf(first), "base64").toString().startsWith("CRG_"), true,
-    "because the surrogate's plaintext is a portable token"
-  );
+  assert.notEqual(visibleOf(second), visibleOf(first), "a NEW context must not inherit the mapping");
   assert.equal(first.includes("cGFzc3dvcmQxMjM0NTY3OA=="), false, "no plaintext in pass 1");
   assert.equal(second.includes("cGFzc3dvcmQxMjM0NTY3OA=="), false, "no plaintext in pass 2");
   assert.equal(ctx1.restoreText(first), doc, "pass 1 round trip is exact");
   assert.equal(ctx2.restoreText(second), first, "pass 2 round trip returns pass 1's output");
+});
+
+test("R1.1: a surrogate from THIS context is recognised as protected and is not re-wrapped [GREEN NOW]", async () => {
+  // The defect: `classifyOwnership` resolved a surrogate through the ledger, but
+  // `ctx.isProtectedToken` did not, so representation-aware ownership held in the
+  // restore/policy layer and not in the input-protection layer.
+  const doc = ["apiVersion: v1", "kind: Secret", "metadata:", "  name: app", "data:", "  password: cGFzc3dvcmQxMjM0NTY3OA=="].join("\n");
+  const flags = { gitleaks: true, highEntropy: true, email: true };
+  const ctx = new RedactionContext({ salt: "property" });
+  const first = await ctx.redactText(doc, flags);
+  const surrogate = (first.match(/password: (\S+)/) || [])[1];
+  assert.ok(surrogate, "the fixture must mint a surrogate");
+
+  assert.equal(ctx.isProtectedToken(surrogate), true, "the protection layer must resolve it through the ledger");
+  assert.equal(classifyOwnership(surrogate, ctx).ownership, "OWN", "and the ownership layer agrees");
+
+  const again = await ctx.redactText(first, flags);
+  assert.equal(again, first, "re-redacting in the same context must be byte-identical");
+});
+
+test("R1.1: a FORGED base64 of a token does not acquire ownership [GREEN NOW]", async () => {
+  // The reason the fix is safe: `resolveSurrogate` consults the ledger's exact mapping only, so
+  // admitting surrogates into the protection layer is not a shape-based bypass. Anyone can
+  // base64-encode a token-shaped string; only a string this request actually minted is in the
+  // ledger.
+  const forged = Buffer.from("CRG_AAAA_AAAA").toString("base64");
+  const ctx = new RedactionContext({ salt: "property" });
+  assert.equal(ctx.isProtectedToken(forged), false, "a forged blob is not protected");
+  assert.equal(classifyOwnership(forged, ctx).ownership, "UNKNOWN", "and is UNKNOWN");
+
+  // And a strong binding still redacts it, which is the observable consequence.
+  const line = `DB_PASSWORD=${forged}`;
+  const out = await ctx.redactText(line, { gitleaks: true, highEntropy: true });
+  assert.notEqual(out, line, "it must be redacted like any other value");
+  assert.equal(out.includes(forged), false);
 });
 
 // ------------------------------------------------- 3. shape is not ownership ------------

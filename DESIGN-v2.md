@@ -1628,24 +1628,59 @@ R2 = adversarial / random exploration（探索本身是目的）
 4. `${` 与 `{{` 在 `${{` 中**重叠**，朴素 `split("${")` 计数会误报不平衡。
 5. token 语法是 `[A-Z0-9]{4,}`（两段都是），`{6}`/`{4}` 只是**当前分配器**的宽度，不是语法。
 
-### R1 FINDING：base64 surrogate 在第二轮被重新包装
+### R1.1 更正：surrogate 重新包装的归因
 
-surrogate 的可见形态是 **base64(CRG token)**——`Q1JHXzhIRFYzVl8wMDAx` 解码为 `CRG_8HDV3V_0001`。因此对上一轮**输出**再脱敏时，它看到一个 base64 块、其明文是便携 token，于是再包一层：
+R1 初稿把"base64 surrogate 在第二轮被重新包装"记为 FINDING，**归因写错了**，而且两条 property 的**标准不一致**：
 
 ```
-pass 1 → Q1JHXzhIRFYzVl8wMDAx
-pass 2 → Q1JHX1BISlg1U18wMDAx
+plain-token 幂等测试：先 normalize 掉不同 request 的 token 再比较
+surrogate 测试：      直接比较 raw base64
 ```
 
-**严重性（实测而非假设）**：
+### 跨 request 重新包装是**契约**，不是缺陷
 
-- 两次输出**都不含明文**；
-- 两次往返都正确（pass 2 的 restore 回到 pass 1 输出）；
-- ⇒ **不是 confidentiality fail-open**。
+```
+ownership request-local
+shape != ownership
+cross-request token unlinkable
+```
 
-它**是**：representation-constrained 字段的输出**不稳定**；且可见 surrogate 对任何做 base64 解码的人**暴露一个便携 token**——后者是 surrogate 方案本身的性质，在此被显式记录而非留到对抗性阶段才发现。
+新 context 铸新 request-id，若让上一 request 的 surrogate 解析成功，就**破坏了跨请求不可关联性**。这一条现在是显式契约测试（`cross-context re-wrapping is the CONTRACT`）。
 
-已写成测试（断言两侧往返、无明文、形态确实改变），并在幂等性质中**排除** surrogate 文档、注明原因。
+### 真正的缺陷：same-context 的 representation-aware ownership 未收口
+
+```
+ctx1 → surrogate(request1 token)
+ctx1.redactText(output again) → 又包一层   ← 缺陷
+```
+
+根因是两层不一致：
+
+```js
+classifyOwnership(surrogate, ctx)  → 经 ledger resolveSurrogate()  → OWN    ✅
+ctx.isProtectedToken(surrogate)    → 只查 tokenToRaw.has(value)    → false  ❌
+```
+
+即 **representation-aware ownership 在 restore/policy 层成立，在 input protection 层没收回**。
+
+修正：`isProtectedToken` 先做 `resolveSurrogate(value, this)`，与 `classifyOwnership` 对齐，且后续 foreign 判定也基于解析后的 token。
+
+**安全性**：`resolveSurrogate` 只查 ledger 的**精确映射**，所以这不是"按 base64 形状自动认 surrogate"——那会重新制造 shape-based bypass。任何人可以 base64 编码一个 token 形状的串，但只有本 request 真正铸过的才在 ledger 里。
+
+### 幂等性质改为在同一 context 内断言
+
+现在 plain-token 与 surrogate 两条 property **用同一标准**：同一个 context、逐字节相等。此前 normalize 后比较，测的其实是"没有新的脱敏"而不是幂等。surrogate 文档已**纳入**该性质而非排除。
+
+### 最低回归（全部实测）
+
+| 场景 | 结果 |
+|---|---|
+| same context：明文 K8s `Secret.data` → surrogate S → 再脱敏输出 | **exact same S** |
+| `classifyOwnership(S, ctx)` | `OWN` |
+| `ctx.isProtectedToken(S)` | `true` |
+| 任意 `base64(CRG_AAAA_AAAA)` 但不在 ledger | `UNKNOWN`，强绑定下仍正常脱敏 |
+| new context：ctx1 的 surrogate 输入 ctx2 | **不继承** ownership，可重新脱敏 |
+| 跨 request 两个往返 | 都正确（pass 2 回到 pass 1 输出） |
 
 ## 10. 未解决问题 / 待验证
 

@@ -2751,14 +2751,24 @@ export class RedactionContext {
     // A token is protected iff this layer OWNS it or a registered foreign namespace
     // claims it. Shape alone is never sufficient.
     this.isProtectedToken = (value) => {
-      if (this.tokenToRaw.has(value)) return true;
+      // Resolve a SURROGATE to the token it stands for FIRST, the same way classifyOwnership
+      // does. Without this, representation-aware ownership held in the restore/policy layer
+      // (which calls classifyOwnership) but not in the input-protection layer, so a surrogate
+      // this request had minted was not recognised as protected on the way back in and was
+      // wrapped a second time.
+      //
+      // `resolveSurrogate` consults the ledger's EXACT mapping only, so this is not a
+      // shape-based admission: an arbitrary base64 blob that happens to decode to something
+      // CRG-shaped is not in the ledger and stays UNKNOWN.
+      const token = resolveSurrogate(value, this);
+      if (this.tokenToRaw.has(token)) return true;
       if (!this.foreignRegistry) return false;
       // An EXACT registration IS the trust decision, so the shape check does not
       // apply to it (same rule as classifyOwnership). Prefix namespaces do require a
       // token-shaped match, so an over-broad matcher cannot declare arbitrary text
       // foreign.
-      if (this.foreignRegistry.tokens.has(value)) return true;
-      return this.foreignRegistry.namespaceOf(value) !== null && isRegisteredTokenLike(value);
+      if (this.foreignRegistry.tokens.has(token)) return true;
+      return this.foreignRegistry.namespaceOf(token) !== null && isRegisteredTokenLike(token);
     };
   }
   nextTokenId() {
