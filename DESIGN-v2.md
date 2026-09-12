@@ -2013,6 +2013,61 @@ YAML 规范要求 `#` 前必须有**空白**才起注释。所以紧跟在凭据
 
 > 这是本 session **第 5 次**"我把未验证的推断当成结论"。前四次：AWS `[A-Z2-7]`、`op://` 的 INTERNAL_HOSTNAME 归因、R0.2 的"无漂移"结论、P7 的 DEFAULT profile 期望。规律一致：**推断一旦写进测试或文档就会变成后续推理的前提**。这次的正确做法是**先用 PyYAML 取基准再判定**。
 
+## 9.32 R2.4 Span / Envelope / Merge Collision（已实现，**无新 finding**）
+
+### 第一优先级：envelope convergence（定向，非随机 overlap）
+
+危险不是"两个 span 重叠"，而是**两个原本互不重叠的 detector span 在 reference widening 后变成完全相同的 span**：
+
+```
+DB_PASSWORD=${{ <32 hex> <email> }}
+                   ^soft     ^hard
+```
+
+widening 后两者都成为同一个 envelope，而 merge 只保留其中一个。**若 soft span 胜出且其自身判定为 preserve-eligible，其中的 hard 秘密就可能一起存活——一个纯粹由"增加一个 detector"导致的明文泄漏。**
+
+### 差分 oracle（本刀的关键）
+
+不是绝对断言，而是：
+
+```
+hard-only redacts X  ⟹  hard+soft 也必须 redacts X
+```
+
+**增加 detector 绝不能削弱保护。** 其余关于 merge 的一切（谁胜出、边界在哪）都允许反直觉。
+
+### 实测
+
+```
+差分检查：2 profile × 3 hard × 3 soft × 2 顺序 × 7 wrapper = 252 组
+          + seeded 300 组
+违约：0
+```
+
+**结论：`hard-only 脱敏 ⇒ hard+soft 也脱敏` 全部成立。soft span 永远不会把 hard span 挤掉。**
+
+### 定向覆盖
+
+- **fixture sanity 先行**：先证明 hard-only 确实脱敏、且 widening 后**每个 span 都等于 envelope 边界**（这才是 convergence 的证明），再做差分断言
+- 胜出 span 的判定生效：含 hard 内容的 span 决策记录必须为 `redact`，绝不 `preserve`
+- **碰撞几何**：同明文两次、相邻秘密、重叠 envelope、嵌套 envelope、两个相同 envelope、秘密在 envelope 边缘、秘密跨闭合符、同 bounds 重复命中、hard 在 soft 形状字段内、soft 在 hard 字段内
+- **attribution 不被 soft 覆盖**：`reason` 必须是 `hard-secret`、`detector` 必须是 `gitleaks`
+
+### 本轮修正的两处**我的断言**错误
+
+1. **断言了不存在的字段**：`policySummary()` 的行暴露 `reason`，**没有** `hardSecret` 布尔。改为断言 `reason: "hard-secret"` / `action: "redact"` / `detector: "gitleaks"`。行为一直是对的。
+2. **前后矛盾的残留断言**：同一测试里先断言裸 40-hex 是 `AMBIGUOUS`，后面又断言它是 `VERIFIED`。改为分别断言裸形态 AMBIGUOUS、`commit ` 锚定形态 VERIFIED。
+
+### 一个值得记的设计结论
+
+**merge 产生"哪个 span 胜出"的差异不构成缺陷**——例如同样内容，hard-first 时 entropy span 覆盖 email（判定 redact，因为 `classifiedText` 是 32-hex 且 AMBIGUOUS 仍 redact），而 email-first 时 email span 胜出（hard）。
+
+两者都**安全**，因为：
+1. `decideSpanAction` 跑在胜出 span 的 `classifiedText` 上；
+2. AMBIGUOUS infra **在任何 profile 下都 redact**（P7 已固定）。
+
+**差分 oracle 正是为这种情形设计的正确工具**：它不关心内部哪个 span 胜出，只问"增加 detector 后 hard 内容是否仍被移除"。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
