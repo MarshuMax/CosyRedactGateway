@@ -1834,6 +1834,57 @@ non-global matcher → spans=[]          → kept      ✅
 2. **capture group matcher 按 full match 求值**（`.test()` 忽略分组）。正确，记录以免读者误以为用 group。
 3. **exact registration 完全绕过 matcher**，因此免疫该状态问题——这条界定了影响范围。
 
+## 9.29.2 R2-REG-001 已修复（fixed）
+
+**判定**：confidentiality 未发现 fail-open；**ownership consistency violated**；**deployment correctness violated**；severity = **Medium / release-blocking correctness**。不接受为 known limitation——namespace registration 是显式 trust/config contract，同一 token 连续调用不能因历史调用顺序在 `FOREIGN_REGISTERED` / `UNKNOWN` 之间摆动。
+
+### 修复（两层，按建议实施）
+
+**1. registry 自己持有 RegExp clone**
+
+```js
+if (pattern instanceof RegExp) return new RegExp(pattern.source, pattern.flags);
+```
+
+外部修改 `pattern.lastIndex` 不影响 registry，registry 也不污染调用方 regex。
+
+**2. 唯一 helper，membership 每次从 0 开始并恢复干净状态**
+
+```js
+function namespaceMatches(matcher, value) {
+  matcher.lastIndex = 0;
+  try { return matcher.test(value); } finally { matcher.lastIndex = 0; }
+}
+```
+
+**没有采用"保存旧 lastIndex → 最后恢复旧值"**：registry 内部 matcher 本就不该携带可观察 cursor state，调用结束后固定回 0 才是诚实状态。
+
+`namespaceOf` 与 `classifyOwnership` 都改用该 helper；另外三处用 `String.match` **枚举** foreign token 的站点改用 `namespaceFindAll`（`String.match` 对 g/y 同样读写 `lastIndex`，四处原本各自手写 `lastIndex = 0` 且无 finally）。修复后 `worker.js` 中不存在裸的 `ns.matcher.test` / `text.match(ns.matcher)`。
+
+**不剥 `g`/`y`**：匹配器的语言保持原样，只是不再有 cursor state。
+
+### 回归（15 条，全部固定契约而非旧缺陷）
+
+`same token × 100 calls 恒定`、`classifyOwnership × isProtectedToken 永远一致`、`去程保留 + 不产生 span`、**顺序不变量**（`A,B,A,B,A` 与 `A,A,A,B,B` 对每个 token 结果一致）、**caller regex 双向隔离**（构造与匹配都不读写调用方 `lastIndex`，且调用方仍能用自己的 regex 迭代）、`共享 registry 跨请求稳定`、`exact registration 不受影响`、`所有 matcher 形态（plain/g/y/gi/gy）稳定`、`string pattern 不变`。
+
+`y` 保留 sticky 语义（只匹配 offset 0），这是调用方声明的含义——已用测试固定。
+
+## 9.29.3 R2-REG-002（open，**不在本次修复范围**）
+
+修 R2-REG-001 过程中发现**独立缺陷**：sticky matcher **无法在文档中间找到 token**。
+
+```
+namespaceOf("ACME_ABCDEF_0001")            = acme   （offset 0 命中）
+namespaceOf("curl x?y=ACME_ABCDEF_0001")   = null   （有前缀即找不到）
+→ untrusted tool operand 被交付而不是 BLOCK
+```
+
+**已用 `git stash` 验证修复前后行为完全一致** ⇒ 既有缺陷，与 R2-REG-001 **无关**。按 R2 规则**不扩大当前 finding 范围**（避免"17 个现象、1 个 root cause"的错误归因），作为独立条目 `R2-REG-002` 记入 corpus，status `open`。
+
+**影响**：prose 与 operand 两个通道对同一 registration 给出不同结论；**无明文暴露**（失败方向是"交出一个本层无法解析的 token"）；仅在 sticky matcher 下可达。Severity Low。
+
+**候选修法（未实施）**：拆分两个操作——ownership 谓词保持锚定（`namespaceMatches` 从 0 开始，保留 sticky/大小写声明的含义），而**文档扫描改为非锚定**（`namespaceFindAll` 剥掉 `g`/`y` 扫描全部出现）。ownership 仍由同一谓词决定，因此**不扩大准入**。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

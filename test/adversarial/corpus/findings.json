@@ -17,9 +17,26 @@
       "expected_invariant": "The same registration must yield the same ownership verdict on every call, and classifyOwnership / ctx.isProtectedToken / the forward path must agree with each other. Registry contract: a registered foreign token is PRESERVED on the input path.",
       "observed": "namespaceOf alternates acme/null/acme/null because RegExp.prototype.test on a g or y matcher advances lastIndex; classifyOwnership resets lastIndex before matching while isProtectedToken does not, so the two layers fight over one matcher object. Consequence: DB_PASSWORD=ACME_ABCDEF_0001 is redacted to DB_PASSWORD=CRG_... instead of being preserved, and the verdict depends on call order.",
       "impact": "ownership/policy inconsistency + deployment correctness. A shared registry built once at startup gives different results than one built per request. No confidentiality leak: the failure direction is over-redaction. An EXACT registration is unaffected.",
-      "status": "open",
+      "status": "fixed",
       "reproduce": "node --test test/adversarial/registry.test.js (tests R2-REG-001)",
-      "control": "an equivalent non-stateful matcher (/ACME_[A-Z0-9_]+/) preserves the token correctly, which locates the defect in how the matcher is used rather than in the registry's purpose"
+      "control": "an equivalent non-stateful matcher (/ACME_[A-Z0-9_]+/) preserves the token correctly, which locates the defect in how the matcher is used rather than in the registry's purpose",
+      "root_cause": "normalizeForeignNamespace kept the caller's RegExp object unchanged and namespaceOf called .test() directly. On a g or y matcher .test() advances lastIndex, so the same token alternated between FOREIGN_REGISTERED and UNKNOWN; classifyOwnership reset lastIndex before matching while isProtectedToken did not, so the two layers fought over one shared matcher object and the verdict depended on call order.",
+      "fix": "Two layers. (1) normalizeForeignNamespace clones: new RegExp(pattern.source, pattern.flags), so neither side can observe the other's cursor. (2) A single namespaceMatches(matcher, value) helper resets lastIndex to 0 before the call and fixes it back to 0 in a finally block; namespaceFindAll does the same for the three String.match enumeration sites. Deliberately not 'save and restore the old value': a registry-internal matcher should not carry observable cursor state at all, so 0 is the honest end state.",
+      "regression": "test/adversarial/registry.test.js -- 100-call stability, cross-layer agreement, forward-path preservation, call-order independence (A,B,A,B,A vs A,A,A,B,B), caller-regex isolation in both directions, reusable-registry stability, exact-registration immunity, and every matcher shape."
+    },
+    {
+      "id": "R2-REG-002",
+      "seed": "0x2e610001",
+      "input": "registry with { name: \"acme\", pattern: /ACME_[A-Z0-9_]+/y }; applySinkPolicy(\"curl x?y=ACME_ABCDEF_0001\", ctx, { kind: \"tool_argument\" })",
+      "config": "foreign registry whose namespace matcher carries the sticky flag y",
+      "expected_invariant": "Ownership recognition must not depend on WHERE in a document a token appears. A registered foreign token that is protected in prose must also be protected as an operand, or the two channels disagree for one registration.",
+      "observed": "A sticky matcher only matches at lastIndex 0. namespaceOf calls .test() with the cursor at 0, and namespaceFindAll uses String.match which with y is anchored at lastIndex as well, so the registry cannot FIND a token that has anything before it. Result for one registration: namespaceOf(\"ACME_ABCDEF_0001\") = acme and isProtectedToken = true, while inside \"curl x?y=ACME_ABCDEF_0001\" namespaceOf = null and an untrusted tool operand is DELIVERED instead of refused.",
+      "impact": "ownership/policy inconsistency between the prose channel and the operand channel for sticky registrations. No plaintext is exposed: the failure direction is that this layer hands over a token it cannot resolve, which the outer DLP owns. Severity Low, and only reachable with a sticky matcher, which the design does not recommend but does accept.",
+      "status": "open",
+      "reproduce": "node --test test/adversarial/registry.test.js (test 'R2-REG OBSERVATION: a STICKY matcher cannot find a token mid-document')",
+      "control": "the equivalent /g matcher refuses the operand, which is the expected behaviour",
+      "relationship": "INDEPENDENT of R2-REG-001. Verified by stashing the stateful-matcher fix and re-running: the behaviour above is identical before and after, so it is pre-existing and was neither caused nor cured by that fix. Deliberately NOT folded into R2-REG-001, per the rule that several red points are usually not one root cause.",
+      "candidate_fix": "split the two operations: keep the ownership predicate anchored (namespaceMatches, cursor at 0, so a sticky/case-sensitive matcher keeps its declared meaning for a whole token) and make the DOCUMENT SCAN non-anchored (namespaceFindAll should strip g and y and scan for all occurrences). Ownership would then still be decided by the same predicate, so this does not widen admission."
     }
   ]
 }

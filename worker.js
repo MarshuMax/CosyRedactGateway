@@ -129,7 +129,12 @@ function isRegisteredTokenLike(value) {
 }
 
 function normalizeForeignNamespace(pattern) {
-  if (pattern instanceof RegExp) return pattern;
+  // CLONE rather than keep the caller's object. Two reasons, and both matter:
+  //   - the caller's `lastIndex` must not influence the registry, and
+  //   - the registry's matching must not advance the caller's `lastIndex` either.
+  // A RegExp is a stateful ITERATOR when it carries g/y, and a namespace matcher is used as a
+  // stateless MEMBERSHIP predicate. Sharing one object made that ambiguity observable.
+  if (pattern instanceof RegExp) return new RegExp(pattern.source, pattern.flags);
   if (pattern && typeof pattern === "object" && typeof pattern.pattern === "string") {
     return new RegExp(pattern.pattern, pattern.flags || "");
   }
@@ -137,6 +142,42 @@ function normalizeForeignNamespace(pattern) {
   // Must throw rather than stringify: `new RegExp(String(42))` silently yields a
   // matcher for the literal "42", which is a config bug that looks like it works.
   throw new TypeError("foreign namespace must be a RegExp or a pattern string");
+}
+
+/**
+ * Stateless membership test against a namespace matcher.
+ *
+ * `RegExp.prototype.test` advances `lastIndex` when the matcher carries `g` or `y`, so calling it
+ * directly made ownership depend on call history: the same token alternated between
+ * FOREIGN_REGISTERED and UNKNOWN, and `classifyOwnership` (which reset lastIndex itself) fought
+ * `isProtectedToken` (which did not) over one shared object.
+ *
+ * The cursor is reset BEFORE the call and fixed back to 0 AFTER it. Deliberately not
+ * "save the old value and restore it": a registry-internal matcher has no business carrying
+ * observable cursor state in the first place, so leaving it clean is the honest end state.
+ */
+function namespaceMatches(matcher, value) {
+  matcher.lastIndex = 0;
+  try {
+    return matcher.test(value);
+  } finally {
+    matcher.lastIndex = 0;
+  }
+}
+
+/**
+ * Every occurrence of a namespace matcher in `text`, with the cursor handled the same way.
+ * `String.prototype.match` on a g/y regex ALSO reads and writes `lastIndex`, so the three call
+ * sites that enumerate matches need the same treatment as the membership test.
+ */
+function namespaceFindAll(matcher, text) {
+  matcher.lastIndex = 0;
+  try {
+    const found = text.match(matcher);
+    return found ? [...found] : [];
+  } finally {
+    matcher.lastIndex = 0;
+  }
 }
 
 // Namespaces are TRUSTED CONFIGURATION, not payload-derived data. A broad
@@ -176,7 +217,7 @@ export class ForeignTokenRegistry {
   /** @returns {string|null} the namespace name that claims this token, if any. */
   namespaceOf(token) {
     if (this.tokens.has(token)) return "exact";
-    for (const ns of this.namespaces) if (ns.matcher.test(token)) return ns.name;
+    for (const ns of this.namespaces) if (namespaceMatches(ns.matcher, token)) return ns.name;
     return null;
   }
   has(token) { return this.namespaceOf(token) !== null; }
@@ -321,8 +362,7 @@ function classifyTokensIn(text, ctx, registry) {
       }
     }
     for (const ns of registry.namespaces) {
-      ns.matcher.lastIndex = 0;
-      for (const found of text.match(ns.matcher) || []) {
+      for (const found of namespaceFindAll(ns.matcher, text)) {
         if (!foreign.includes(found)) foreign.push(found);
       }
     }
@@ -2479,8 +2519,7 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // registrations are found by substring; prefix namespaces by their matcher.
   if (deps.foreignRegistry) {
     for (const ns of deps.foreignRegistry.namespaces) {
-      ns.matcher.lastIndex = 0;
-      for (const found of text.match(ns.matcher) || []) {
+      for (const found of namespaceFindAll(ns.matcher, text)) {
         const at = text.indexOf(found);
         if (at < 0) continue;
         c.push({ start: at, end: at + found.length, type: "foreign_token", priority: 70 });
@@ -3218,8 +3257,7 @@ function endsWithCompleteRegistration(text, registry) {
     if (token && text.endsWith(token) && (!best || token.length > best.length)) best = token;
   }
   for (const ns of registry.namespaces) {
-    ns.matcher.lastIndex = 0;
-    for (const f of text.match(ns.matcher) || []) {
+    for (const f of namespaceFindAll(ns.matcher, text)) {
       if (f && text.endsWith(f) && (!best || f.length > best.length)) best = f;
     }
   }
