@@ -4151,7 +4151,7 @@ export async function handleRequest(request, env = {}, options = {}) {
     // assistant_text: that is the fail-open this guard exists to prevent.
     return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
   }
-  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry);
+  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth);
 }
 
 export default { fetch(request, env, ctx) { return handleRequest(request,env); } };

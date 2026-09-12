@@ -319,6 +319,43 @@ test("R3.4: an over-deep SSE event becomes a stream error and cancels the upstre
   assert.equal(cancelled, true, "the upstream reader must be cancelled");
 });
 
+test("R3.4: REDACT_MAX_JSON_DEPTH reaches every path, including the non-stream response [GREEN NOW]", async () => {
+  // The guard's default value made the non-stream path LOOK wired: the parameter was declared with
+  // a default and handleRequest never passed it, so a deployment lowering REDACT_MAX_JSON_DEPTH got
+  // the new limit on the request path and the old default on the response path. A test that only
+  // exercises the default cannot see that, which is why this one sets the env var and checks a
+  // depth that is legal by default but illegal under the override.
+  const body = JSON.stringify({ model: "c", max_tokens: 20, messages: [{ role: "user", content: `PASSWORD=${SECRET}` }] });
+  const deepResponse = async () => new Response(
+    JSON.stringify({ type: "message", role: "assistant", content: [{ type: "text", text: KINDS.object(100, "plain") }] }),
+    { headers: { "content-type": "application/json" } }
+  );
+  const make = () => new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/messages`, {
+    method: "POST", headers: { "content-type": "application/json" }, body,
+  });
+
+  const byDefault = await handleRequest(make(), {}, { fetchImpl: deepResponse, salt: "depth" });
+  assert.equal(byDefault.status, 200, "depth 101 is legal under the default 512");
+  await byDefault.text();
+
+  const overridden = await handleRequest(make(), { REDACT_MAX_JSON_DEPTH: "64" }, { fetchImpl: deepResponse, salt: "depth" });
+  assert.equal(overridden.status, 502, "and illegal once the deployment lowers the limit to 64");
+  await overridden.text();
+
+  // The request path honours the same override, so the two cannot drift apart.
+  const deepRequest = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/chat/completions`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "hi" }], deep: KINDS.object(100, "x") }),
+  });
+  let fetchCalls = 0;
+  const requestOverride = await handleRequest(deepRequest, { REDACT_MAX_JSON_DEPTH: "64" }, {
+    fetchImpl: async () => { fetchCalls++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
+    salt: "depth",
+  });
+  assert.equal(requestOverride.status, 413, "the request path refuses with the same limit");
+  assert.equal(fetchCalls, 0, "and still does not forward");
+});
+
 test("R3.4: the guard is non-recursive, so it cannot overflow on the input it catches [GREEN NOW]", () => {
   // A guard that recursed would fail on exactly the input it exists to reject.
   let node = "leaf";
