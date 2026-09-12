@@ -92,8 +92,22 @@ const sampler = setInterval(() => {
 }, 2);
 
 let result;
-if (spec.side === "request") {
-  // TWO tracks, because one cannot serve both purposes honestly.
+if (spec.side === "request" && spec.mode === "phases") {
+  // PHASES MODE ONLY. Separate process from the E2E run so the memory sampler never spans both --
+  // the earlier single-process version ran handleRequest and then the instrumented pipeline, and
+  // reported the high-water mark of the TWO together, which overstates a single request.
+  const text = await stageAsync("decode", async () => new TextDecoder().decode(encoded));
+  const parsed = stage("jsonParse", () => JSON.parse(text));
+  const ctx = new RedactionContext({ salt: "perf", maxRedactions: 1e9 });
+  const redacted = await stageAsync("redactJson", () => redactJson(parsed, ctx, { gitleaks: true, highEntropy: true, email: true }));
+  const out = stage("stringify", () => JSON.stringify(redacted));
+  result = { outBytes: out.length, tokens: ctx.rawToToken.size };
+} else if (spec.side === "request") {
+  // E2E MODE ONLY. The instrumented pipeline runs in a SEPARATE process (mode=phases), because a
+  // memory sampler that spans both reports the high-water mark of two executions rather than of one
+  // request.
+  //
+  // Two tracks, because one cannot serve both purposes honestly.
   //
   // E2E: the real request path through handleRequest, with a fake fetchImpl that answers
   // immediately, so the measured cost IS the forward path. This is the authoritative baseline for
@@ -130,14 +144,7 @@ if (spec.side === "request") {
     return (await res.text()).length;
   });
 
-  // Phase attribution over a fresh parse of the same corpus.
-  const text = await stageAsync("decode", async () => new TextDecoder().decode(encoded));
-  const parsed = stage("jsonParse", () => JSON.parse(text));
-  const ctx = new RedactionContext({ salt: "perf", maxRedactions: 1e9 });
-  // ASSIGN the result: redactJson returns a new tree.
-  const redacted = await stageAsync("redactJson", () => redactJson(parsed, ctx, { gitleaks: true, highEntropy: true, email: true }));
-  const out = stage("stringify", () => JSON.stringify(redacted));
-  result = { e2eOutBytes: e2eOut, outBytes: out.length, tokens: ctx.rawToToken.size };
+  result = { outBytes: e2eOut };
 } else if (spec.sse) {
   // SSE: build a stream of delta events whose deltas total the target size, then drive it through
   // handleRequest so restoreSseStream, streamFields and the per-event policy all run for real.

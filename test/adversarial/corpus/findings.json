@@ -311,19 +311,18 @@
   ],
   "r3_3_baselines": {
     "request_corpus_a_clean_AUTHORITATIVE": {
-      "method": "Real handleRequest E2E with a fake fetchImpl returning a tiny response, so the measured body is the request forward path. One fresh process per size point.",
+      "method": "Real handleRequest E2E with a fake fetchImpl returning a tiny response, so the measured body is the request forward path. One fresh process per size point, and E2E runs in a process that does NOTHING ELSE (mode=e2e) while phase attribution runs in a separate process (mode=phases), so the memory sampler never spans two executions.",
       "note": "Supersedes the earlier hand-copied pipeline measurement, which used request.arrayBuffer() instead of readBodyCapped() and dropped redactJson's return value. redactJson BUILDS A NEW TREE, so that version stringified the original object and misreported heap, stringify time and output size.",
       "points": {
-        "64KiB": "60.2ms 963.1 ms/MiB 1.04 MiB/s peakRSS 69MiB peakHeap 12MiB",
-        "256KiB": "99.1ms 396.2 ms/MiB 2.52 MiB/s peakRSS 87MiB peakHeap 18MiB",
-        "1MiB": "201.0ms 201.0 ms/MiB 4.98 MiB/s peakRSS 126MiB peakHeap 37MiB",
-        "4MiB": "582.9ms 145.7 ms/MiB 6.86 MiB/s peakRSS 274MiB peakHeap 167MiB",
-        "8MiB": "1005.2ms 125.6 ms/MiB 7.96 MiB/s peakRSS 300MiB peakHeap 184MiB",
-        "16MiB": "2113.9ms 132.1 ms/MiB 7.57 MiB/s peakRSS 849MiB peakHeap 688MiB"
+        "1MiB": "E2E 211.5ms 211.5 ms/MiB 4.73 MiB/s peakRSS 127MiB peakHeap 40MiB  |  phases-only 271.4ms peakRSS 117MiB peakHeap 38MiB",
+        "4MiB": "E2E 576.1ms 144.0 ms/MiB 6.94 MiB/s peakRSS 190MiB peakHeap 94MiB  |  phases-only 958.9ms peakRSS 176MiB peakHeap 93MiB",
+        "16MiB": "E2E 2078.1ms 129.9 ms/MiB 7.70 MiB/s peakRSS 499MiB peakHeap 353MiB  |  phases-only 3774.7ms peakRSS 451MiB peakHeap 322MiB"
       },
       "x4_ratios": "1.65 / 2.03 / 2.90 / 1.72 / 2.10 -- at or below 2.9 throughout, so scaling stays healthy",
       "comparison_to_superseded": "1MiB 288ms -> 201ms, 4MiB 1021ms -> 583ms, 16MiB 3922ms -> 2114ms: the corrected path is FASTER, which is what you would expect when the original was stringifying an uncontaminated tree. Peak RSS changed materially in the other direction: 16MiB was 481MiB and is now 849MiB, because the real path holds the original parsed tree, the REDACTED tree (a separate allocation, not a mutation) and the stringified output at once. Peak heap 349MiB -> 688MiB.",
-      "conclusion": "Scaling stays linear (x4 ratios under 3, ms/MiB flat from 4MiB) and throughput reaches 7.6 MiB/s. The resource picture has changed enough to matter: peak RSS is about 53x the body at 16 MiB, not the 30x the superseded measurement suggested. The SCALING conclusion is unchanged; the RESOURCE conclusion is revised upward."
+      "conclusion": "Scaling stays linear and healthy: x4 ratios under 3, ms/MiB falling to ~130 and flat from 4 MiB, throughput ~7.7 MiB/s. Resource: peak RSS is about 30x the body at 16 MiB (499 MiB), which RESTORES the pre-correction figure of ~30x and withdraws the 53x claim. Peak heap is about 21x (353 MiB). The earlier 'materially worse than 30x' statement was an artefact of the combined-process harness.",
+      "memory_correction": "The first version of this baseline ran BOTH the E2E request and the instrumented pipeline in one process, so peak RSS/heap were the high-water mark of two consecutive executions. Measured per-mode at 16 MiB: E2E-only peak RSS 499 MiB / heap 353 MiB, phases-only 451 MiB / 322 MiB. The combined figure was 849 MiB / 688 MiB, i.e. it OVERSTATED a single request by about 70%. Timing was unaffected: 2078 ms E2E-only vs 2114 ms measured in the combined run.",
+      "status": "closed"
     },
     "request_corpus_b_parser_heavy": "BLOCKED by R3-BODY-002; not measured to full size.",
     "response": {
@@ -340,6 +339,7 @@
       "the clean corpus rounded its padding UP and produced a body 18 bytes over the 16 MiB cap, so the 16 MiB row was a 413 refusal reported as a 38ms request",
       "`total` summed the E2E run and the instrumented phase run, double-counting both",
       "the request object was reused across measurements, but request.body is a ONE-SHOT stream, so the second read saw an empty body"
-    ]
+    ],
+    "request_side_status": "CLOSED. Corpus B remains blocked by R3-BODY-002."
   }
 }
