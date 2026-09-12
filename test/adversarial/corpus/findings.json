@@ -344,7 +344,7 @@
       "regression": "test/b2-containment.test.js pins the INVARIANT rather than the deletion: envelopes sorted and strictly disjoint across 18 shapes and a 2000-construct corpus; no envelope contained in another over the 111111-string exhaustive corpus; the nested `${{ a: {b:1}}}` case yielding a single envelope; and a bounded linearity check on 4x the construct count. The linearity check is there because correctness alone CANNOT catch this class of defect -- the deleted filter never changed the result, so every other assertion passed while the function was 36x slower than necessary."
     },
     {
-      "id": "R3-BODY-002-P3",
+      "id": "R3-BODY-003",
       "seed": "n/a",
       "input": "documents where no detector produces a surviving span, including one reference construct per line",
       "expected_invariant": "Stages that only ADJUST existing spans must not run when there are no spans. reference widening, infra widening, the remerge and applyObjectSchema all fit that description.",
@@ -355,7 +355,8 @@
       "differential": "Exact comparison against the pre-change implementation, over 14 case/flag combinations covering all four requested shapes: no detector hit with many valid refs, no detector hit with malformed/unclosed refs, no detector hit on ordinary clean text, and WITH a hit so the fast path must not fire. Compared spans by start/end/type/priority/ruleId/classifiedText/evidence, the coverage summary, and the ARRAY'S OWN PROPERTY NAMES (the returned array carries a non-enumerable coverage property). 0 differences. Run twice, once against HEAD and once against the pre-BODY-002 commit 1aad949, so the check also proves that Phase 1 and Phase 3 together are equivalent to the behaviour before either change.",
       "explicitly_not_a_fix_for_redos_002": "This narrows R3-REDOS-002's reachability but must NOT be recorded as fixing it. The moment a single span survives, referenceEnvelopes() runs again and the repeated failed forward scan over unclosed constructs is unchanged. A document with one secret and one unclosed construct still pays it.",
       "regression": "Covered by the existing coverage and reference suites; the differential above is the acceptance evidence.",
-      "config": "default detectors; corpus B (one reference construct per line, zero surviving spans)"
+      "config": "default detectors; corpus B (one reference construct per line, zero surviving spans)",
+      "note_on_id": "The Phase 3 fast path, recorded as its own finding because it is a separate change from the Phase 1 filter deletion and neither implies the other."
     }
   ],
   "r3_3_baselines": {
