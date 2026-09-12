@@ -431,7 +431,20 @@
         "primary_term": "finalRemerge at worker.js:3000 (`if (!remerged.some((x) => overlaps(span, x)))`), 427.6ms of a 1054.6ms total at m=8000, about 41%.",
         "confirmed_correction": "This CONFIRMS the correction made last round. My stage table had no line for the final remerge, so its cost was folded into `refInfra`, and I had attributed that 22% to infra recognition. resolveInfraEnvelope is 9.9ms at m=8000 while the final remerge after it is 427.6ms -- the widening is linear and cheap, the dedup pass after it is the cost.",
         "pipeline_shape_now": "The picture is now three independent quadratic dedup/overlap passes over the same span list, not one unknown performance problem: containmentMerge (FIXED, 1002.9ms -> 2.1ms at m=8000), selectedOverlap 464.6ms, finalRemerge 427.6ms. Everything else measured is linear."
-      }
+      },
+      "final_remerge_fix": {
+        "change": "Disjoint FAST PATH plus the original loop as fallback. The remerge order `remergeOrder` is computed UNCONDITIONALLY exactly as before, and the final `sort(startAsc)` stays on the old path -- the fast path skips ONLY the `remerged.some(overlaps)` scan. This was deliberate: under equal starts or zero-width spans the stable-sort tie order could differ, so nothing about the input or output ordering was changed.",
+        "disjoint_detector": "Sorts by start with END ASC as an explicit tie-break, then tests `next.start >= prev.end`. The END ASC term is not decoration: `overlaps()` is `a.start < b.end && a.end > b.start`, which has its own behaviour at equal starts and for zero-width spans, and a stable sort alone does not pin the comparison order. The detector was validated BEFORE being trusted -- 13 targeted shapes (zero-width inside a span, at the left boundary, at the right boundary, two zero-width spans at one point, equal-start zero plus nonzero, equal start and end, adjacent touching, adjacent with zero gap, crossing, nested, single, empty, all-zero distinct) plus 200000 seeded verdict comparisons against a pairwise `!overlaps` oracle: 0 mismatches.",
+        "differential": "The old implementation was instrumented to expose `remergeOrder`, `remerged` and `sorted2`, and compared as EXACT ARRAYS with order, over 13 targeted documents (no widening, disjoint widened many, provider-in-binding widening, nested, crossing, same bounds, adjacent touching, ARN-shaped infra, a Kubernetes Secret, a nested reference, multi-secret one line, email-adjacent-secret, empty, single) plus 30000 seeded random documents: 30014 checked, 0 differences. Empty input returns early in both, so 'both null' is treated as equivalent rather than as a mismatch.",
+        "measured": {
+          "finalRemerge_m8000": "427.6ms -> 1.9ms",
+          "finalRemerge_m16000": "1697.0ms -> 3.6ms",
+          "total_m8000": "1054.6ms -> 622.0ms",
+          "total_m16000": "3728.2ms -> 2056.7ms"
+        }
+      },
+      "remaining_term": "selectedOverlap is now the ONLY quadratic term left: 459.9ms of 622.0ms at m=8000 and 1780.5ms of 2056.7ms at m=16000, tail ratio 3.87. Everything else measures linear: consolidate 1.79, refInfra, finalRemerge 1.9, containmentMerge 1.5, applyObjectSchema ~1.1.",
+      "us_per_span_trend": "52.3 / 48.6 / 56.8 / 77.8 / 128.5 -- still rising, so BODY-004 stays OPEN until selectedOverlap is addressed."
     }
   ],
   "r3_3_baselines": {

@@ -3027,9 +3027,35 @@ export function findSensitiveSpans(text, flags, deps = {}) {
       evidence: [...new Set([...(span.evidence || []), ...envelope.evidence])],
     };
   });
+  // The remerge order is computed UNCONDITIONALLY, exactly as before. The fast path below only skips
+  // the `remerged.some(overlaps)` scan; every sort on the way in and the final `sort(startAsc)` stay
+  // on the old path, so tie order under equal starts is unchanged.
+  const remergeOrder = widened.slice().sort((a, b) => (b.end - b.start) - (a.end - a.start) || a.start - b.start);
+
+  // FAST PATH: `widened` is pairwise-disjoint, so no span can overlap any other and the scan can
+  // remove nothing -- it would reproduce its own input after O(m^2) work, exactly as the containment
+  // merge did before the same treatment (R3-BODY-004: 427.6ms of a 1054.6ms call at m=8000).
+  //
+  // The disjointness test ties on END ASC and not only on start. `overlaps()` has its own boundary
+  // behaviour at equal starts and for zero-width spans, and a stable sort alone does not pin the
+  // comparison order, so a start-only test could disagree with the scan it is meant to skip. Zero-
+  // width spans were not observed anywhere in this codebase's corpora, but the FAST PATH's
+  // correctness must not rest on "they do not occur today".
+  const remergeDisjoint = (() => {
+    const byStart = widened.slice().sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 1; i < byStart.length; i++) {
+      if (byStart[i].start < byStart[i - 1].end) return false;
+    }
+    return true;
+  })();
+
   const remerged = [];
-  for (const span of widened.slice().sort((a, b) => (b.end - b.start) - (a.end - a.start) || a.start - b.start)) {
-    if (!remerged.some((x) => overlaps(span, x))) remerged.push(span);
+  if (remergeDisjoint) {
+    remerged.push(...remergeOrder);
+  } else {
+    for (const span of remergeOrder) {
+      if (!remerged.some((x) => overlaps(span, x))) remerged.push(span);
+    }
   }
   const sorted2 = remerged.sort((a,b) => a.start-b.start);
 
