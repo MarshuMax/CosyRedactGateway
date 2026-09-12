@@ -660,6 +660,60 @@
       "phase_B_rss_slope_above_threshold": "+0.585 MiB/sample against a 0.5 threshold, 90 MiB over 4 minutes at concurrency 8. V8 heap also grew (30 -> 49 MiB). The run is too short to distinguish a plateau from a slow climb, so by the agreed escalation rule -- 'memory slope borderline' -- this is exactly the condition that would justify the longer run. Phase A at concurrency 1 was flat (+0.048), so the growth is concurrency-related, not per-request.",
       "harness_bugs_of_mine": "Four in this task alone: process.exit() truncating the pending stdout write (the harness ran to completion and printed nothing, which I first misread as a hang); a missing event-loop yield forming a microtask chain; `prev` declared inside the fetchImpl closure but read outside it, which made every iteration throw ReferenceError while still reporting sseNormal/sseCancel counts; and the rotation guard above. Each was caught only by reading a counter that should not have been zero -- probes=0 in phase B was the tell."
     },
-    "verdict": "R3.6 does NOT meet the agreed PASS bar as stated. Six of eight criteria pass unambiguously and with very large sample sizes (1.5M+ iterations per phase, 446/446 tests). Two do not: the concurrency-phase cross-request probe is unmeasured, and phase B's RSS slope is above the flatness threshold. By the escalation rule agreed in advance -- borderline memory slope, handles or p95 near a threshold, or a result too noisy to conclude -- this is a case for the longer run, not for a PASS."
+    "verdict": "R3.6 does NOT meet the agreed PASS bar as stated. Six of eight criteria pass unambiguously and with very large sample sizes (1.5M+ iterations per phase, 446/446 tests). Two do not: the concurrency-phase cross-request probe is unmeasured, and phase B's RSS slope is above the flatness threshold. By the escalation rule agreed in advance -- borderline memory slope, handles or p95 near a threshold, or a result too noisy to conclude -- this is a case for the longer run, not for a PASS.",
+    "concurrency_8_32min_run": {
+      "revision": "70b5dba (production frozen; harness-only change)",
+      "iterations": 12173072,
+      "ok": 12173072,
+      "errors": 0,
+      "samples": 1280,
+      "probe_fix": "Cross-request probes now use a PER-WORKER local counter (one probe per 50 completed requests per worker) instead of a global `it % N` guard. The modulo form silently never fired at CONC=8 with `it % 50 < 8`, producing 0 probes across a whole 4-minute phase.",
+      "cross_request_probes": 121728,
+      "cross_request_leaks": 0,
+      "probeFailed": 0,
+      "rejections": 2028845,
+      "rejection_fetch_violations": 0,
+      "sse_normal": 2028845,
+      "sse_cancel": 2028845,
+      "sse_hangs": 0,
+      "missing_restores": 0,
+      "throughput_first20_per_s": 6336,
+      "throughput_last20_per_s": 6321,
+      "throughput_delta": "-0.2%",
+      "p50_ms": 0.9,
+      "p95_ms": 1.2,
+      "p99_ms": 1.7,
+      "p95_first20": 1.2,
+      "p95_last20": 1.2,
+      "handles": "0 -> 0",
+      "active_requests": "0 -> 0",
+      "rss_MiB": {
+        "first20_mean": 255,
+        "mid20_mean": 409,
+        "last20_mean": 327,
+        "peak": 534,
+        "final": 261,
+        "slope_MiB_per_sample": 0.1233
+      },
+      "heap_MiB": {
+        "first20_mean": 69,
+        "mid20_mean": 129,
+        "last20_mean": 185,
+        "slope_MiB_per_sample": 0.1066
+      },
+      "externalMiB": 6.0,
+      "arrayBuffersMiB": 2.6,
+      "memory_interpretation": "RSS peaked at 534 MiB and then FELL BACK to 261 MiB, i.e. a major collection reclaimed roughly half of it. That rules out an unbounded leak in the strongest sense available from outside the runtime. heapUsed however is NOT flat: 69 -> 129 -> 185 MiB across the thirds, slope +0.107 MiB/sample. Heap is growing at roughly the same RATE as the process, so this is not merely V8 holding freed pages -- it is the live heap itself expanding.",
+      "gates": {
+        "throughput_degradation_le_20pct": "PASS (-0.2%)",
+        "p95_degradation_le_30pct": "PASS (1.2 -> 1.2ms)",
+        "handles_streams_no_accumulation": "PASS (0 -> 0)",
+        "cross_request_leaks_zero": "PASS (121728 probes, 0 leaks)",
+        "sse_hangs_zero": "PASS (4,057,690 streams, 0 hangs)",
+        "rejection_fetch_violations_zero": "PASS (2,028,845 rejections, 0 violations)",
+        "memory_no_sustained_growth": "NOT MET on heapUsed: slope +0.107 MiB/sample and a monotonic rise across the thirds. RSS is non-monotonic because of collection, so RSS alone would have looked benign.",
+        "npm_test_after_soak": "PASS (446/446)"
+      }
+    }
   }
 }
