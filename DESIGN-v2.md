@@ -1295,7 +1295,7 @@ worker.js 中 'legacyRedactToken' 0 处
 4. **【待验证】** 跨层归属的显式声明机制：网关与外层 DLP 如何协商 EXCLUSIVE / PASS_THROUGH（响应头、部署配置或共享清单），以及不一致时的检测点。
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
 6. **【覆盖率机制已建立，见 9.12】** 已实现 attempt 级 coverage（PARSED/PARTIAL/FAILED/NOT_APPLICABLE）与请求级 union 汇总，并有 8 份语料基线。仍**无实现数据**的部分：YAML 锚点/别名、shell 引号与转义、多行 `.env`——这些目前会体现为 PARTIAL 或不计入，需要更大语料才能定量。
-7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
+7. **【已关闭，见 9.22】** ~~legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免~~：整个 legacy 方言已从生产代码移除，该形状现在只是普通输入。
 8. **【已实现，见 9.14 / 9.16 / 9.21】** Infra Recognizer：10 个 subtype，certainty 与 disposition 解耦，profile 可切换，**envelope 解析解决 detector/entity 边界错配**（实例 ID 等不再被拆开）。**未做**：`MASK` 语义（需要逐类型保真定义）、infra 自身产出 span（当前只注解 detector 已产出的 span，因此未被任何 detector 命中的裸 ARN 不会脱敏）、`INTERNAL_HOSTNAME` 的 envelope 规则已有但 K8s `svc` 短名仍需完整 FQDN。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。
