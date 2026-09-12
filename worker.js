@@ -1470,13 +1470,13 @@ export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
     .filter((b) => !b.regionOnly)
     .filter((b) => b.bodyCandidate === true
       || (b.strength === KEY_STRENGTH.STRONG && !b.evidence.includes("reference_value")))
-    // A value that is ALREADY a token of this layer's dialect must not be wrapped
-    // again. `DB_PASSWORD=CRG_...` is the normal shape for a payload that has already
-    // been through this gateway, or through an outer DLP using the same dialect, and
-    // re-tokenising it would defeat the foreign-token pass-through contract. The check
-    // is shape-based on purpose: eligibility for REDACTION still comes from ownership
-    // at merge time, because an unregistered CRG-shaped string must remain detectable.
-    .filter((b) => !isOwnDialectToken(b.raw))
+    // NOTE: no shape-based exclusion here. An earlier revision skipped any value that
+    // merely LOOKED like this layer's token, which reintroduced the bypass the design
+    // removed: `DB_PASSWORD=CRG_AAAA_AAAA` is a perfectly plausible low-entropy
+    // password, and it was forwarded in the clear because the binding candidate never
+    // reached the merge and no other detector fired. Protection eligibility comes from
+    // OWNERSHIP at merge time (see RedactionContext.isProtectedToken), never from the
+    // shape of the value.
     .map((b) => ({
       start: b.valueStart,
       end: b.valueEnd,
@@ -1535,6 +1535,26 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   if (flags.structuredContext !== false) {
     c.push(...bindingSpansOf(text));
     c.push(...bindingSpansOf(text, "binding", parseYamlBindings));
+  }
+  // Registered foreign tokens are contributed as candidates so that the SAME
+  // ownership filter that protects owned tokens also protects them. Exact
+  // registrations are found by substring; prefix namespaces by their matcher.
+  if (deps.foreignRegistry) {
+    for (const ns of deps.foreignRegistry.namespaces) {
+      ns.matcher.lastIndex = 0;
+      for (const found of text.match(ns.matcher) || []) {
+        const at = text.indexOf(found);
+        if (at < 0) continue;
+        c.push({ start: at, end: at + found.length, type: "foreign_token", priority: 70 });
+      }
+    }
+    for (const token of deps.foreignRegistry.tokens) {
+      let at = text.indexOf(token);
+      while (at >= 0) {
+        c.push({ start: at, end: at + token.length, type: "foreign_token", priority: 70 });
+        at = text.indexOf(token, at + token.length);
+      }
+    }
   }
 
   const candidates = c.filter((x) => {
@@ -1678,8 +1698,12 @@ function randomTokenChars(n) {
 export function createRequestId() { return randomTokenChars(TOKEN_REQUEST_ID_WIDTH); }
 
 export class RedactionContext {
-  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS, requestId = null } = {}) {
+  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS, requestId = null, foreignRegistry = null } = {}) {
     this.salt = salt;
+    // Registered foreign namespaces participate in INPUT ownership too, not only in
+    // the restore policy. Without this the registry only governed the return path,
+    // while the forward path still re-tokenised a foreign token it should preserve.
+    this.foreignRegistry = foreignRegistry;
     this.maxRedactions = maxRedactions;
     this.requestId = requestId || createRequestId();
     this.nextToken = 0;
@@ -1696,7 +1720,18 @@ export class RedactionContext {
       // Legacy: shape-based, because v1 tokens carry no request-local namespace.
       LEGACY_TOKEN_RE,
     ];
-    this.isProtectedToken = (value) => this.tokenToRaw.has(value);
+    // A token is protected iff this layer OWNS it or a registered foreign namespace
+    // claims it. Shape alone is never sufficient.
+    this.isProtectedToken = (value) => {
+      if (this.tokenToRaw.has(value)) return true;
+      if (!this.foreignRegistry) return false;
+      // An EXACT registration IS the trust decision, so the shape check does not
+      // apply to it (same rule as classifyOwnership). Prefix namespaces do require a
+      // token-shaped match, so an over-broad matcher cannot declare arbitrary text
+      // foreign.
+      if (this.foreignRegistry.tokens.has(value)) return true;
+      return this.foreignRegistry.namespaceOf(value) !== null && isRegisteredTokenLike(value);
+    };
   }
   nextTokenId() {
     this.nextToken += 1;
@@ -1716,7 +1751,12 @@ export class RedactionContext {
    * `match` is the token a caller already knows, or the raw plaintext.
    */
   async emit(match, encodingKind = ENCODING_KIND.PLAIN) {
-    const token = typeof match === "string" && TOKEN_FULL_RE.test(match)
+    // Ownership decides, never shape. An earlier revision returned any TOKEN_FULL_RE
+    // match verbatim, which meant an arbitrary token-SHAPED literal passed straight
+    // through: `DB_PASSWORD=CRG_AAAA_AAAA` is a plausible low-entropy password, and
+    // treating it as "already a token" forwarded it in the clear. A string is only a
+    // token if THIS request minted it.
+    const token = (typeof match === "string" && this.tokenToRaw.has(match))
       ? match
       : await this.tokenFor(match);
     return this.ledger.mint(token, encodingKind);
@@ -1736,7 +1776,7 @@ export class RedactionContext {
     const spans = findSensitiveSpans(
       text,
       { ...flags, protectedTokenPatterns: this.protectedTokenPatterns },
-      { isProtectedToken: this.isProtectedToken }
+      { isProtectedToken: this.isProtectedToken, foreignRegistry: this.foreignRegistry }
     );
     if (!spans.length) return text;
     let out = "", at = 0;

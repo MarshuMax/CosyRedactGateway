@@ -624,9 +624,39 @@ restoreText(out) === 原文                      → 逐字节一致 ✅
 username（弱键）保持原样                        → 未过度脱敏 ✅
 ```
 
+#### 9.8.4b D2c.1 ownership hardening（安全回归修复）
+
+在为"外来 token 透传"修 bug 时引入了一个**安全回归**：binding 层按**形状**跳过任何看起来像本层 token 的值，注释里还写着"资格仍由 merge 阶段的 ownership 决定"——但候选根本没到 merge 阶段，所以那句话是假的，口子是真开的。
+
+```
+DB_PASSWORD=CRG_AAAA_AAAA
+```
+
+`CRG_AAAA_AAAA` 完全可能就是一个真实的低熵密码。binding 候选被形状过滤掉，`H` 不会抓（熵不够），generic `G` 也大概率不抓 ⇒ **明文出网**。
+
+**同一个错误有三份副本**，全部已修：
+
+| 位置 | 错误 |
+|---|---|
+| `bindingSpansOf()` | 按形状过滤候选（已删除） |
+| `RedactionContext.emit()` | `TOKEN_FULL_RE.test(match) ? match : tokenFor(match)`，把任意 token 形状字面量当已铸 token 直通 |
+| legacy 过渡豁免 | 见下方"已知过渡缺口" |
+
+**统一规则**：
+
+```
+OWN                 → preserve
+FOREIGN_REGISTERED  → preserve
+UNKNOWN token 形状  → 不享受任何豁免；strong binding / G / 其它 detector 命中即正常脱敏
+```
+
+**输入方向的 ownership 也与回程统一**：此前 `ForeignTokenRegistry` 只接在 `classifyRestore()` 上，输入 redaction 路径并未用它决定 foreign ownership——B 组测的是回程透传，不等于已支持 `input → model_visible`。现在 `RedactionContext` 接受 `foreignRegistry`，`isProtectedToken` 统一判定 own / registered-foreign；registry 的 token 与 namespace 命中也会作为候选进入 merge，由**同一个** ownership 过滤器决定去留。精确登记（`registerTokens`）本身即信任决定，不再受形状检查约束（与 `classifyOwnership` 同一规则）。
+
+**已知过渡缺口（显式测试记录）**：legacy `{{Redact:<64 hex>}}` 形状在输入方向**仍被豁免**，因为 v1 token 没有 request-local namespace，无法对照 mapping 校验。后果是与刚修掉的 v2 口子同形的绕过：任何人写一个 `{{Redact:<64 hex>}}` 就能让该值跳过。移除条件已在 9.1 写明——删除 legacy restore 分支时一并去掉，测试 `KNOWN TRANSITIONAL GAP` 会在那时失败提醒。
+
 #### 9.8.4a surrogate 与本层方言的交互
 
-`CRG_` 形状的值**不再被二次包装**：`DB_PASSWORD=CRG_...` 是"已经过本层或同方言外层 DLP"的正常形态，再包一层会破坏外来 token 的透传契约。守卫是**形状判定**（值本身即本层方言时不产 binding 候选），而**脱敏资格仍由 merge 时的 ownership 决定**——未登记的 CRG 形状串依然不视为"已脱敏"，不会被当作受保护值。
+`CRG_` 形状的值是否透传，**只由 ownership 决定**（见 9.8.4b）。早期版本在 binding 层按形状跳过，那是安全回归，已删除。
 
 ## 10. 未解决问题 / 待验证
 

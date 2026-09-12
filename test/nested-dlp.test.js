@@ -31,7 +31,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext, isRedactedText } from "../worker.js";
+import { RedactionContext, ForeignTokenRegistry, isRedactedText } from "../worker.js";
 
 const ALL = { highEntropy: true, phone: true, secret: true, identity: true, bank: true, email: true, gitleaks: true };
 const PLACEHOLDER_RE = /\{\{Redact:[a-f0-9]{64}\}\}/g;
@@ -56,63 +56,82 @@ function rewriteCount(before, after) {
 
 // ------------------------------------------- 1. what happens right now ------
 
-test("a token already in this gateway's dialect is passed through [GREEN NOW]", async () => {
-  // Behaviour change from the D2c work: a binding value that is ALREADY a token of
-  // this dialect is not wrapped again. `DB_PASSWORD=CRG_...` is the normal shape for
-  // a payload that has been through this gateway before, or through an outer DLP
-  // using the same dialect, and re-tokenising it would break the pass-through
-  // contract that the ownership rules depend on.
+test("an UNREGISTERED token-shaped literal is redacted, not exempted [GREEN NOW]", async () => {
+  // This replaces three earlier tests that asserted the opposite and were WRONG.
+  // A shape guard in the binding layer used to skip any CRG-shaped value, so
+  // `DB_PASSWORD=CRG_AAAA_AAAA` -- a perfectly plausible low-entropy password -- was
+  // forwarded in the clear: the binding candidate never reached the merge, and neither
+  // entropy nor the generic rule fires on it. Shape is not ownership.
   const ctx = newCtx();
-  const line = "DB_PASSWORD=CRG_K7M2Q9_T8F4N6P3";
-  assert.equal(await ctx.redactText(line, ALL), line, "same-dialect tokens pass through");
-
-  // Everything else under a credential-ish key is still redacted, which is what
-  // keeps the guard from becoming a bypass.
-  for (const [label, token] of FOREIGN_TOKENS.filter(([, t]) => !/^CRG_/.test(t))) {
+  for (const token of ["CRG_AAAA_AAAA", "CRG_K7M2Q9_T8F4N6P3", "VAULT_TOKEN_xyz789"]) {
     const inbound = `DB_PASSWORD=${token}`;
-    assert.notEqual(await ctx.redactText(inbound, ALL), inbound, `${label}: must still be redacted`);
+    const out = await ctx.redactText(inbound, ALL);
+    assert.notEqual(out, inbound, `${token}: an unowned token-shaped literal must be redacted`);
+    assert.equal(out.includes(token), false, `${token}: and must not survive in the output`);
   }
 });
 
-test("a same-dialect foreign token survives the round trip untouched [GREEN NOW]", async () => {
-  // This is why "nested DLP silently loses plaintext" is WRONG, and it now holds in
-  // the strongest form: the value is neither rewritten nor substituted, so the outer
-  // layer receives exactly the token it issued.
+test("KNOWN TRANSITIONAL GAP: the legacy v1 shape is still exempt on input [GREEN NOW]", async () => {
+  // Recorded as a fact, NOT as desired behaviour. During the dual-format transition
+  // `protectedTokenPatterns` still contains the legacy shape, because a v1 token
+  // carries no request-local namespace and therefore cannot be checked against the
+  // mapping. The consequence is the same bypass shape that was just fixed for v2:
+  // anyone can write `{{Redact:<64 hex>}}` and have that value skipped.
+  //
+  // Removal condition already noted in DESIGN-v2 9.1: when the legacy restore branch
+  // is deleted, this exemption goes with it. Until then the gap is documented here so
+  // it cannot be forgotten.
   const ctx = newCtx();
-  const foreign = "CRG_K7M2Q9_T8F4N6P3";
-  const inbound = `DB_PASSWORD=${foreign}`;
-  const modelSees = await ctx.redactText(inbound, ALL);
-  assert.equal(modelSees, inbound, "the token is not rewritten");
-  assert.equal(ctx.restoreText(modelSees), inbound, "and not substituted either: the outer DLP still owns it");
+  const forgedLegacy = "{{Redact:" + "a".repeat(64) + "}}";
+  const inbound = `DB_PASSWORD=${forgedLegacy}`;
+  assert.equal(await ctx.redactText(inbound, ALL), inbound, "still exempt today");
+  assert.equal(ctx.tokenToRaw.has(forgedLegacy), false, "and the request does not own it");
 });
 
-// --------------------------------------- 2. target invariant for ownership ---
-
-test("the text layer now honours same-dialect pass-through, closing the earlier limit [GREEN NOW]", async () => {
-  // Previously this recorded a LIMIT: the text pipeline had no registry knowledge, so
-  // a CRG-shaped value was just a high-entropy block and the generic rule wrapped it.
-  // A shape guard in the binding layer now prevents re-wrapping this layer's own
-  // dialect, while REDACTION eligibility still comes from ownership at merge time.
+test("an OWNED token is preserved on the input path [GREEN NOW]", async () => {
+  // The legitimate case the shape guard was trying to serve, now decided by ownership.
   const ctx = newCtx();
-  const sameDialect = "CRG_K7M2Q9_T8F4N6P3";
-  const inbound = `DB_PASSWORD=${sameDialect}`;
-  assert.equal(await ctx.redactText(inbound, ALL), inbound, "not rewritten any more");
+  const owned = (await ctx.redactText("a@example.com", { email: true })).match(/CRG_[A-Z0-9]+_[A-Z0-9]+/)[0];
+  const inbound = `DB_PASSWORD=${owned}`;
+  assert.equal(await ctx.redactText(inbound, ALL), inbound, "a token this request minted is passed through");
 });
 
-test("CRG-shaped payload text cannot gain protection by looking like a token [GREEN NOW]", async () => {
-  // The bypass this guards against: whoever controls the payload writes something
-  // that looks like a token and hopes the scanner skips it. Eligibility is
-  // ownership only, so an unregistered CRG-shaped string is still scanned.
-  // The shape guard deliberately does NOT extend to unregistered tokens of the same
-  // dialect, so this stays a bypass-free path: the string is forwarded as-is, and it
-  // is not treated as already-redacted because this request never minted it.
-  const ctx = newCtx();
-  const forged = "CRG_AAAAAAAA_0001";
-  const line = `DB_PASSWORD=${forged}`;
-  const out = await ctx.redactText(line, ALL);
-  assert.equal(out, line, "an unregistered CRG-shaped value is forwarded unchanged");
-  assert.equal(ctx.restoreText(out), line, "and is never substituted: nothing minted it");
-  assert.equal(ctx.tokenToRaw.has(forged), false, "the request does not own it");
+test("a REGISTERED foreign token is preserved on the input path too [GREEN NOW]", async () => {
+  // Closes a gap left by the B group: the registry only governed the restore policy,
+  // so the forward path still re-tokenised a token an outer DLP had issued. Input
+  // ownership now uses the same three-way judgement as the return path.
+  const ACME = { name: "acme", pattern: /(?<![A-Za-z0-9_])ACME_[A-Z0-9_]{4,}(?![A-Za-z0-9_])/ };
+  const registry = new ForeignTokenRegistry([ACME]);
+  const ctx = new RedactionContext({ salt: "fixture", foreignRegistry: registry });
+  const inbound = "DB_PASSWORD=ACME_ABCDEF_0001";
+  assert.equal(await ctx.redactText(inbound, ALL), inbound, "a registered foreign token passes through");
+
+  // Without the registration the same literal is an ordinary value and is redacted.
+  const bare = newCtx();
+  assert.notEqual(await bare.redactText(inbound, ALL), inbound, "unregistered: redacted");
+});
+
+test("ownership is the only exemption, on both paths [GREEN NOW]", async () => {
+  // One table covering input ownership and the restore policy together, so the two
+  // cannot drift apart again.
+  const ACME = { name: "acme", pattern: /(?<![A-Za-z0-9_])ACME_[A-Z0-9_]{4,}(?![A-Za-z0-9_])/ };
+  const registry = new ForeignTokenRegistry([ACME]);
+  const ctx = new RedactionContext({ salt: "fixture", foreignRegistry: registry });
+  const owned = (await ctx.redactText("a@example.com", { email: true })).match(/CRG_[A-Z0-9]+_[A-Z0-9]+/)[0];
+
+  const table = [
+    ["OWN", owned, "preserve"],
+    ["FOREIGN_REGISTERED", "ACME_ABCDEF_0001", "preserve"],
+    ["UNKNOWN token-shaped", "CRG_AAAA_AAAA", "redact"],
+    ["UNKNOWN foreign-shaped", "EVIL_ABCDEF_0001", "redact"],
+    ["ordinary secret", "cGFzc3dvcmQxMjM0NTY3OA==", "redact"],
+  ];
+  for (const [kind, value, expected] of table) {
+    const inbound = `DB_PASSWORD=${value}`;
+    const out = await ctx.redactText(inbound, ALL);
+    const action = out === inbound ? "preserve" : "redact";
+    assert.equal(action, expected, `${kind}: expected ${expected}, got ${action} (${out})`);
+  }
 });
 
 test("unregistered secrets are still redacted (no blanket pass-through) [GREEN NOW]", async () => {
