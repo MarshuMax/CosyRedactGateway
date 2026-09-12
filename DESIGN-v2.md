@@ -1682,6 +1682,70 @@ ctx.isProtectedToken(surrogate)    → 只查 tokenToRaw.has(value)    → false
 | new context：ctx1 的 surrogate 输入 ctx2 | **不继承** ownership，可重新脱敏 |
 | 跨 request 两个往返 | 都正确（pass 2 回到 pass 1 输出） |
 
+## 9.28 R1.2 Invariant Matrix Closure（已实现）
+
+R1 的验收项里有 5 条**没有自己的 property**。本刀只加测试，**不改生产行为**。
+
+### P3 — OWN token × sink × trust 授权矩阵
+
+现有 `unowned token never substituted` 覆盖不到 OWN token 一侧。固定的矩阵：
+
+```
+OWN + assistant_text + untrusted        → 可还原
+OWN + tool_argument  + untrusted        → 保留 token，明文不得出现
+OWN + shell/network/database/email      → 明文不得出现
+OWN + explicit trusted broker           → 可还原
+```
+
+**property 直接写在输出上**：`output contains plaintext ⇒ sink has restore authority`。不检查 mode/action 字符串——那正是"helper 正确、生产没接线"会通过的形式。
+
+### P5 — plain token 与 surrogate 的**交付策略**等价
+
+R1.1 已证明两者 **ownership** 一致，但没证明**policy** 一致。同一 entity 的两种表示跑同一 sink 矩阵，要求：`assistant restore ↔ restore`、`tool preserve ↔ preserve`、敏感 sink 两侧都无明文、**拒绝判定也一致**。
+
+### P6 — parser failure ≠ detector shutdown
+
+生成 parser 无法完整理解的宿主文本（未闭合引号、`[ broken`、`${{ malformed`、`{a:`、`- ?`、混合缩进块）。**先做 fixture sanity**：证明该赋值确实**没有**被解析成 binding；再证明独立 provider detector 仍然命中并移除 secret。
+
+### P7 — AMBIGUOUS 不能获得豁免
+
+补齐最关键的中间格：
+
+```
+VERIFIED  + preserve profile → may preserve
+AMBIGUOUS + preserve profile → redact        ← 此前无覆盖
+HARD      + VERIFIED         → redact
+```
+
+用 `decideSpanAction()` 做笛卡尔矩阵（policy 问题，E2E 只能抽样），另有一条 E2E 观察同一格，防止矩阵与管线脱节。
+
+### P8 — 选中 span 之外的字节不变
+
+最强可用形式：**用 `findSensitiveSpans()` 报告的 span 从输入重建输出**，若任何其他字节移动（吞注释、吞引号、offset 漂移、`i-CRG...`、半截模板），重建就不可能匹配。另有一条直接读边界：span 不得以引号/逗号/空白/注释符开头或结尾。
+
+外围随机取自 quotes / spaces / `#` comments / commas / `=` / `:` / newline。
+
+### 非空转验证（实测）
+
+property 的 `assert.ok(exercised > N)` 只在**失败时**可见，所以另行打印了执行数：
+
+```
+P3  执行 200，其中实际还原 66
+P6  执行 180 / 180 被 claim
+P8  执行 240 / 240 有 span
+P8b 执行 180 / 180 有 span
+```
+
+### 本轮暴露的我的断言错误（第 6 次同源）
+
+P7 里我断言"DEFAULT profile 会脱敏每个 VERIFIED 值"——**是错的**：`DEFAULT_PROFILE` 本身就 preserve `GIT_SHA` 与 `OCI_DIGEST`。改为**从 profile 对象读取期望值**而非硬编码：
+
+```js
+const expected = profile[infra.infraType] === INFRA_DISPOSITION.PRESERVE ? "preserve" : "redact";
+```
+
+硬编码矩阵会让测试变成 policy 的**第二份会漂移的副本**，而不是对 policy 的检查。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
