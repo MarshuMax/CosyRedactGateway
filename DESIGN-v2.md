@@ -496,6 +496,60 @@ DB_PASSWORD="prefix <PAT> suffix"
 
 另外修了一个相关缺陷：**未闭合引号**（截断日志、流式 delta 被切断）会把开引号吞进 value span，导致替换后出现 `KEY=""ABCDEFG…`。
 
+## 9.7 D2a：简单 YAML block-mapping scalar（已实现）
+
+范围刻意收窄，只处理：
+
+```yaml
+password: xxx
+password: "xxx"
+password: 'xxx'
+```
+
+**不处理**（D2b/D2c）：block scalar（`|` `>`）、sequence、flow style（`{}` `[]`）、anchor/alias/tag、multi-document、非 scalar 值。
+
+### 结构上下文：hint，不是事实
+
+D2a 维护 indentation stack 并产出：
+
+```js
+{ syntax: "yaml", key, valueStart, valueEnd, indent,
+  pathSegments: ["data", "password"],
+  pathConfidence: "simple-mapping" | "unknown" }
+```
+
+`pathConfidence` 只有两档。遇到不建模的结构时：
+
+- **路径退化**：`pathConfidence = unknown`、`pathSegments = []`，并追加 `path_unknown` evidence；
+- **但该行仍然被解析**——跳过整行会停止检查 sequence item 里的秘密，那是 fail-open。
+
+**`pathSegments` 不得当作 schema path 使用。** D2c 必须写成对象级 recognizer：
+
+```
+apiVersion == v1  AND  kind == Secret  AND  path under root `data`   → base64 representation
+apiVersion == v1  AND  kind == Secret  AND  path under root `stringData` → 普通 string token
+```
+
+仅凭 `path === data.password` 就判 base64 是错的（普通应用配置同样可以有 `data.password`）。测试 `pathSegments is a hint, not a schema path` 固定这个契约。
+
+### 其他实现要点
+
+- **引号只作定界符**：span 圈引号内部，`password: "` 与结尾 `"` 原样保留。
+- **key 清洗**：锚点/别名/标签/引号从 key 中剥离（`- &a password: x` 的 key 必须是 `password`，否则强度判定失效、绑定静默失效）。
+- **偏移以原始行为准**：先前用"去掉行尾空白后的长度"计算 `restStart` 而未计入该差值，导致每个 span 偏移 1 字符、值首字符被吞。
+- **已知限制（显式测试）**：plain scalar 后的 ` # comment` 目前仍留在 raw value 内。不裁剪是有意的——裁剪属于改写宿主语法；目标是 D2b 处理。
+
+分片状态：
+
+| 片 | 范围 | 状态 |
+|---|---|---|
+| D1 | assignment family | 已实现 |
+| D1.1 | 共享 evidence 层加固 | 已实现 |
+| D2a | 简单 YAML scalar mapping | 已实现 |
+| D2b | block scalar / 注释裁剪 / path evidence | 待做 |
+| D2c | K8s Secret schema + base64 surrogate | 待做 |
+| D3 | HTTP header + URL query | 待做 |
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

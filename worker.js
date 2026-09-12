@@ -774,6 +774,18 @@ function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
 // mode this layer is supposed to avoid, so the span covers the value only (inside
 // the quotes, when there are quotes) and the surrounding `KEY="` / `"` survives.
 
+// Strip YAML anchors/aliases/tags and surrounding quotes from an extracted key.
+// `- &a password: x` yields the key `&a password` if this is skipped, which then
+// looks like a non-credential name and silently loses the binding's strength.
+export function cleanBindingKey(key) {
+  return String(key)
+    .trim()
+    .replace(/^[&*!][^\s]*\s*/, "")
+    .replace(/^!(?:![^\s]*|[^\s]*)\s*/, "")
+    .replace(/^["']|["']$/g, "")
+    .trim();
+}
+
 export const KEY_STRENGTH = Object.freeze({
   STRONG: "strong",
   WEAK: "weak",
@@ -893,6 +905,157 @@ function looksLikeReferenceValue(raw) {
   return REFERENCE_VALUE_RE.test(raw.trim());
 }
 
+export const PATH_CONFIDENCE = Object.freeze({
+  SIMPLE_MAPPING: "simple-mapping",
+  UNKNOWN: "unknown",
+});
+
+// D2a: simple block-mapping YAML scalars only.
+//
+//   password: xxx
+//   password: "xxx"
+//   password: 'xxx'
+//
+// Deliberately NOT handled here: block scalars (`|`, `>`), sequences, flow style
+// (`{...}`, `[...]`), anchors/aliases/tags, multi-document files, and non-scalar
+// values. When any of those appear the structural hint degrades instead of
+// guessing:
+//
+//   - a construct we do not model inside a block -> pathConfidence UNKNOWN and the
+//     path is cleared,
+//   - an entry we cannot interpret at all -> no binding record for that line.
+//
+// `pathSegments` is a HINT, not a fact, and must not be used as a schema path. In
+// particular, D2c must NOT conclude "path === data.password therefore base64": the
+// schema decision needs an object-level recognizer
+// (apiVersion == v1 AND kind == Secret AND path under root `data`).
+export function parseYamlBindings(text) {
+  const out = [];
+  if (typeof text !== "string" || !text) return out;
+  const lines = text.split("\n");
+
+  // Indentation stack: entries are { indent, key }. Only maintained while the
+  // document looks like a simple block mapping.
+  let stack = [];
+  let docShapeKnown = true;
+
+  let lineStart = 0;
+  for (const rawLine of lines) {
+    const line = rawLine;
+    const stripped = line.trim();
+    const indent = line.length - line.replace(/^[ \t]*/, "").length;
+
+    // A document that is not a plain block mapping: stop tracking the path rather
+    // than inventing parent keys.
+    if (/^(---|\.\.\.)\s*$/.test(stripped) || /^(---|\.\.\.)\s/.test(stripped)) {
+      docShapeKnown = false;
+      stack = [];
+      lineStart += line.length + 1;
+      continue;
+    }
+    if (stripped === "" || stripped.startsWith("#")) { lineStart += line.length + 1; continue; }
+
+    // Sequences, explicit keys, anchors/aliases and tags are not modelled. The PATH
+    // is lost, but the line is still scanned: skipping it outright would stop
+    // checking secrets inside a sequence item, which is fail-open. So the entry is
+    // parsed below with pathConfidence UNKNOWN and pathSegments cleared.
+    const unmodelled = /^\s*(-\s|\?\s|[&*!])/.test(line);
+    if (unmodelled) { docShapeKnown = false; stack = []; }
+
+    // Match against the line with trailing whitespace removed, but compute offsets
+    // against `line`: using the trimmed length without its delta shifted every span
+    // by one character, which silently ate the first character of the value.
+    const trimmedEnd = line.replace(/\s+$/, "");
+    // A sequence item may still carry a `key: value` pair (`- password: x`). Strip
+    // the dash for matching only; the offset arithmetic below stays relative to the
+    // original line.
+    const matchTarget = trimmedEnd.replace(/^([ \t]*)-[ \t]+/, "$1");
+    const m = /^([ \t]*)([^\s:#][^:#]*?)[ \t]*:[ \t]*([\s\S]*)$/.exec(matchTarget);
+    if (!m) { lineStart += line.length + 1; continue; }
+
+    const rawKey = m[2].trim();
+    const key = cleanBindingKey(rawKey);
+    if (!key) { lineStart += line.length + 1; continue; }
+    const rest = m[3];
+    // Leading offset of `rest` inside `line`: everything the regex consumed before it.
+    const restStart = lineStart + trimmedEnd.length - rest.length;
+
+    // Maintain the indentation stack for the NEXT line's benefit, and compute this
+    // key's ancestry.
+    while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
+
+    const structural = {
+      syntax: "yaml",
+      indent,
+      pathSegments: [],
+      pathConfidence: PATH_CONFIDENCE.UNKNOWN,
+    };
+    if (docShapeKnown) {
+      structural.pathSegments = [...stack.map((e) => e.key), key];
+      structural.pathConfidence = PATH_CONFIDENCE.SIMPLE_MAPPING;
+    }
+
+    // ---- value ----
+    if (rest === "" || rest.startsWith("|") || rest.startsWith(">")) {
+      // Empty value, or a block scalar: D2b territory. Record the key in the stack
+      // so descendants are still attributable, but emit no binding.
+      stack.push({ indent, key });
+      lineStart += line.length + 1;
+      continue;
+    }
+
+    let valueStart = -1;
+    let valueEnd = -1;
+    let raw = "";
+    let quoted = false;
+    const dq = /^"((?:\\.|[^"\\])*)"/.exec(rest);
+    const sq = /^'((?:''|[^'])*)'/.exec(rest);
+    if (dq) { quoted = true; valueStart = restStart + 1; raw = dq[1]; valueEnd = valueStart + raw.length; }
+    else if (sq) { quoted = true; valueStart = restStart + 1; raw = sq[1]; valueEnd = valueStart + raw.length; }
+    else if (rest.startsWith("{") || rest.startsWith("[")) {
+      // Flow collection: not a scalar. Trailing comments after a flow collection are
+      // also not modelled, so the key is not pushed.
+      lineStart += line.length + 1;
+      continue;
+    } else {
+      // Plain scalar runs to the end of the line. A trailing ` #comment` is left in
+      // the raw value on purpose: this layer must not rewrite the host syntax, and
+      // trimming a comment is a rewrite. A path/key judgement on such a record is
+      // the caller's business.
+      raw = rest;
+      valueStart = restStart;
+      valueEnd = restStart + raw.length;
+    }
+    if (raw.length === 0) { stack.push({ indent, key }); lineStart += line.length + 1; continue; }
+
+    const strength = classifyKeyStrength(key);
+    const evidence = ["structured_binding"];
+    if (strength === KEY_STRENGTH.STRONG) evidence.push("strong_secret_key");
+    if (quoted) evidence.push("quoted_value");
+    if (looksLikeReferenceValue(raw)) evidence.push("reference_value");
+    if (structural.pathConfidence === PATH_CONFIDENCE.UNKNOWN) evidence.push("path_unknown");
+
+    out.push({
+      kind: "binding",
+      key,
+      normalizedKey: normalizeBindingKey(key),
+      valueStart,
+      valueEnd,
+      syntax: "yaml",
+      evidence,
+      strength,
+      raw,
+      indent: structural.indent,
+      pathSegments: structural.pathSegments,
+      pathConfidence: structural.pathConfidence,
+    });
+
+    stack.push({ indent, key });
+    lineStart += line.length + 1;
+  }
+  return out;
+}
+
 /**
  * Produce `binding` records: { kind, key, normalizedKey, valueStart, valueEnd,
  * syntax, evidence }. Raw value span only -- quotes are excluded from the span but
@@ -978,8 +1141,8 @@ export function parseBindings(text) {
  * Binding records that are safe to treat as secret evidence: strong key, and a
  * value that is not a reference to another value.
  */
-export function bindingSpansOf(text, kind = "binding") {
-  return parseBindings(text)
+export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
+  return parser(text)
     .filter((b) => b.strength === KEY_STRENGTH.STRONG)
     .filter((b) => !b.evidence.includes("reference_value"))
     .map((b) => ({
@@ -991,6 +1154,7 @@ export function bindingSpansOf(text, kind = "binding") {
       normalizedKey: b.normalizedKey,
       syntax: b.syntax,
       evidence: b.evidence,
+      ...(b.pathSegments ? { pathSegments: b.pathSegments, pathConfidence: b.pathConfidence, indent: b.indent } : {}),
     }));
 }
 
@@ -1036,7 +1200,10 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // the same merge as everything else and never suppresses G/H or returns early.
   // A parse failure simply contributes nothing, leaving the other detectors to
   // cover the text -- the parser is evidence, not a security boundary.
-  if (flags.structuredContext !== false) c.push(...bindingSpansOf(text));
+  if (flags.structuredContext !== false) {
+    c.push(...bindingSpansOf(text));
+    c.push(...bindingSpansOf(text, "binding", parseYamlBindings));
+  }
 
   const candidates = c.filter((x) => {
     if (protectedSpans.some((p) => overlaps(x, p))) return false;

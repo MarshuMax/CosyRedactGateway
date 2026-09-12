@@ -99,16 +99,21 @@ test("key-name evidence is what closes the value-class gap [GREEN NOW]", async (
   assert.equal((await redact(dotted)).includes(SECRET), false, "structured binding covers it");
 });
 
-test("D1 closes the env/shell forms; YAML/header/URL are still open [GREEN NOW]", async () => {
-  // D1 covers the assignment family only. The remaining three forms are D2/D3 and
-  // are expected to still miss -- recorded here so D2/D3 have a baseline to flip.
+test("D1+D2a cover the assignment and YAML-scalar families; header/URL remain [GREEN NOW]", async () => {
+  // Slice baseline. D1 closed env/shell, D2a closed the simple YAML scalar
+  // mapping (`password: xxx` and both quote styles). What is left is D2b (block
+  // scalar), D2c (K8s Secret schema), and D3 (header + URL).
   const missed = [];
   for (const form of BINDING_FORMS) {
     const out = await redact(form.line);
     if (!out.includes(SECRET)) continue; // covered
     missed.push(form.name);
   }
-  assert.deepEqual(missed, ["YAML mapping", "HTTP header", "URL query", "YAML base64 field"]);
+  // The nested `data:\n  password: x` form is ALSO covered by D2a -- not because
+  // base64 semantics are understood (that is D2c), but because a nested key is
+  // still a simple scalar mapping and its span is the plain value. The base64
+  // question is about the replacement FORMAT, not about whether the span is found.
+  assert.deepEqual(missed, ["HTTP header", "URL query"]);
 });
 
 test("the fix is attributable to structured context, not another detector [GREEN NOW]", async () => {
@@ -125,6 +130,8 @@ test("the fix is attributable to structured context, not another detector [GREEN
 // --------------------------------------------------- 2. target behaviour -----
 
 const D1_FORMS = BINDING_FORMS.filter((f) => ["env", "shell"].includes(f.syntax) && !f.line.includes("\n"));
+const D2A_FORMS = BINDING_FORMS.filter((f) => f.name === "YAML mapping");
+const COVERED_FORMS = [...D1_FORMS, ...D2A_FORMS];
 const D2_D3_FORMS = BINDING_FORMS.filter((f) => !D1_FORMS.includes(f));
 
 test("D1: assignment-family bindings are redacted [GREEN NOW]", async () => {
@@ -135,17 +142,21 @@ test("D1: assignment-family bindings are redacted [GREEN NOW]", async () => {
   assert.equal(D1_FORMS.length, 3, "fixture must cover .env, shell export and spaced assignment");
 });
 
-test("D2/D3: YAML / header / URL bindings are not covered yet [RED]", async () => {
-  // Baseline for the next two slices. These assert the TARGET, and are expected to
-  // fail until D2 (YAML scalar) and D3 (header + URL query) land.
-  for (const form of D2_D3_FORMS) {
+test("D3: header and URL bindings are not covered yet [RED]", async () => {
+  // Baseline for the remaining slice. YAML scalar mapping moved to the D2a test
+  // above when it landed; D2b (block scalar) and D2c (Secret schema) are about
+  // span kinds and replacement FORMAT rather than key detection, and are tracked in
+  // test/d2a-yaml.test.js.
+  const pending = D2_D3_FORMS.filter((f) => !["YAML mapping", "YAML base64 field"].includes(f.name));
+  assert.ok(pending.length >= 3, "fixture must still hold the pending forms");
+  for (const form of pending) {
     const out = await redact(form.line);
     assert.equal(out.includes(SECRET), false, `${form.name} must not forward the secret verbatim`);
   }
 });
 
 test("redaction covers exactly the value, not the binding syntax [GREEN NOW]", async () => {
-  for (const form of D1_FORMS) {
+  for (const form of COVERED_FORMS) {
     const out = await redact(form.line);
     // Guard: without this the prefix/suffix assertions below pass vacuously
     // whenever the value was not redacted at all, which is the current state.
@@ -158,7 +169,7 @@ test("redaction covers exactly the value, not the binding syntax [GREEN NOW]", a
 
 test("round-trip is byte-identical once the value is redacted [GREEN NOW]", async () => {
   const ctx = new RedactionContext({ salt: "fixture" });
-  for (const form of D1_FORMS) {
+  for (const form of COVERED_FORMS) {
     const out = await ctx.redactText(form.line, GITLEAKS);
     assert.equal(isRedactedText(out), true, `${form.name}: value must be redacted before round-trip is meaningful`);
     assert.equal(ctx.restoreText(out), form.line, `${form.name}: round-trip must be byte-identical`);
@@ -169,7 +180,7 @@ test("structured extraction exposes the key name as evidence [GREEN NOW]", () =>
   // The D1 interface: a binding span carries the enclosing field name and the
   // evidence that produced it, so a low-entropy value is protected on key evidence
   // alone. YAML/header/URL forms are D2/D3 and are excluded here.
-  for (const form of D1_FORMS) {
+  for (const form of COVERED_FORMS) {
     const spans = findSensitiveSpans(form.line, GITLEAKS);
     const hit = spans.find((x) => x.type === "binding" && x.key);
     assert.ok(hit, `${form.name}: expected a binding span`);
