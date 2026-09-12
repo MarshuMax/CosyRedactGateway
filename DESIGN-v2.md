@@ -1190,6 +1190,62 @@ ACME_ + 10MB 的体        → 达到 streamMaxLength → RELEASE（否则整个
 
 只 `await response.text()` 的测试**无法区分**"增量交付"与"全部拖到 finish 再一次性输出"——后者也会全绿。因此新增一条测试：upstream 发送"完整 surrogate + 空格"后**保持连接不关闭**，gateway 的 reader 必须在 2 秒内读到输出。实测通过。
 
+## 9.21 G2 Infra Envelope Resolution + Ledger Closure（已实现）
+
+### 根因：detector boundary ≠ entity boundary
+
+```
+instance: i-0a1b2c3d4e5f67890
+          └──── 熵检测器 span ────┘
+          └──────── 实体 ─────────┘
+```
+
+`H` 只产生"看起来随机的一串字符"，因此对实例 ID 它报的是 **hex 段**。`recogniseInfra(spanText)` 看到的是 `0a1b2c3d4e5f67890`，判不出任何东西，前缀被留在外面——交付文本甚至被拆成 `i-CRG_...`。
+
+**这不是"EC2 缺 anchor"**。逐个补 `contextBefore`（OCI 一个、EC2 一个、K8s 一个……）治的是症状。修法是**在分类之前把 span 解析到其所属实体**。
+
+### 表驱动的 envelope 规则
+
+每条规则声明如何向左/向右扩展，扩展有界，且**扩展结果必须被 recogniser 接受**（否则规则算猜错，保留原 span）：
+
+| 类型 | 左扩展 | 右扩展 |
+|---|---|---|
+| `EC2_RESOURCE_ID` | `i-` / `subnet-` / `sg-` / `ami-` … | hex 串 |
+| `OCI_DIGEST` | `sha256:` / `sha256@` | hex 串 |
+| `INTERNAL_HOSTNAME` | 域名标签前缀 | 标签字符 |
+| `K8S_RESOURCE_NAME` | 名称前缀 | 名称字符 |
+
+### 扩展后必须重新归并
+
+这是实现上的关键点：扩展后的 span **包含**原检测器 span，若不重新归并，原窄 span 会与它并存并可能赢下局部替换——`i-CRG_...` 正是这么产生的。因此 envelope 解析后**再跑一次 containment merge**。
+
+### Ledger closure
+
+envelope 归因写入实体账本（`infraType` / `infraCertainty`），`entityClassFor()` 据此返回 `INFRA`。没有这一步，策略层已经判定为 `EC2_RESOURCE_ID`，账本却仍答 `UNKNOWN`。
+
+修的过程中发现**账本构造时把这两个字段丢弃了**（参数传进来了，entry 里没有），所以仅接线不够。
+
+### 实测
+
+```
+默认 profile（strict）:
+  EC2/Subnet/SG/AMI ID   → 脱敏（整体替换，无 i- 残留）  infra=EC2_RESOURCE_ID  class=INFRA
+  镜像 digest / commit    → 原样（VERIFIED + allowlist）
+  裸 64hex（无锚）         → 脱敏  infra=OCI_DIGEST（AMBIGUOUS）class=INFRA
+  真密码 / GitHub PAT     → 脱敏  class=CREDENTIAL（单调性保持）
+
+devops profile:
+  所有 VERIFIED 的 infra 标识 → 原样
+  裸 64hex（AMBIGUOUS）      → 仍脱敏
+  真密码 / GitHub PAT        → 仍脱敏
+```
+
+### 测试修正
+
+两条测试的夹具本身是**形状歧义**的（32 位 hex 恰好是 trace-id 形状），G2 之后被正确地判为 `TRACE_ID`，因此测试失败的原因是夹具选得不好，而不是行为回归。改用**非 infra 形状**的熵值作为"entropy-only"夹具，并新增一条测试记录"32hex 在有锚/无锚下分别判 TRACE_ID"现在是有意行为。
+
+F4.2 那条 limitation 测试（"前缀在 span 外需要逐类型变体"）已改写为 G2 契约：实例 ID 现在被整体解析。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
@@ -1200,7 +1256,7 @@ ACME_ + 10MB 的体        → 达到 streamMaxLength → RELEASE（否则整个
 5. **【待验证】** infra golden corpus 的来源与规模：需要覆盖 AWS / K8s / Git / 追踪 ID 的真实样本集，才能把"零误删"作为 HARD 的准入条件。
 6. **【覆盖率机制已建立，见 9.12】** 已实现 attempt 级 coverage（PARSED/PARTIAL/FAILED/NOT_APPLICABLE）与请求级 union 汇总，并有 8 份语料基线。仍**无实现数据**的部分：YAML 锚点/别名、shell 引号与转义、多行 `.env`——这些目前会体现为 PARTIAL 或不计入，需要更大语料才能定量。
 7. **【已知缺口】** legacy `{{Redact:<64 hex>}}` 形状在输入方向仍被豁免（见 9.8.4b），移除条件随 legacy restore 分支删除。
-8. **【已实现，见 9.14 / 9.16】** Infra Recognizer：10 个 subtype，certainty 与 disposition 解耦，profile 可切换。**未做**：`MASK` 语义（需要逐类型保真定义）、infra 自身产出 span（当前只注解 detector 已产出的 span，因此未被任何 detector 命中的 ARN 不会脱敏）、EC2 前缀的 `contextBefore` 变体（实例 ID 仍会被熵检测器吃掉）、`INTERNAL_HOSTNAME` 对 K8s `svc` 短名的覆盖（当前需完整 FQDN）。
+8. **【已实现，见 9.14 / 9.16 / 9.21】** Infra Recognizer：10 个 subtype，certainty 与 disposition 解耦，profile 可切换，**envelope 解析解决 detector/entity 边界错配**（实例 ID 等不再被拆开）。**未做**：`MASK` 语义（需要逐类型保真定义）、infra 自身产出 span（当前只注解 detector 已产出的 span，因此未被任何 detector 命中的裸 ARN 不会脱敏）、`INTERNAL_HOSTNAME` 的 envelope 规则已有但 K8s `svc` 短名仍需完整 FQDN。
 7. **【待验证】** 流式场景下 base64 surrogate 的跨 chunk 还原，以及新 token 变长后 `SseRestorer` 的后缀保留上界取值。
 8. **【待统一】测试夹具与语法的两处不一致**：`test/k8s-surrogate.test.js` 的 `surrogate length is independent of plaintext length` 使用了三段 token `CRG_7K2M9Q_E9999_T8F4N6P3`，与 6.5 的两段语法及 `token-syntax` 的 `parts.length === 2` 断言冲突，需改成两段夹具；该用例注释写"surrogate 长度泄露明文长度"，但断言与行为是"长度只跟踪 token"，若同请求内 token 定长则不泄露明文长度，注释应按断言修正。
 9. **【待替换】测试内的实现占位**：`token-syntax` 的 `targetToken()`（`djb2(明文)` 派生 entity slot）与 `k8s-surrogate` 的 `base64Surrogate()`、`restore-miss` 的 `classifyRestore()` 都是形态占位；前者的派生方式正是 8.1 所禁止的 checksum oracle 形态，worker.js 实现时必须用 CSPRNG，不得复用测试里的推导。

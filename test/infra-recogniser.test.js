@@ -29,6 +29,7 @@ import {
   INFRA_DISPOSITION,
   DEFAULT_PROFILE,
   DEVOPS_PROFILE,
+  findSensitiveSpans,
 } from "../worker.js";
 
 const ALL = { highEntropy: true, phone: true, secret: true, identity: true, bank: true, email: true, gitleaks: true };
@@ -512,20 +513,45 @@ test("F4.2 limitation: a disposition only applies to a span some detector produc
   assert.equal(ctx.policySummary().decisions, 0, "and no policy decision is recorded");
 });
 
-test("F4.2 limitation: a prefix OUTSIDE the span needs a per-type variant [GREEN NOW]", async () => {
-  // `i-0a1b2c3d4e5f67890` is VERIFIED when the recogniser sees the whole token, but the
-  // entropy detector circles only the hex run and leaves `i-` outside the span. The bare
-  // hex is AMBIGUOUS, so nothing preserves it and the instance id is still redacted.
+test("G2: a prefix outside the detector span is resolved by the envelope, not per-type patches [GREEN NOW]", async () => {
+  // This test previously recorded a LIMITATION: the entropy detector circles only the hex
+  // run, `i-` fell outside the span, the bare hex was AMBIGUOUS, and the instance id was
+  // still redacted. Adding a per-type `contextBefore` for EC2 would have been the
+  // symptom-level patch -- the same fix would then be owed to OCI, K8s, and every future
+  // identifier.
   //
-  // This is the same shape as the OCI case, and the OCI case is solved by variant B
-  // (`contextBefore: /sha256:\s*$/`). No such variant exists for the EC2 prefixes yet, so
-  // the practical effect today is that entropy keeps eating instance ids. Recorded rather
-  // than papered over: closing it either adds per-type context variants or makes the
-  // recogniser produce spans of its own, and the latter is a design decision this slice
-  // deliberately did not take.
+  // The general fix is envelope resolution: a detector span is widened to the enclosing
+  // entity before it is classified. `resolveInfraEnvelope` does that from a declared table,
+  // and the pipeline re-merges afterwards so the narrow span cannot win a partial
+  // replacement.
   assert.equal(recogniseInfra("i-0a1b2c3d4e5f67890").certainty, INFRA_CERTAINTY.VERIFIED, "the full token is verified");
 
-  const ctx = new RedactionContext({ salt: "fixture", profile: DEVOPS_PROFILE });
-  const out = await ctx.redactText("instance: i-0a1b2c3d4e5f67890", ALL);
-  assert.notEqual(out, "instance: i-0a1b2c3d4e5f67890", "the instance id is still redacted today");
+  const doc = "instance: i-0a1b2c3d4e5f67890";
+  const spans = findSensitiveSpans(doc, ALL);
+  assert.equal(spans.length, 1, "the envelope must collapse to ONE span");
+  assert.equal(doc.slice(spans[0].start, spans[0].end), "i-0a1b2c3d4e5f67890", "covering the whole entity");
+  assert.equal(spans[0].infraEnvelope?.infraType, INFRA_TYPE.EC2_RESOURCE_ID, "classified as the entity, not the hex run");
+
+  // The default profile still redacts it -- the point is that it is now redacted as a WHOLE,
+  // so the delivered text cannot end up as `i-CRG_...`.
+  const strict = new RedactionContext({ salt: "fixture", profile: DEFAULT_PROFILE });
+  const strictOut = await strict.redactText(doc, ALL);
+  assert.equal(strictOut.includes("i-"), false, "no dangling prefix is left behind");
+  assert.equal(strictOut.includes("0a1b2c3d4e5f67890"), false, "and no partial hex either");
+
+  // A profile that preserves infrastructure identifiers gets the complete value back.
+  const devops = new RedactionContext({ salt: "fixture", profile: DEVOPS_PROFILE });
+  assert.equal(await devops.redactText(doc, ALL), doc, "the whole entity is preserved");
 });
+
+test("G2: the ledger records the envelope classification, so entityClassFor answers INFRA [GREEN NOW]", async () => {
+  const ctx = new RedactionContext({ salt: "fixture" });
+  await ctx.redactText("instance: i-0a1b2c3d4e5f67890", ALL);
+  const [entry] = ctx.entityLedger.entries();
+  assert.equal(entry.detector, "entropy", "the detector was the entropy detector");
+  assert.equal(entry.infraType, INFRA_TYPE.EC2_RESOURCE_ID, "but the entity is an envelope-resolved resource id");
+  assert.equal(entry.infraCertainty, INFRA_CERTAINTY.VERIFIED);
+  assert.equal(entry.entityClass, "INFRA", "and that is what the entity is");
+  assert.equal(ctx.entityClassFor(entry.token), "INFRA", "which entityClassFor reports");
+});
+

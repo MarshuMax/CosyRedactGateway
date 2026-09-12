@@ -139,10 +139,15 @@ test("E1: an entropy-only hit stays UNKNOWN, not CREDENTIAL [GREEN NOW]", async 
   // "Looks random" is compatible with a secret, a git SHA, a Docker digest and a trace
   // id alike. Mapping it to CREDENTIAL would manufacture confidence the evidence does
   // not support; that disentangling is the infra recogniser's job.
-  const entries = await ledgerFor("sha: 4bf92f3577b34da6a3ce929d0e0e4736");
+  // The fixture must NOT be infrastructure-shaped, or it tests the other branch: a 32-hex
+  // run is the trace-id shape, so the recogniser legitimately claims it (see the infra
+  // suite). This is a random-looking alphanumeric block with no recognisable shape, which
+  // is what "entropy-only" actually means.
+  const entries = await ledgerFor("blob: 9fK2mXq7Lp4Rt8Wz3Vb6Nc1Yd5Hs0Jg");
   assert.equal(entries.length, 1);
   assert.equal(entries[0].detector, "entropy");
-  assert.equal(entries[0].entityClass, ENTITY_CLASS.UNKNOWN);
+  assert.equal(entries[0].entityClass, ENTITY_CLASS.UNKNOWN, "shape-free entropy is not a class");
+  assert.equal(entries[0].infraType, null, "and no infra type is claimed");
 });
 
 test("E1: a weak key name confers nothing by itself [GREEN NOW]", async () => {
@@ -232,7 +237,7 @@ test("a FAILED region does not downgrade a deterministic detector [GREEN NOW]", 
 
   // Conversely, an entropy-only hit in a FAILED region is UNKNOWN for its own reason:
   // entropy was never class evidence to begin with.
-  const entropyOnly = await ledgerFor("X-Custom-Header:\nvalue: 4bf92f3577b34da6a3ce929d0e0e4736");
+  const entropyOnly = await ledgerFor("X-Custom-Header:\nvalue: 9fK2mXq7Lp4Rt8Wz3Vb6Nc1Yd5Hs0Jg");
   for (const entry of entropyOnly) {
     if (entry.detector === "entropy") assert.equal(entry.entityClass, ENTITY_CLASS.UNKNOWN);
   }

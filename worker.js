@@ -1178,6 +1178,87 @@ const INFRA_RULES = rawInfraRules.map((rule) => ({
   contextBeforeRe: rule.contextBefore ? new RegExp(rule.contextBefore.source, rule.contextBefore.flags.replace("g", "")) : null,
 }));
 
+// ---------------------------------------------------- infra envelope resolution ---
+//
+// A detector boundary is not an entity boundary. The entropy detector sees a run of
+// random-looking characters, so for `i-0a1b2c3d4e5f67890` it reports the HEX RUN while the
+// entity is the whole resource id:
+//
+//   instance: i-0a1b2c3d4e5f67890
+//             └──── detector span ───┘
+//             └──────── entity ─────────┘
+//
+// `recogniseInfra(spanText)` therefore sees `0a1b2c3d4e5f67890`, classifies nothing, and the
+// prefix is left outside -- the delivered text even ends up split (`i-CRG_...`). Patching
+// this one identifier at a time (an OCI rule, then an EC2 rule, then a K8s rule) treats the
+// symptom; the fix is to RESOLVE the span to the enclosing entity before classifying it.
+//
+// Rules are table-driven and each declares how to expand LEFT and RIGHT. Expansion is
+// bounded and must produce a string the recogniser actually accepts, so it cannot run away.
+const INFRA_ENVELOPES = Object.freeze([
+  {
+    type: INFRA_TYPE.EC2_RESOURCE_ID,
+    // `i-`, `subnet-`, `sg-`, ... immediately before the detector span.
+    left: /(?:^|[^A-Za-z0-9_-])((?:i|ami|vol|snap|subnet|sg|vpc|eni|rtb|acl)-)$/,
+    right: /^[0-9a-fA-F]*/,
+  },
+  {
+    type: INFRA_TYPE.OCI_DIGEST,
+    left: /(sha256[:@])$/,
+    right: /^[0-9a-fA-F]*/,
+  },
+  {
+    type: INFRA_TYPE.INTERNAL_HOSTNAME,
+    left: /(?:^|[^A-Za-z0-9_.-])([a-z0-9][a-z0-9.-]*\.)$/,
+    right: /^[a-z0-9.-]*/,
+  },
+  {
+    type: INFRA_TYPE.K8S_RESOURCE_NAME,
+    left: /(?:^|[^A-Za-z0-9_-])([a-z0-9][a-z0-9-]*-)$/,
+    right: /^[a-z0-9-]*/,
+  },
+]);
+
+/**
+ * Expand a detector span to the enclosing infrastructure entity, if there is one.
+ *
+ * @returns {{start:number,end:number,infraType:string,evidence:string[]}|null}
+ */
+export function resolveInfraEnvelope(text, span) {
+  if (typeof text !== "string" || !span) return null;
+  let best = null;
+  for (const rule of INFRA_ENVELOPES) {
+    const leftWindow = text.slice(Math.max(0, span.start - 64), span.start);
+    const leftMatch = rule.left.exec(leftWindow);
+    if (!leftMatch) continue;
+
+    const leftLength = leftMatch[1].length;
+    const after = text.slice(span.end);
+    const rightMatch = rule.right.exec(after);
+    const rightLength = rightMatch ? rightMatch[0].length : 0;
+
+    const start = span.start - leftLength;
+    const end = span.end + rightLength;
+    if (start === span.start && end === span.end) continue;
+
+    const candidate = text.slice(start, end);
+    const recognised = recogniseInfra(candidate);
+    // The widened string has to be an entity the recogniser agrees with; otherwise the rule
+    // guessed and the original span stands.
+    if (!recognised || recognised.infraType !== rule.type) continue;
+    if (!best || (end - start) > (best.end - best.start)) {
+      best = {
+        start,
+        end,
+        infraType: recognised.infraType,
+        certainty: recognised.certainty,
+        evidence: ["infra_envelope", `infra_envelope:${rule.type.toLowerCase()}`, ...recognised.evidence],
+      };
+    }
+  }
+  return best;
+}
+
 /**
  * Classify a span's text as an infrastructure identifier.
  *
@@ -1330,7 +1411,9 @@ export class EntityLedger {
   constructor() { this.byToken = new Map(); }
   record(token, meta) {
     if (this.byToken.has(token)) return this.byToken.get(token);
-    const entityClass = classifyEntityClass(meta);
+    // An envelope-resolved infrastructure entity is INFRA by construction, even when the
+    // detector that produced the span was the entropy detector.
+    const entityClass = meta.infraType ? ENTITY_CLASS.INFRA : classifyEntityClass(meta);
     const entry = {
       token,
       entityClass,
@@ -1346,6 +1429,11 @@ export class EntityLedger {
       // different statements. A GitHub PAT inside a FAILED region is still a PAT.
       coverageStatus: meta.coverageStatus ?? null,
       encodingKind: meta.encodingKind ?? ENCODING_KIND.PLAIN,
+      // Ledger closure for infrastructure: without these two the classification reached
+      // record() and was dropped on the floor here, so entityClassFor() kept answering
+      // UNKNOWN for an envelope the policy had already resolved to EC2_RESOURCE_ID.
+      infraType: meta.infraType ?? null,
+      infraCertainty: meta.infraCertainty ?? null,
     };
     this.byToken.set(token, entry);
     return entry;
@@ -2421,11 +2509,32 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 
   const selected = [];
   for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
-  const sorted = selected.sort((a,b) => a.start-b.start);
+  // A detector boundary is not an entity boundary: widen each span to the enclosing
+  // infrastructure entity and MERGE AGAIN, because the widened span now contains the
+  // detector span and possibly its neighbours. Without re-merging, the detector's narrower
+  // span survives alongside it and a partial replacement can win -- which is how
+  // `i-0a1b2c3d4e5f67890` came out as `i-CRG_...`.
+  const widened = selected.map((span) => {
+    const envelope = resolveInfraEnvelope(text, span);
+    if (!envelope) return span;
+    return {
+      ...span,
+      start: envelope.start,
+      end: envelope.end,
+      infraEnvelope: { infraType: envelope.infraType, certainty: envelope.certainty },
+      evidence: [...new Set([...(span.evidence || []), ...envelope.evidence])],
+    };
+  });
+  const remerged = [];
+  for (const span of widened.slice().sort((a, b) => (b.end - b.start) - (a.end - a.start) || a.start - b.start)) {
+    if (!remerged.some((x) => overlaps(span, x))) remerged.push(span);
+  }
+  const sorted2 = remerged.sort((a,b) => a.start-b.start);
+
   // Last step: an object-level recogniser may impose a representation on a span
   // (Kubernetes Secret.data must stay base64). It only annotates; the caller decides
   // how to publish the replacement.
-  const finalSpans = applyObjectSchema(text, sorted);
+  const finalSpans = applyObjectSchema(text, sorted2);
   return coverage ? coverage.attachTo(finalSpans) : finalSpans;
 }
 
@@ -2532,6 +2641,11 @@ export class RedactionContext {
     const detector = detectorOfSpan(spanMeta);
     return this.entityLedger.record(token, {
       detector,
+      // Ledger closure: the infrastructure classification is recorded on the entity, so
+      // entityClassFor() answers INFRA for a resolved envelope rather than UNKNOWN. The
+      // enveloping evidence is kept with it, so "why is this INFRA" is answerable.
+      infraType: spanMeta.infraEnvelope?.infraType || spanMeta.infra?.infraType || null,
+      infraCertainty: spanMeta.infraEnvelope?.certainty || spanMeta.infra?.certainty || null,
       ruleId: spanMeta.ruleId ?? null,
       evidence: spanMeta.evidence ?? [],
       // The classifier reads this to recognise a strong binding; omitting it here made
@@ -2547,7 +2661,12 @@ export class RedactionContext {
 
   /** E1: the classifier does not change verdicts; it only answers what a token was. */
   entityClassFor(token) {
-    return this.entityLedger.get(token)?.entityClass ?? ENTITY_CLASS.UNKNOWN;
+    const entry = this.entityLedger.get(token);
+    if (!entry) return ENTITY_CLASS.UNKNOWN;
+    // An envelope-resolved entity is INFRA by construction, even though its detector may
+    // have been the entropy detector.
+    if (entry.infraType) return ENTITY_CLASS.INFRA;
+    return entry.entityClass ?? ENTITY_CLASS.UNKNOWN;
   }
 
   async emit(match, encodingKind = ENCODING_KIND.PLAIN) {
@@ -2596,7 +2715,11 @@ export class RedactionContext {
       const detector = detectorOfSpan(s);
       // Context is what lets an anchored form be recognised: `commit <40-hex>` is a git
       // sha, while a bare 40-hex run is shape-ambiguous and must not be preserved.
-      const infra = recogniseInfra(raw, text.slice(Math.max(0, s.start - 64), s.start));
+      const contextBefore = text.slice(Math.max(0, s.start - 64), s.start);
+      // A span already widened to its envelope classifies on the widened text; otherwise
+      // the recogniser would see only the detector's slice of the entity.
+      const infra = recogniseInfra(raw, contextBefore)
+        || (s.infraEnvelope ? recogniseInfra(raw) : null);
       const decision = decideSpanAction({ detector, ruleId: s.ruleId, infra, profile: this.profile });
       this.spanActions.push({
         detector,
@@ -2625,6 +2748,7 @@ export class RedactionContext {
         { ...s, detector, coverageStatus: coverageStatusForSpan(spans, s), infra },
         encodingKind
       );
+      void 0;
       out += visible;
       at = s.end;
     }
