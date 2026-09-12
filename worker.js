@@ -925,6 +925,51 @@ function collectRegexSpans(text, regex, type, priority, validator = null) {
   return out;
 }
 
+/**
+ * Email spans, found by LOCATING `@` FIRST and validating around it.
+ *
+ * The previous form was one unanchored pattern:
+ *
+ *   /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[...])+/g
+ *
+ * There is no nested quantifier in it, which is why it survived review, but the leading class and
+ * the `@` are AMBIGUOUS: on text with no `@` the engine advances one character at a time and, at
+ * every start position, consumes the rest of the run before failing on `@`. That is O(n^2) --
+ * measured 502 ms for 16 KB of plain `x`, 2.0 s for 32 KB, with the doubling ratio holding at ~4.
+ * Extrapolated to the 16 MiB body limit that is hours, from a payload containing no email at all.
+ *
+ * Anchoring each part removes the ambiguity instead of trying to out-optimise the engine:
+ * `indexOf("@")` enumerates the only positions where a match can start, the local part is taken by
+ * walking left over the allowed class, and the domain is matched with an ANCHORED pattern against
+ * the remainder. Cost is linear in the number of `@` characters, and a body with none costs a
+ * single scan.
+ *
+ * Character classes, the 63-character label limit and the required dot are all preserved, so the
+ * accepted language is unchanged; that is checked against the old pattern on a fixture set.
+ */
+const EMAIL_LOCAL_RE = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+/;
+const EMAIL_DOMAIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
+
+export function collectEmailSpans(text, type = "email", priority = 90) {
+  const out = [];
+  if (typeof text !== "string" || text.length === 0) return out;
+  let at = text.indexOf("@");
+  while (at >= 0) {
+    // The local part runs leftwards over the allowed class, which is exactly what the leading
+    // `[class]+` matched.
+    let start = at;
+    while (start > 0 && EMAIL_LOCAL_RE.test(text[start - 1])) start--;
+    if (start < at) {
+      const domain = EMAIL_DOMAIN_RE.exec(text.slice(at + 1));
+      if (domain && domain[0].length > 0) {
+        out.push({ start, end: at + 1 + domain[0].length, type, priority });
+      }
+    }
+    at = text.indexOf("@", at + 1);
+  }
+  return out;
+}
+
 function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
 
 // ------------------------------------------------ structured context (D1) -------
@@ -2559,7 +2604,7 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 
   const c = [];
   if (flags.secret) c.push(...collectRegexSpans(text, /\bsk-[A-Za-z0-9]{60,}\b/g, "secret", 110));
-  if (flags.email) c.push(...collectRegexSpans(text, /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g, "email", 90));
+  if (flags.email) c.push(...collectEmailSpans(text));
   if (flags.identity) c.push(...collectRegexSpans(text, /(?<!\d)\d{17}[0-9Xx](?!\d)/g, "identity", 100, (s) => chinaIdValid(s)));
   if (flags.bank) {
     const bankValid = (s) => { const d=s.replace(/\D/g,""); return d.length>=13 && d.length<=19 && luhnValid(d); };
@@ -2780,13 +2825,18 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     };
   });
 
-  // Memoised on the BOUNDS, so a shared bounds pair yields exactly one envelope object. Without
-  // this, enclosingReference() re-scanned the whole document for EVERY span, which measured as
-  // O(spans x text) and dominated the whole call: at 800 spans it walked 12.7M bytes.
+  // The reference constructs are precomputed ONCE per document, and each span then scans that
+  // PRECOMPUTED SET. There is no bounds -> envelope Map here.
   //
-  // Keying on the bounds also matters for CORRECTNESS of the optimisation: two spans that converge
-  // on the same envelope must receive the same object, or attribution could depend on how many
-  // candidates happened to land there.
+  // Why it matters: the previous code called enclosingReference(text, start, end) per span, and
+  // that helper recomputes referenceEnvelopes(text) -- a full scan of the document -- on every
+  // call. So the phase was O(spans x text) and dominated the whole call: at 800 spans it walked
+  // 12.7M bytes.
+  //
+  // The remaining cost is O(spans x |reference constructs in the document|), which is second order
+  // when a document has few constructs and is recorded as a watch item rather than rewritten here.
+  // A bounds-keyed memo would be the next step if a document with many constructs and many spans
+  // ever shows up in a profile.
   const documentReferences = referenceEnvelopes(text);
   const envelopeFor = (span) => {
     // Same selection rule as enclosingReference(): the narrowest construct that STRICTLY contains

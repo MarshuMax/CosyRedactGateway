@@ -9,7 +9,8 @@
     "start": "node node-server.mjs",
     "entropy-report": "node scripts/entropy-report.mjs",
     "perf": "node scripts/perf.mjs",
-    "perf:soak": "node scripts/perf.mjs --soak"
+    "perf:soak": "node scripts/perf.mjs --soak",
+    "perf:redos": "node scripts/perf-redos.mjs"
   },
   "engines": {
     "node": ">=20"

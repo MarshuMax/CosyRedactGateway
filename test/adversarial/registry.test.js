@@ -374,7 +374,9 @@ test("R2-REG: the corpus file is well-formed and every finding is complete [GREE
     for (const key of required) {
       assert.ok(f[key] !== undefined && f[key] !== "", `${f.id}: field ${key} is required`);
     }
-    assert.match(f.id, /^R2-[A-Z]+-\d{3}$/, `bad id: ${f.id}`);
+    // The corpus holds findings from R2 and R3, so the prefix is a phase marker rather than a
+    // fixed literal. A regex pinned to `R2-` rejects a legitimate later finding.
+    assert.match(f.id, /^R[23]-[A-Z]+-\d{3}$/, `bad id: ${f.id}`);
     assert.ok(["open", "fixed", "accepted"].includes(f.status), `bad status for ${f.id}: ${f.status}`);
   }
   // The fixed finding must actually be marked fixed, or the registry is lying about the tree.
