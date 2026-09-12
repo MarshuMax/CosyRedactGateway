@@ -27,7 +27,16 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext, REDACTED_TOKEN, isRedactedText } from "../worker.js";
+import {
+  RedactionContext,
+  REDACTED_TOKEN,
+  REDACTED_TOKEN_ONE,
+  TOKEN_PREFIX,
+  TOKEN_LENGTH,
+  isRedactedText,
+} from "../worker.js";
+
+const ALL = { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true };
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -257,4 +266,90 @@ test("same plaintext within one request reuses one token [COUPLING]", async () =
   const tokens = (await ctx.redactText(payload, { gitleaks: true })).match(REDACTED_TOKEN);
   assert.equal(tokens.length, 2, "fixture must produce one token per occurrence");
   assert.equal(tokens[0], tokens[1], "two occurrences of one plaintext in one payload must share a token");
+});
+
+// =================================== R0.2.1 token identity invariants ================
+//
+// The document used to claim "entity-id is randomly generated per entity; auto-increment is
+// forbidden", while the implementation allocates `this.nextToken += 1`. The claim was wrong,
+// and it named the wrong security property: cross-request unlinkability comes from the random
+// request-id, not from entity-id randomness. These tests pin what is actually true.
+
+test("R0.2.1: request-id is per-request random and differs across requests [GREEN NOW]", async () => {
+  const ids = new Set();
+  for (let i = 0; i < 24; i++) ids.add(new RedactionContext({ salt: "fixed" }).requestId);
+  assert.equal(ids.size, 24, "every request must get its own id");
+
+  // Two requests redacting the SAME plaintext must not share a token: that is what makes
+  // tokens unlinkable across requests.
+  const a = await new RedactionContext({ salt: "fixed" }).redactText("DB_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY", ALL);
+  const b = await new RedactionContext({ salt: "fixed" }).redactText("DB_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY", ALL);
+  const tokenOf = (t) => t.match(REDACTED_TOKEN_ONE)[0];
+  assert.notEqual(tokenOf(a), tokenOf(b), "same plaintext, different request, different token");
+});
+
+test("R0.2.1: entity-id is a request-local allocation counter, and that is intended [GREEN NOW]", async () => {
+  const ctx = new RedactionContext({ salt: "fixed" });
+  const out = await ctx.redactText(
+    ["DB_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY", "API_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a"].join("\n"),
+    ALL
+  );
+  const ids = [...out.matchAll(/CRG_[A-Z0-9]+_([A-Z0-9]+)/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ["0001", "0002"], "allocated in order, not drawn at random");
+
+  // Same plaintext twice in one request reuses one token: the counter is what makes that
+  // lookup cheap, and it is a documented property rather than an accident.
+  const again = await ctx.redactText("x=wJalrXUtnFEMIK7MDENGbPxRfiCY", ALL);
+  assert.ok(again.includes("CRG_") && again.includes(ids[0]), "the same value reuses its token");
+});
+
+test("R0.2.1: no token component is derived from the plaintext [GREEN NOW]", async () => {
+  // The real invariant. A component derived from the secret would be an offline oracle for
+  // low-entropy values: guess the PIN, compute the expected component, compare.
+  //
+  // Two directions, because either alone is unconvincing:
+  //
+  //   same position in a fresh request -> same entity-id regardless of the secret
+  //   successive values in ONE request -> ids follow ALLOCATION ORDER, not the values
+  const secrets = ["0000", "1234", "9999", "wJalrXUtnFEMIK7MDENGbPxRfiCY"];
+
+  const firstIds = [];
+  for (const secret of secrets) {
+    // A fixed request-id makes the entity-id the only variable part.
+    const ctx = new RedactionContext({ salt: "fixed", requestId: "AAAAAA" });
+    const out = await ctx.redactText(`DB_PASSWORD=${secret}`, ALL);
+    const token = out.match(REDACTED_TOKEN_ONE)?.[0] ?? null;
+    assert.ok(token, `fixture must redact ${secret}`);
+    firstIds.push(token.split("_")[2]);
+  }
+  assert.deepEqual(
+    [...new Set(firstIds)], ["0001"],
+    `the first allocation is 0001 whatever the value: ${JSON.stringify(firstIds)}`
+  );
+
+  // Now several DISTINCT values inside one request: the ids must count up in allocation
+  // order, and a repeated value must keep the token it already has rather than taking a new
+  // one. (The fixture needs values a detector actually claims, and strong keys to raise them;
+  // `K0=0000` is neither, which is why an earlier version of this test saw a single id.)
+  const ctx = new RedactionContext({ salt: "fixed", requestId: "AAAAAA" });
+  const out = await ctx.redactText(
+    [
+      "DB_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY",
+      "API_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+      "DB_PASSWORD=wJalrXUtnFEMIK7MDENGbPxRfiCY",
+      "SECRET_KEY=cGFzc3dvcmQxMjM0NTY3OA==",
+    ].join("\n"),
+    ALL
+  );
+  const ids = [...out.matchAll(/CRG_AAAAAA_([A-Z0-9]+)/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ["0001", "0002", "0001", "0003"], "counting allocation, with reuse for a repeat");
+});
+
+test("R0.2.1: the token carries no checksum or derived component [GREEN NOW]", () => {
+  // Structure is exactly prefix + two identifiers: nothing is left over for a verifier.
+  assert.match(TOKEN_PREFIX, /^CRG_$/);
+  const shape = new RegExp(`^${TOKEN_PREFIX}[A-Z0-9]{${6}}_[A-Z0-9]{${4}}$`);
+  const sample = `${TOKEN_PREFIX}${"A".repeat(6)}_${"0".repeat(4)}`;
+  assert.ok(shape.test(sample), "the declared shape has no room for a third component");
+  assert.equal(TOKEN_LENGTH, TOKEN_PREFIX.length + 6 + 1 + 4, "length is derived from the widths");
 });

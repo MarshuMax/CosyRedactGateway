@@ -12,10 +12,18 @@ const FLAG_NAMES = Object.freeze({
   G: "gitleaks",
 });
 
+// The notice is a RUNTIME PROMISE to the model, so it has to describe the sink policy that
+// actually exists. It previously ended with "placeholders you emit in text or tool calls are
+// restored to the original secrets", which G0 made false: an untrusted tool argument PRESERVES
+// a known token and BLOCKS an unresolvable one, and only assistant prose (or an explicitly
+// trusted broker) restores. A notice promising restoration everywhere invites the model to
+// write credentials into tool calls and then report a failure when they are not resolved.
 export const REDACT_NOTICE =
   "Sensitive values are redacted before forwarding, including messages, tool inputs, and tool results. " +
   "You may see CRG_ tokens; treat them as opaque and preserve them exactly. " +
-  "Sensitive values you read appear as placeholders, and placeholders you emit in text or tool calls are restored to the original secrets.";
+  "Do not decode, modify, or invent CRG_ tokens. " +
+  "Whether a token is restored, preserved, or blocked depends on the output channel and trust policy; " +
+  "do not assume that tool arguments can resolve tokens.";
 
 // v2 token format. Charset [A-Z0-9_] is a portable subset that needs no escaping
 // in .env, shell, YAML plain scalars, URL query values or HTTP header values.

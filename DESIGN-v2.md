@@ -223,7 +223,18 @@ CRG_<request-id>_<entity-id>
 - 边界断言用**否定字符类** `(?<![A-Za-z0-9_])…(?![A-Za-z0-9_])`，不能用 `\b`：`_` 是词字符，`\b` 在 `…_CRG_` 这类拼接处不成立，会漏配合法 token。
 - 字符集不含 `{ } " ' : @ ! = & ? / +`，`[A-Z0-9_]` 在 URL query（RFC 3986 unreserved）、shell、`.env` key、YAML plain scalar、HTTP header 中都不需要转义。
 - **受保护 span 的资格只能来自登记，不能来自形状**：`findSensitiveSpans` 不做任何形状 fallback，未传资格即保护为空；`RedactionContext` 以谓词 `isProtectedToken = (v) => tokenToRaw.has(v)` 提供资格。这既支持"铸号过程中产生的新 token"（legacy 重新铸号），也避免任何人用 `CRG_` 形状的标签把秘密夹带过检测。
-- `request-id` 每请求随机生成；`entity-id` 每实体随机生成，**禁止自增计数**，也禁止任何由明文派生的取值。
+- **`request-id` = 每请求 CSPRNG 生成**（`createRequestId()`，宽度 6）。这是跨请求不可关联性的**唯一**来源。
+- **`entity-id` = 请求内单调分配计数器**（`this.nextToken += 1`，宽度 4，base36 大写）。**不是随机的，也不应该是**——它只需在请求内唯一，并让"同一明文复用同一 token"成为一次廉价查表。
+- **两者都不得由明文派生**（不得有 checksum / hash / oracle）。
+
+> **更正（R0.2.1）**：本节此前写的是"`entity-id` 每实体随机生成，**禁止自增计数**"，与实现直接冲突，而且**指错了安全属性**。真正的不变量不是"entity-id 必须随机"，而是：
+>
+> ```
+> cross-request unlinkability  ← 随机 request-id
+> no offline oracle            ← 明文不得产生任何 checksum / hash / 取值
+> ```
+>
+> 手工验证：四个不同明文（`0000` / `1234` / `9999` / 一个 AWS key）在同一请求位置各得到一个全新 context，**都拿到 `_0001`**——entity-id 与明文完全无关。不变量测试见 `test/token-syntax.test.js` 的 `R0.2.1` 组。
 - 同一请求内同一明文复用同一 token；跨请求必须重新随机。
 - **不带任何由原文派生的 checksum**：派生校验位会给低熵秘密（PIN、卡号、短密码）提供离线猜测验证器。该风险已量化为测试：对 `0000 / 1234 / 9999` 取 `djb2` 哈希，高 16 位几乎恒定（`7c53`–`7c58`），只有低位可分（低 2 位 hex 分别为 `05 / 41 / 45`）——"看起来很强"的高位截断 checksum 在它本该保护的候选空间上几乎是常量。
 - token 必须自识别（固定前缀），使未知 token 能被识别为"受保护形状"而不是普通文本（见 6.8、8.4）。
@@ -1426,7 +1437,25 @@ x: ${{ a: "}" }}   →  envelope 覆盖 ${{ a: "}" }，一个 } 留在外面
 
 > **reference envelope 是"花括号平衡"的构造。引号内的花括号不被区分，因此含字符串内非平衡花括号的构造不被可靠识别。**
 
-后果有界且安全：**envelope 偏短只会导致替换得更多（span 变宽），永不泄漏**。它可能破坏宿主语法——这正是该限制被记录而不是被默默容忍的原因。测试同时断言"在 contract 内的所有括号位置变体均完整覆盖"。
+**后果必须相对两个不同的参照物分别说明**（此前写成"envelope 偏短只会替换更多、span 变宽"，**方向说反了**）：
+
+```
+相对 detector span:
+    envelope 仍可能是 WIDEN —— mutation 范围比检测器识别的那一段更大
+
+相对真正的 reference construct:
+    提前闭合的 envelope 是 UNDER-COVER —— 覆盖不足
+
+current known consequence:
+    已检测到的 secret 字节仍然会消失（confidentiality 未破）
+    但宿主语法可能被留下不完整（syntax integrity 无保证）
+
+therefore:
+    无已知 confidentiality fail-open
+    quoted-brace 情形下 syntax integrity 不做保证
+```
+
+"替换更多"只在**相对 detector span** 时成立；相对构造本身它是**覆盖不足**。两句混用会让读者以为 envelope 错误只会过度替换、不会遗漏——那正是最需要避免的误读。测试同时断言"在 contract 内的所有括号位置变体均完整覆盖"。
 
 ## 9.24 R0.2 Spec / Test / Runtime Contract Sync
 
@@ -1447,6 +1476,8 @@ x: ${{ a: "}" }}   →  envelope 覆盖 ${{ a: "}" }，一个 } 留在外面
 
 结论：**文档与实现没有行为性漂移**（所有可机械验证的行为断言都成立），漂移集中在**生产注释**与**标签完整性**。
 
+> **R0.2.1 更正**：上面这个结论**下早了**。机械检查覆盖的是"符号/常量/表格数值"这类可抽取的断言，因此漏掉了三处**散文形式的 current-contract 矛盾**——notice 与 sink policy 冲突、§6.5 与实现冲突、R0.1.2 limitation 方向说反。见 9.25。教训：**机械抽取只能覆盖结构化断言，散文断言需要按"每处 claim 都问它今天是否还成立"来过一遍**，而那一步当时没有做。
+
 ### 已修
 
 1. **悬空交叉引用**：`// Policy is a separate layer (see INFRA_POLICY below)` —— `INFRA_POLICY` 常量已不存在（策略现在是 `decideSpanAction` + profile）。改为指向真实符号。
@@ -1456,11 +1487,54 @@ x: ${{ a: "}" }}   →  envelope 覆盖 ${{ a: "}" }，一个 } 留在外面
 
 3. **`REDACT_NOTICE` 正文未进设计文档**。它是**运行时对模型的承诺**，且已被 `proxy.test.js` 断言，但文档从未写出它的正文。补录如下：
 
-   > Sensitive values are redacted before forwarding, including messages, tool inputs, and tool results. You may see CRG_ tokens; treat them as opaque and preserve them exactly. Sensitive values you read appear as placeholders, and placeholders you emit in text or tool calls are restored to the original secrets.
+   > Sensitive values are redacted before forwarding, including messages, tool inputs, and tool results. You may see CRG_ tokens; treat them as opaque and preserve them exactly. Do not decode, modify, or invent CRG_ tokens. Whether a token is restored, preserved, or blocked depends on the output channel and trust policy; do not assume that tool arguments can resolve tokens.
 
-   它的三句分别对应三条契约：**注入范围**（messages / tool inputs / tool results）、**token 不透明性**（模型不得改写）、**双向还原**（正文与 tool calls 都还原）。任何一句失效都是行为变更，却不会有测试失败——这是当前**最薄的一处 contract 覆盖**。
+   **R0.2.1 更正**：此处最初记录的正文末句是 "placeholders you emit in text or tool calls are restored to the original secrets"，该句在 G0 之后**已不成立**——不受信任的 tool argument 对已知 token 是 **PRESERVE**、对无法解析的 token 是 **BLOCK**，只有 assistant 正文或显式 trusted broker 才 RESTORE。已按真实 sink policy 改写（见 9.25）。
+
+   现在的四句各对应一条契约：**注入范围**（messages / tool inputs / tool results）、**token 不透明性与精确保留**、**禁止解码/修改/编造**、**结果取决于 channel 与 trust policy**。语义契约测试见 `test/notice-contract.test.js`——**刻意不做全文字符串冻结**，文案可继续优化，安全语义不能退化。
 
 4. **42 条测试无标签**。标签约定是 `[GREEN NOW]`（现状）/ `[RED]`（目标）/ `[COUPLING]`（耦合约束）；未标注集中在 `core` / `entropy` / `gitleaks` / `proxy` / `stream` / `node-server` / `http-integration` 这些较早的文件。这不是缺陷，但意味着"这条测试在固定现状还是规格"无法从名字判断。
+
+## 9.25 R0.2.1 Contract Truth Pass（已实现）
+
+R0.2 的机械检查漏掉了**三处明确的 current-contract 矛盾**，全部是散文形式的断言。
+
+### ① `REDACT_NOTICE` 与 G0 sink policy 冲突
+
+notice 末句原为 "placeholders you emit in text or tool calls are restored to the original secrets"——**G0 之后不成立**。真实语义：
+
+```
+assistant prose      OWN → may RESTORE
+untrusted tool_arg   OWN → PRESERVE ；unknown / foreign → may BLOCK
+trusted broker       OWN → may RESTORE
+```
+
+一句话承诺"tool calls 会还原"会诱导模型把凭据写进 tool call，然后在未解析时表现为无法解释的工具错误。已按真实策略改写，并**不做全文字符串冻结**，改为语义契约测试 `test/notice-contract.test.js`：
+
+- 必须称 token 为 opaque、要求 preserve exactly
+- 必须禁止 decode / modify / invent
+- 必须声明结果取决于 **output channel** 与 **trust policy**，且三种结果都点名
+- **不得出现 blanket 承诺**（正则否定：`tool calls?…are restored`、`all (placeholders|tokens)…restored` 等）
+- 必须写明"不要假设 tool arguments 能解析 token"
+- 必须声明注入范围；且正文无内嵌换行
+
+### ② §6.5 与生产实现冲突
+
+文档写"`entity-id` 每实体随机生成，**禁止自增计数**"；实现是 `this.nextToken += 1`。**文档错，而且指错了安全属性**：
+
+```
+request-id = 每请求 CSPRNG          ← cross-request unlinkability 的唯一来源
+entity-id  = 请求内单调分配计数器    ← 只需请求内唯一 + 让同明文复用成为廉价查表
+两者都不得由明文派生                  ← 不得有 checksum / hash / oracle
+```
+
+手工验证：四个不同明文（`0000`/`1234`/`9999`/AWS key）在同一请求位置各得一个全新 context，**都拿到 `_0001`**，与明文完全无关。
+
+不变量测试（`test/token-syntax.test.js` 的 `R0.2.1` 组）：request-id 跨请求互异且同明文得到不同 token；entity-id 按分配序递增且同请求内复用；首位置与明文无关；token 形状无第三个分量可容纳 checksum；`TOKEN_LENGTH` 由宽度派生。
+
+### ③ R0.1.2 limitation 方向说反
+
+原表述"envelope 偏短只会导致替换得更多（span 变宽），永不泄漏"——**只在相对 detector span 时成立**；相对真正的 reference construct 它是 **UNDER-COVER**。已改为相对两个参照物分别说明，并明确当前后果：**已检测到的 secret 字节仍会消失（无已知 confidentiality fail-open），但 quoted-brace 情形的 syntax integrity 不做保证。**
 
 ## 10. 未解决问题 / 待验证
 
