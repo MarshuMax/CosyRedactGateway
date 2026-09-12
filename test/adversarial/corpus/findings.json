@@ -38,6 +38,19 @@
       "relationship": "INDEPENDENT of R2-REG-001. Verified by stashing the stateful-matcher fix and re-running: the behaviour above is identical before and after, so it is pre-existing and was neither caused nor cured by that fix. Deliberately NOT folded into R2-REG-001, per the rule that several red points are usually not one root cause.",
       "fix": "namespaceFindAll is now a real DOCUMENT SEARCH while namespaceOf keeps the matcher's declared semantics unchanged. The scan runs on a clone with y removed and g ensured, and every candidate it proposes is re-checked against the ORIGINAL matcher, so discovery is not authority and the registry's own matcher is never permanently rewritten. namespaceOf(TOKEN) = acme and namespaceOf(prefix + TOKEN) = null are both unchanged for a sticky matcher.",
       "regression": "test/adversarial/registry.test.js -- membership unchanged in both directions for sticky; the operand is now refused; prose still preserves; the registry keeps its declared flags; every flag combination scans AND keeps its membership semantics (only y/gy are anchored, corrected from an earlier table that wrongly expected gi to be anchored); and admission is not widened, asserted on classifyOwnership rather than on a span, with a case-sensitivity control."
+    },
+    {
+      "id": "R2-REP-001",
+      "seed": "0x2e610005",
+      "input": "A=cGFzc3dvcmQxMjM0NTY3OA==   (minimal)\napiVersion: v1\\nkind: Secret\\ndata:\\n  a: cGFzc3dvcmQxMjM0NTY3OA==\\n  b: cGFzc3dvcmQxMjM0NTY3OA==   (K8s path)",
+      "config": "flags gitleaks+highEntropy; default profile",
+      "expected_invariant": "The replacement is self-delimiting: a redaction replaces a whole value and leaves NO characters of the original beside it. R1 already pins that every emitted token matches ^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$ and that no truncated PREFIX survives; the converse -- a complete replacement with leftover characters glued to it -- is the uncovered half.",
+      "observed": "The entropy detector's span stops before base64 padding, so the padding survives next to the replacement. Minimal: `A=cGFzc3dvcmQxMjM0NTY3OA==` becomes `A=CRG_AAAAAA_0001==`, and the single-padding form becomes `A=CRG_AAAAAA_0001=`. In a K8s Secret the two occurrences of one plaintext produce two spans that differ by the padding -- gitleaks takes the padded form, entropy the unpadded one -- which overlap WITHOUT containment, so the merge keeps both and the second yields `b: Q1JHX0FBQUFBQV8wMDAy==`, a base64 encode of a second token with the ORIGINAL padding appended. Two occurrences of one plaintext therefore get two different replacements.",
+      "impact": "Integrity and representation correctness, in every context rather than only K8s: the emitted value is neither the replacement nor the original, `CRG_AAAAAA_0001==` is not a token and is not valid base64 either, and one plaintext acquires two identities. Round-trip happens to survive because the residual `==` is still the original's padding and restoration is substring-based -- asserted, so the claim is exact. No confidentiality fail-open was found.",
+      "status": "open",
+      "reproduce": "node --test test/adversarial/representation.test.js (tests R2-REP-001)",
+      "verified_pre_existing": "Confirmed with `git stash` that the behaviour is identical with and without the R2-REG-001/R2-REG-002 fixes, so it is not related to those.",
+      "why_r1_missed_it": "R1's token-shape property removes every full token and then checks that no `CRG_` PREFIX remains. Residue that sits AFTER a complete token is invisible to that check, so the property only covered truncation, not trailing leftovers."
     }
   ]
 }

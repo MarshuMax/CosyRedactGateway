@@ -2068,6 +2068,68 @@ hard-only redacts X  ⟹  hard+soft 也必须 redacts X
 
 **差分 oracle 正是为这种情形设计的正确工具**：它不关心内部哪个 span 胜出，只问"增加 detector 后 hard 内容是否仍被移除"。
 
+> **措辞更正**：不要写成"`classifiedText` 消除了顺序敏感性"——这超出了实测强度。准确表述是：**internal survivor may be order-sensitive; security outcome was order-invariant in the exercised corpus.**（内部胜出者可能对顺序敏感；安全性结果在已遍历的 corpus 中与顺序无关。）
+
+## 9.33 R2.5 Representation / Ownership / Ledger Adversarial（**1 finding**）
+
+优先级按"跨层 authority + request-local state"排。
+
+### ① SurrogateLedger exact authority —— 不变量成立
+
+7 种表示 × 多种上下文实测：
+
+```
+real OWN token                  → OWN       protected
+real ledger surrogate           → OWN       protected
+forged CRG                      → UNKNOWN   not protected
+base64(forged CRG)              → UNKNOWN   not protected
+double-base64(real token)       → UNKNOWN   not protected
+double-base64(forged)           → UNKNOWN   not protected
+surrogate then base64           → UNKNOWN   not protected
+```
+
+**关键事实**：surrogate 方案就是 `base64(token)`，故 `b64(realToken) === realSurrogate`。这意味着 **"base64 一个 token" 与 "登记一个 surrogate" 是同一件事**，因此"未登记的 base64(real token)"不构成独立情形——它要么就是该 surrogate（命中 ledger），要么不是 token 的编码。**ledger 精确映射是唯一权威。**
+
+**总 oracle 无违约**：`plaintext appears ⇒ exactly ownership AND sink restore authority`（6 上下文 × 2 表示 × 6 sink × 2 trust = 144 组）。
+
+### ② EntityLedger first-write-wins
+
+同一明文跨 occurrence / schema / path 时**复用同一 token identity**（5 种排列实测）。账本保持**首条记录**，故元数据字段（`syntax` / `pathSegments`）**对顺序敏感**——按你的要求**这不单独判为 finding**，只在它影响安全结果时升级。实测安全性结果与顺序无关（两序都脱敏、往返都精确）。
+
+### ③ restoreText 两阶段级联 —— 未发生
+
+构造 `tokenToRaw: {outer → inner(CRG-looking), inner → plaintext}`，验证 `restoreText(outer)` **单趟**返回 `inner`，不会继续解析成明文。**无级联。**
+
+### R2-REP-001（open，未修）
+
+**一个真实 finding。** 在 K8s Secret 文档探索中发现。
+
+**最小复现**：
+
+```
+A=cGFzc3dvcmQxMjM0NTY3OA==   →  A=CRG_AAAAAA_0001==     ❌ padding 残留
+A=cGFzc3dvcmQxMjM0NTY3OA=    →  A=CRG_AAAAAA_0001=      ❌
+A=cGFzc3dvcmQxMjM0NTY3OA     →  A=CRG_AAAAAA_0001       ✅
+```
+
+**K8s 路径**（同一明文的两个 occurrence 产生**两个不同 span**）：
+
+```
+data:
+  a: cGFzc3dvcmQxMjM0NTY3OA==  →  Q1JHX0FBQUFBQV8wMDAx      （正确）
+  b: cGFzc3dvcmQxMjM0NTY3OA==  →  Q1JHX0FBQUFBQV8wMDAy==    （截断编码 + 原 padding）
+```
+
+根因：**entropy span 停在 base64 padding 之前**，而 gitleaks span 包含 padding。两个 span **重叠但互不包含** ⇒ merge 全部保留 ⇒ 同一明文得到**两个不同替换件**，第二个是"token 的 base64 编码 + 原 padding"。
+
+**违反的契约**：替换件必须**自定界**。R1 已固定"每个发出的 token 匹配 `^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$`"且"无截断前缀残留"——**但"完整替换件之后粘着残留字符"这另一半从未被覆盖**。`CRG_AAAAAA_0001==` 既不是 token、也不是合法 base64、也不是原值。
+
+**影响**：integrity / representation correctness，**在 K8s 之外同样成立**（`A=...` 最小复现）。同一明文获得两个 identity。**无 confidentiality fail-open**；往返恰好仍正确（残留 `==` 仍是原值的 padding，且 restore 基于子串），已在测试中单独断言以保证结论精确。
+
+**既有性**：`git stash` 验证修复前后行为一致 ⇒ 与 R2-REG-001/002 无关。
+
+**R1 为何漏掉**：R1 的 token-shape 性质先移除所有完整 token、再检查无 `CRG_` **前缀**残留。**位于完整 token 之后**的残留对该检查不可见——该性质只覆盖了截断，没覆盖尾部残留。这是**性质表述不完整**，不是实现回归。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
