@@ -99,6 +99,20 @@
       "next_step": "A correct fix has to keep per-position results while sharing the failure information. Two candidates: (a) scan once and record, for every position, the index where a balanced scan from there stops, then reuse those stops -- which is linear because the stop indices are monotone; (b) restructure to a single stack-based pass that emits constructs as it closes them, which is the conventional way to parse nested delimiters in one pass. Both need the exhaustive equivalence check above as the acceptance gate.",
       "regression": "scripts/perf-redos.mjs families C-reference-unclosed, C-reference-depth and C-reference-siblings, all reporting amplifying adversarial/control ratios. No bounded reproducer is in the ordinary suite yet, because the fix is not in.",
       "found_via": "The sweep's per-family summary. Note that three OTHER families that appeared as TIMEOUT in the pre-fix sweep (A-assignment-quote, A-assignment-separators, B-provider-wrong-tail) were NOT regex problems at all: their adversarial/control ratio was 1.00-1.07, i.e. both sides were equally slow because of the email detector. After the email fix they measure 24ms, 19ms and 37ms at 131072 bytes with linear exponents. That is exactly why a same-length control is required -- without it, a shared quadratic term reads as a regex finding."
+    },
+    {
+      "id": "R3-REDOS-003",
+      "seed": "n/a (deterministic pathological input)",
+      "input": "'k' + ' '.repeat(n - 2) + ':'   -- one character, a long run of spaces, a colon",
+      "config": "any flag set; parseYamlBindings() runs on every document",
+      "expected_invariant": "Trimming trailing whitespace from a line is a linear walk from the end. No single-line operation may cost superlinear time.",
+      "observed": "`line.replace(/\\s+$/, \"\")` -- and `replace(/[ \\t]+$/, \"\")` just as badly -- is QUADRATIC on a long trailing run: the greedy `+` tries the longest run, fails the end anchor, then retries one character shorter, so O(n) attempts per line. In a document split into many lines whose total length is n, one long line makes it O(n^2) and many lines make it O(n^3). Measured through parseYamlBindings on 'k' + spaces + ':': 7.32ms at 2 KB, 113ms at 8 KB, 1806ms at 32 KB, with the doubling ratio holding at ~16.",
+      "impact": "Availability / DoS, and the most reachable of the three regex findings: no special characters are needed, only a long run of spaces followed by a colon. It runs on every request regardless of which detectors are enabled, and it showed up as amplifying adversarial/control ratios in the sweep (10.36 -> 22.80 -> 48.68).",
+      "status": "fixed",
+      "root_cause": "Greedy quantifier plus end anchor in a trailing-trim regex. The engine cannot know the run length without trying, and each failed attempt is re-anchored at the end of the string.",
+      "fix": "stripTrailing(text, isStrip) walks backwards once and stops at the first character outside the set. Both regex forms are replaced, not only the `\\s` one, because `[ \\t]+$` measured just as badly (1985ms at 32768). `String.prototype.trimEnd()` would also be linear but strips a fixed Unicode set, so a character walk was used instead to keep each call site's exact set. Four sites: parseYamlBindings' trimmedEnd, the block-scalar region end, the block-scalar body line, and splitPlainScalar's value. Equivalence was checked EXHAUSTIVELY against both original regexes over every string of length 0..4 on a 9-character alphabet including NBSP and ideographic space: 7381/7381 identical. Measured after the fix at 32 KB: 1806ms -> 3.43ms.",
+      "regression": "scripts/perf-redos.mjs family A-assignment-delimiter, whose adversarial/control ratio is the detector for this class.",
+      "measurement_note": "This finding was NOT in a regex I suspected. The YAML mapping pattern, `([^\\s:#][^:#]*?)[ \\t]*:`, does contain an ambiguous nested quantifier and measured 0.044ms -- innocent. Isolating each STEP of the same line (exec, trimEnd, dash-strip) is what located the real cost."
     }
   ]
 }
