@@ -1536,6 +1536,44 @@ entity-id  = 请求内单调分配计数器    ← 只需请求内唯一 + 让�
 
 原表述"envelope 偏短只会导致替换得更多（span 变宽），永不泄漏"——**只在相对 detector span 时成立**；相对真正的 reference construct 它是 **UNDER-COVER**。已改为相对两个参照物分别说明，并明确当前后果：**已检测到的 secret 字节仍会消失（无已知 confidentiality fail-open），但 quoted-brace 情形的 syntax integrity 不做保证。**
 
+## 9.26 R0.3 Production Context Wiring（已实现）
+
+两个**程序化生产输入**在底层被支持、但从未到达请求侧 `RedactionContext`。两处都很容易被漏掉，因为**每个特性看起来都已接线**：
+
+| 输入 | 症状 |
+|---|---|
+| `foreignRegistry` | **响应**路径拿到了它，所以 G0.1 的 response E2E 全绿；而**去程**仍把一个本应保留的 foreign token 重新铸号 |
+| `profile` | `RedactionContext` 支持它，但 `handleRequest` 从不传，因此部署方**无法**通过生产入口选择 profile |
+
+修正：`handleRequest` 的 ctx 构造现在传 `foreignRegistry` 与 `profile: options.profile`。
+
+### 端到端实测（全部穿 `handleRequest`）
+
+```
+foreign + registry（去程保留）    DB_PASSWORD=ACME_ABCDEF_0001 → 原样
+foreign 无 registry（普通策略）    → DB_PASSWORD=CRG_...
+EC2 id + DEFAULT（脱敏）          → instance: CRG_...
+EC2 id + DEVOPS（保留）           → instance: i-0a1b2c3d4e5f67890
+hard cred + DEVOPS（仍脱敏）      → DB_PASSWORD=CRG_...
+registry + DEVOPS（两者独立）      → 均按各自规则
+```
+
+### 为什么此前没被发现
+
+**这两个缺口都只在 `RedactionContext` 单测下不可见**——单元是对的，接线不是。与此前 G0（`classifyRestore` 零调用点）和 G0.1（registry 只在响应路径）是**同一个失败模式**：
+
+> helper 正确、生产没接线；而测试只测 helper。
+
+因此本刀的 9 条测试**全部穿 `handleRequest()`**，其中一条专门断言 `handleRequest` 确实把两个参数传给了 ctx。
+
+### 一处夹具教训（第三次同源）
+
+写"未传 profile 时用默认值"时，我断言 `implicit === explicit`——**跨请求 token 必然不同**（request-id 每请求随机，正是 R0.2.1 刚固定的不变量）。已改为比较**结果形状**而非字节。
+
+### 未做（刻意）
+
+没有为 profile 发明环境变量名。`REDACT_INFRA_PROFILE=devops` 之类属于**部署配置 hardening**，本刀只保证**程序化生产路径真实可用**。测试中有一条断言 `worker.js` 里没有出现 `env?.` 形式的 PROFILE / INFRA 变量。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

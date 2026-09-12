@@ -3682,7 +3682,14 @@ export async function handleRequest(request, env = {}, options = {}) {
     || (env?.REDACT_TRUSTED_BROKERS ? String(env.REDACT_TRUSTED_BROKERS).split(",").map((x) => x.trim()).filter(Boolean) : null);
   const maxBody=intSetting(env?.REDACT_MAX_BODY_BYTES,DEFAULT_MAX_BODY_BYTES);
   const maxRedactions=intSetting(env?.REDACT_MAX_REDACTIONS,DEFAULT_MAX_REDACTIONS);
-  const ctx=new RedactionContext({salt:options.salt || RUNTIME_SALT,maxRedactions});
+  // Both of these are PROGRAMMATIC production inputs, not test-only knobs, and both were
+  // missing here. The consequences were easy to miss because each feature looked wired:
+  //
+  //   foreignRegistry -- the RESPONSE path received it, so the G0.1 response E2E passed
+  //     while the forward path still re-tokenised a foreign token it should preserve.
+  //   profile         -- RedactionContext honoured it, but nothing ever passed one, so a
+  //     deployment could not actually choose a profile through the production entry point.
+  const ctx=new RedactionContext({salt:options.salt || RUNTIME_SALT,maxRedactions,foreignRegistry,profile:options.profile});
   const headers=filteredRequestHeaders(request.headers);
   let body;
   if (request.method !== "GET" && request.method !== "HEAD") {
