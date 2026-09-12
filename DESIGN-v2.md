@@ -2207,6 +2207,71 @@ canonical ==          → 扩大 ✅（否则前述 controls 全部空转）
 
 `G only` 时 gitleaks **不报**这个 base64 块——该规则**自带 entropy 门槛**，H 关闭即不命中，因而输出原样。所以"无 padding 残留"只在该 flag 组合确实发生脱敏时才适用。
 
+## 9.34 R2.6 Nested Tool Operand（已实现，**无新 finding**）
+
+### scope 明确限定为 JSON-reachable values
+
+`object` / `array` / `string` / `number` / `boolean` / `null`。
+
+**明确不作为 finding**：cyclic object、`Map`/`Set`/`Date`、getter/Proxy、sparse array、custom prototype——这些属于 **JS API robustness**，不是当前 wire contract。**stack/depth exhaustion 留给 R3。**
+
+### 核心 oracle：differential
+
+```
+nestedResult(x) === applySinkPolicy(x, TOOL_ARGUMENT, same toolName/trust)
+```
+
+**递归 walker 只负责 traversal，不应发明第二份 policy。** 这条比"自己再写一张 OWN/FOREIGN 应该怎样的期望表"强得多——后者会成为**会漂移的 policy 副本**。
+
+### 六条 invariant 实测
+
+| # | invariant | 结果 |
+|---|---|---|
+| 1 | 每个 string VALUE leaf 执行同一 tool_argument policy | ✅ |
+| 2 | 深度不改变 policy（depth 1/2/5/10/20/50 × object/array × 4 种 authority × 2 trust） | ✅ |
+| 3 | 非 string value 逐值不变 | ✅ |
+| 4 | container shape 不变（含 object/array/array-of-array/empty） | ✅ |
+| 5 | **object KEY 不改写**（key 长得像 token 也保留原 key） | ✅ |
+| 6 | 一个 sibling 不污染另一个 | ✅ |
+
+**第 5 条是刻意的**：重命名 JSON key 会改变 tool schema，**比保留 opaque token 更危险**。walker 也不尝试 restore key。
+
+### 遍历顺序无关
+
+`OWN first` / `OWN last`、property 顺序交换、array 顺序交换——**每个 leaf 的结果只依赖 leaf 本身 + tool trust**，并逐元素与其**直接 policy 结果**相等。
+
+### Anthropic 生产 E2E（补上你指出的缺口）
+
+真正调用递归 walker 的生产路径是 `content[] → tool_use → block.input → applyOperandPolicy()`，所以除 helper 测试外补了三条 **`applyResponsePolicy()`** 驱动的 E2E：
+
+- 6 层 nested OWN token + **untrusted** → 保留 token，全响应无明文
+- 6 层 nested + **trusted toolName** → 恢复明文
+- 同一响应内 **text block 恢复 / operand block 保留**，两个 channel 的 policy 不互相渗漏
+
+这正是此前反复出现的 `helper 对、production wiring 没接上` 模式的针对性防护。
+
+### 本轮修正的两处**我的测试**问题
+
+1. **container shape 测试比较失真**：我从**同一个被 mutate 的对象**上取"之前"和"之后"的形状，两侧不可能因预期原因产生差异。改为独立构造 + 纯形状比较，并显式断言数组长度与顺序。
+2. **遍历顺序测试写法错误**：复用了同一个被 mutate 的对象，并比较整体序列化——那样只能报出**key 顺序**差异，而非结果差异。改为每棵树**独立构造、各走一次、逐字段比较**，并补上"每个元素仍等于其直接 policy 结果"这一更强断言。
+
+## 9.35 R2 Adversarial Exploration 阶段收口
+
+| 类别 | findings | 结果 |
+|---|---|---|
+| **R2.1** ownership / foreign registry | **2**（R2-REG-001 Medium、R2-REG-002 Low） | **均已修** |
+| R2.2 streaming / SSE fragmentation | 0 | 两个 oracle（transport 逐字节 / logical canonical）全绿 |
+| R2.3 parser collision | 0 | 四条契约在 500+ 组合下成立 |
+| R2.4 span / envelope / merge collision | 0 | 差分 oracle 552 组零违约 |
+| **R2.5** representation / ownership / ledger | **1**（R2-REP-001 Low~Medium） | **已修** |
+| R2.6 nested tool operand | 0 | differential oracle 全绿 |
+
+**三个 finding 全部落在"跨层共享状态 / 跨层 authority"区域**，而纯函数式变换（transport、递归 walker、merge geometry）**零 finding**。这与进入 R2 时的判断一致，也说明后续搜索应优先考虑**存在共享可变状态或跨层契约的地方**。
+
+**测试方法错误的统计**：R2 期间共修正 **13 处我自己写错的断言或测试方法**，其中 **2 处我误告了 gateway**（`#` 注释被吞、`op://` 归因），**1 处我差点把正确的实现改坏**（YAML `#` 语义，用 PyYAML 校准后推翻）。**规律：我的断言比代码更容易出错，且错误集中在"自认为已理解的性质"上。**
+
+**R2 的价值来自定向组合，不来自随机次数**——3 个 finding 全部来自定向的跨层组合（有状态 matcher、sticky 扫描、base64 边界），而非随机 fuzz。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
