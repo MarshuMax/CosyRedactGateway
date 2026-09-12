@@ -395,6 +395,30 @@ telemetry 三种：`restore_ok`（全部已登记）/ `restore_miss`（存在未
 
 与 `restoreText` 的分工：`restoreText` 只做映射查找，不改行为；策略层独立判定。既有语义（未知 token 原样透传）因此保持不变，策略是**附加**判定而不是替换。
 
+## 9.3 Namespace ownership（已实现）
+
+三分法，由 `classifyOwnership(token, ctx, registry)` 给出：
+
+| 归属 | 判定依据 | 本层行为 |
+|---|---|---|
+| `OWN` | `ctx.tokenToRaw.has(token)` | restore，但受 sink policy 约束（见 9.2） |
+| `FOREIGN_REGISTERED` | 已登记 namespace 命中 **且** token 形状合法 | **永不 restore、永不改写**；敏感 sink 且 sink 未声明 trusted 时 **block** |
+| `UNKNOWN` | 其余 | 普通文本 preserve + telemetry；敏感 sink block |
+
+**为什么 FOREIGN_REGISTERED 在敏感 sink 里也要 block**：外层 DLP 正是在那里把明文替换回去。放行等于把 exfiltration 路径从"本层还原"换成"外层还原"，风险不变。
+
+**为什么 matcher 不能宽泛**：namespace 是**可信配置**，不是 payload 派生数据。若把"长得像 `CRG_*`"一律当外来可信，控制 payload 的人就能把自己的文本声明成外来从而绕过全部检测——正是 `isProtectedToken` 要堵的那个 bypass。因此：
+
+- 前缀 namespace：matcher 命中 **且** token 形状合法（`FOREIGN_TOKEN_SHAPE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/`）。形状里不含 `- : . 空格`，所以 `i-0a1b2c3d4e5f67890`、`arn:aws:iam::…`、UUID、release 名**即使 matcher 写成 `.*` 也claim不到**。
+- 精确登记（`registerTokens`）：本身就是显式信任决定，**不再受形状约束**，用于没有可控前缀形状的 issuer。
+
+已知覆盖缺口（显式测试记录，不当作已解决）：未登记的外来 token 若其形状不是本层方言，则既不匹配 `REDACTED_TOKEN` 也不匹配 `PROTECTED_TOKEN_LIKE_RE`，UNKNOWN 分支看不到它。真正的修法是让各 provider 规则识别常见 DLP 形状，属 D 组之后的工作。
+
+## 9.4 测试断言的两个陷阱（迁移期实测）
+
+1. **`isRedactedText` 是形状判定，不是"发生过敏删"的判定。** 对本身就长得像 token 的输入（如 `API_KEY=CRG_AAAAAAAA_0001`）它返回 `true`，即使一个字都没改。凡是想表达"是否被脱敏"的断言，必须比较输入与输出，不能只用这个谓词——否则会写出自指的假绿断言。
+2. **`assert.match(x, 全局正则)` 不可用**，理由见 9.1。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

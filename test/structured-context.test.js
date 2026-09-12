@@ -163,3 +163,32 @@ test("an unquoted low-entropy password is protected by key evidence [RED]", asyn
   const out = await redact(line, ALL);
   assert.equal(isRedactedText(out), true, "a low-entropy password must be redacted on key evidence");
 });
+
+// --------------------------------------------- 5. keyword gate coverage gaps ---
+
+test("the left-hand name has to carry a strong word, not just any key [GREEN NOW]", async () => {
+  // Measured. Two gates must pass: the name must reach the rule's keyword set and
+  // the value must match the value character class. For a plain alnum value the
+  // name gate is the discriminator: `DB_PASSWORD` is detected, a bare `API_KEY` is
+  // not, while a base64-shaped value is detected under either name.
+  //
+  // This corrects two earlier claims made in this file: that `API_KEY` fails the
+  // keyword gate (it is simply a weaker match than password/secret/token), and
+  // that value shape alone explains the miss.
+  const changed = async (line) => (await redact(line)) !== line;
+
+  assert.equal(await changed("DB_PASSWORD=SuperSecret123"), true, "password-bearing name + plain value");
+  assert.equal(await changed("API_KEY=SuperSecret123"), false, "bare `key` name + plain value is missed");
+  assert.equal(await changed("API_KEY=cGFzc3dvcmQxMjM0NTY3OA=="), true, "base64 value rescues the bare key name");
+  assert.equal(await changed("API_KEY=CRG_AAAAAAAA_0001"), false, "underscore-bearing value is not a candidate");
+});
+
+test("isRedactedText is a shape predicate, not a change detector [GREEN NOW]", async () => {
+  // Regression for a self-referential assertion: `isRedactedText` answers "does
+  // this text look like it contains a token", so a literal token-shaped INPUT
+  // returns true even though nothing was redacted. Tests that mean "was anything
+  // redacted" must compare the output to the input instead.
+  const unchanged = "API_KEY=CRG_AAAAAAAA_0001";
+  assert.equal(await redact(unchanged), unchanged, "nothing was redacted");
+  assert.equal(isRedactedText(unchanged), true, "yet the shape predicate says otherwise");
+});

