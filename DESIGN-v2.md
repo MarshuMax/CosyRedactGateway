@@ -761,6 +761,78 @@ UNKNOWN 占比 **0.00%**（该语料无不可定位形态），attempt 覆盖率
 
 `unionBytes` 原以 `-1` 作哨兵，导致**从 0 开始的 region 永远不计入**，所有字节统计恒为 0；`summary()` 又把 `{regionStart,regionEnd}` 记录直接传给期望 `{start,end}` 的 `unionBytes`，过滤条件退化为 `undefined > undefined`。两处均已修，并加边界用例（重叠 / 相邻 / 乱序 / 从 0 开始）。
 
+## 9.13 E0 + E1：entity class 语义与"只落账"的分类器
+
+### E0 sink policy 的 entity class 语义（已修正）
+
+`isCredentialRisk()` 的旧实现：
+
+```
+CREDENTIAL / UNKNOWN → true
+PII / INFRA          → false
+```
+
+**这是个潜伏危险**：分类器一旦正确地把 email / 手机号 / 身份证 / 银行卡标成 `PII`，这些实体反而会**因为被分类正确而放行**到敏感 sink。已改为：
+
+| class | 敏感 sink |
+|---|---|
+| `CREDENTIAL` | 保护 |
+| `PII` | **保护**（本次修正） |
+| `UNKNOWN` | 保护（fail-closed） |
+| `INFRA` | 保持原有 policy —— 本刀**不借分类器顺手改**，留给 infra recognizer 那一刀 |
+
+同时改名为 **`requiresSinkProtection()`**：该谓词从来不是只判断 credential。测试断言旧名 `isCredentialRisk` 已不存在。
+
+### E1 分类器只落账，不改变 redaction verdict
+
+**分类发生在 emit 时**——那时 span 的 `detector` / `ruleId` / `evidence` / `syntax` / `key` / `pathSegments` 都还在。等 `classifyRestore()` 再从 token 反推是猜。
+
+```js
+entityClassFor(token) { return this.entityLedger.get(token)?.entityClass ?? ENTITY_CLASS.UNKNOWN; }
+```
+
+落账条目：
+
+```js
+{ token, entityClass, detector, ruleId, evidence, strength, syntax, key,
+  pathSegments, coverageStatus, encodingKind }
+```
+
+**第一版只做高置信度确定性映射**，不为覆盖率扩大误分类面：
+
+| 证据 | class |
+|---|---|
+| `strong_secret_key` 绑定 / `http-header`（敏感头名） / provider 规则命中 / `sk-` / 私钥 | `CREDENTIAL` |
+| `email` / `phone` / `identity` / `bank` detector | `PII` |
+| entropy-only / 通用模糊命中 | `UNKNOWN` |
+| **"看起来像资源 ID"** | **不判 `INFRA`** —— 留给 infra recognizer 正门产出 |
+
+归因取**最具体的 detector**：`ruleId` 存在即记为 gitleaks；否则在 `type` 与 `absorbed` 中挑第一个非 `entropy`/`block_scalar` 的。这样 provider 规则赢下 span 边界时归因不会丢。
+
+### 修正我之前的一个说法
+
+我此前写过"实体来自 FAILED region，分类结果本身就不可信"——**这不能一概而论**：
+
+```
+parser FAILED + entropy-only                → 确实低可信
+parser FAILED + 明确 GitHub PAT / PEM / 合法邮箱 → detector 本身依然很可信
+```
+
+`coverageStatus` 因此作为**独立证据维度**记录，**不参与降级确定性 detector**，也不与 class 揉成一个 confidence 数。Parser coverage 衡量的是"结构理解程度"，不是所有 detector 的可信度。测试 `a FAILED region does not downgrade a deterministic detector` 固定这条。
+
+### 实测分类结果
+
+```
+CREDENTIAL  binding    key=DB_PASSWORD           cov=PARSED
+CREDENTIAL  binding    key=API_KEY               cov=PARSED
+CREDENTIAL  gitleaks   rule=github-classic-token cov=PARSED
+CREDENTIAL  gitleaks   rule=private-key          key=private_key
+PII         email / phone / identity / bank
+UNKNOWN     entropy    （SHA-like 串）
+```
+
+另有一条值得记的实测：`cache_key: <base64>` **会**被判 `CREDENTIAL`——但归因是通用 provider 规则命中**值**，`key=null` 证明**不是 key 名给的**。这与"弱 key 名不授予 class"不矛盾：`cache_key: abc123` 完全不产生实体。测试同时固定这两点。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
