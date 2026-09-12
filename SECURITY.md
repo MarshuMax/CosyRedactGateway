@@ -10,7 +10,7 @@ It does **not** attempt to make a malicious upstream trustworthy. It only reduce
 
 1. Set `REDACT_ALLOWED_HOSTS` unless arbitrary upstream routing is an explicit requirement.
 2. Protect public deployments with your platform's authentication/rate limiting if they should not be open relays.
-3. Keep `REDACT_MAX_BODY_BYTES` and `REDACT_MAX_REDACTIONS` bounded. The shipped defaults are 16 MiB and 16384 respectively; lower them on memory-constrained deployments.
+3. Keep `REDACT_MAX_BODY_BYTES` bounded. It is a hard cap on request-body bytes consumed: an oversized read is cancelled before JSON parsing or redaction. The shipped default is 16 MiB; lower it on memory-constrained deployments. `REDACT_MAX_REDACTIONS` is a **different kind of limit** and does not substitute for it. It caps the number of unique plaintext identities minted in one request (default 16384), so it bounds request-local mapping and output allocation -- not detector candidate count, span count, occurrence count, or pre-mint CPU work. It is consulted during token minting, which runs after the parsers, detectors, envelopes and merge have already completed, so it cannot shorten the work a document full of candidates causes.
 4. Do not log request bodies, upstream bodies, or the per-runtime salt in surrounding infrastructure.
 5. Keep redirects disabled. The implementation uses `redirect: "manual"` so an upstream cannot redirect the forwarded API key to a second origin.
 6. Treat URL-embedded upstream query parameters as visible routing metadata. Secrets should normally remain in forwarded authorization headers, not the proxy URL.

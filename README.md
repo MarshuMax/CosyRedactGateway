@@ -227,15 +227,19 @@ curl -N \
 | Variable | Default | Meaning |
 |---|---:|---|
 | `REDACT_ALLOWED_HOSTS` | unset | comma-separated hostname allow-list; unset allows arbitrary upstreams |
-| `REDACT_MAX_BODY_BYTES` | 16 MiB | maximum request body buffered for safe JSON redaction |
-| `REDACT_MAX_REDACTIONS` | 16384 | maximum unique plaintext replacements in one request |
+| `REDACT_MAX_BODY_BYTES` | 16 MiB | hard cap on request-body bytes consumed by the gateway; an oversized read is cancelled before JSON parsing or redaction |
+| `REDACT_MAX_REDACTIONS` | 16384 | maximum number of unique plaintext identities minted in one request; bounds request-local mapping and output allocation, NOT detector candidate count or pre-mint CPU work |
 | `REDACT_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `HOST` | `127.0.0.1` | Node local adapter only |
 | `PORT` | `8787` | Node local adapter only |
 
 Non-empty request bodies must be JSON. This is intentional fail-closed behavior: an unknown binary or plaintext body is rejected with 415 instead of being forwarded without redaction.
 
-Large base64 image/audio payload fields and URL/control fields are excluded from text redaction to avoid corrupting multimodal requests. The defaults are intentionally generous for large LLM payloads; on memory-constrained deployments, lower `REDACT_MAX_BODY_BYTES` and/or `REDACT_MAX_REDACTIONS` explicitly.
+Large base64 image/audio payload fields and URL/control fields are excluded from text redaction to avoid corrupting multimodal requests. The defaults are intentionally generous for large LLM payloads.
+
+On memory-constrained deployments, lower `REDACT_MAX_BODY_BYTES`. It is the knob that bounds how much of a request is read: the read stops as soon as the cap is exceeded, and the body is never parsed, redacted or forwarded.
+
+`REDACT_MAX_REDACTIONS` additionally bounds the number of unique request-local entity mappings, but it is **not** a detector/merge CPU budget. It is consulted while tokens are minted, which happens after the parsers, detectors, span envelopes and merge have already run, so lowering it does not shorten the work done on a document full of candidates. It bounds distinct entity identities only: one identity repeated many times counts once. A real CPU bound would be a separate candidate-count or time budget enforced before the merge.
 
 ## Tests
 
