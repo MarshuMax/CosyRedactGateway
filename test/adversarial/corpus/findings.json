@@ -405,5 +405,12 @@
       "the request object was reused across measurements, but request.body is a ONE-SHOT stream, so the second read saw an empty body"
     ],
     "request_side_status": "CLOSED. Corpus B remains blocked by R3-BODY-002."
+  },
+  "harness_notes": {
+    "timing_assertions_in_the_ordinary_suite_are_parallel_sensitive": {
+      "observation": "test/r3-span-density.perf.test.js failed once in a full `node --test` run and passed every time in isolation (3/3), then passed on a full re-run (434/434). The assertions in it are RATIO-based with a tail threshold, which is the right design, but `node --test` runs files in PARALLEL, so a timing ratio measured while other files are also running is not the same quantity as one measured alone.",
+      "not_a_regression": "The failure could not be reproduced in three isolated runs or in a full re-run, and the corpus in question is unrelated to the change under test (a corpus record was added; no production code changed in that commit).",
+      "guidance": "Treat a single timing-assertion failure in a parallel run as a FLAKE until it reproduces in isolation. Do not loosen the threshold to make it pass, and do not treat it as evidence of a regression: re-run the file alone first. The heavy sweeps belong in `npm run perf*`, which run one case per process by design."
+    }
   }
 }
