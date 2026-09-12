@@ -929,6 +929,70 @@ export const PATH_CONFIDENCE = Object.freeze({
 // particular, D2c must NOT conclude "path === data.password therefore base64": the
 // schema decision needs an object-level recognizer
 // (apiVersion == v1 AND kind == Secret AND path under root `data`).
+// YAML plain-scalar comment boundary.
+//
+// A `#` starts a comment only when it is preceded by separation whitespace;
+// `abc#123` keeps its `#` as part of the value. Getting this wrong is not
+// cosmetic: with the comment inside the span, redaction swallows the comment and
+// rewrites the host document, and restoring byte-for-byte becomes impossible.
+// Returns the value and the offset at which the value ends (comments and the
+// whitespace that separates them are NOT part of the span).
+export function splitPlainScalar(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] !== "#") continue;
+    const prev = i > 0 ? rest[i - 1] : "";
+    if (i === 0 || /[ \t]/.test(prev)) {
+      let end = i;
+      while (end > 0 && /[ \t]/.test(rest[end - 1])) end--;
+      return { value: rest.slice(0, end), end };
+    }
+  }
+  return { value: rest.replace(/\s+$/, ""), end: rest.replace(/\s+$/, "").length };
+}
+
+// Block scalar header: `|`, `>`, with optional chomping (`+`/`-`) and an explicit
+// indentation indicator (`1`-`9`), in either order.
+const BLOCK_SCALAR_HEADER_RE = /^([|>])(?:(\d)([+-]?)|([+-]?)(\d)?)([ \t]*(?:#.*)?)$/;
+
+// D2b-2: locate the BODY span of a block scalar, following the YAML 9.1.1 rule --
+// content indentation is set by the first non-empty line, and the block ends at the
+// first non-empty line that is indented less.
+//
+// The span covers the body text only: the indicator line (`|`, `>-`, ...) and the
+// leading indentation of each body line stay outside it, so a replacement can
+// neither eat the indicator nor re-indent the document. That leaves the leading
+// indentation of continuation lines in place, which keeps the replacement valid
+// YAML for a single-line body and is the conservative choice for multi-line bodies.
+export function findBlockScalarBody(lines, headerIndex, keyIndent) {
+  const first = headerIndex + 1;
+  const bodyIndent = (raw) => {
+    const ws = raw.match(/^[ \t]*/)[0];
+    const rest = raw.slice(ws.length);
+    if (rest === "" || rest.startsWith("#")) return -1; // blank or comment-only
+    return ws.length;
+  };
+
+  let contentIndent = -1;
+  for (let i = first; i < lines.length; i++) {
+    const ind = bodyIndent(lines[i]);
+    if (ind === -1) continue;
+    if (ind <= keyIndent) return null; // no body at all
+    contentIndent = ind;
+    break;
+  }
+  if (contentIndent === -1) return null;
+
+  let last = -1;
+  for (let i = first; i < lines.length; i++) {
+    const ind = bodyIndent(lines[i]);
+    if (ind === -1) continue;
+    if (ind < contentIndent) break;
+    last = i;
+  }
+  if (last < first) return null;
+  return { firstContentLine: first, lastContentLine: last, contentIndent };
+}
+
 export function parseYamlBindings(text) {
   const out = [];
   if (typeof text !== "string" || !text) return out;
@@ -939,9 +1003,17 @@ export function parseYamlBindings(text) {
   let stack = [];
   let docShapeKnown = true;
 
+  // Absolute start offset of every line, computed once. The previous inline helper
+  // did `lines.slice(0, idx).reduce((n, l) => n + l.length + 1, lineStart)`, which
+  // added `lineStart` on top of the accumulated prefix -- the prefix already IS
+  // `lineStart` at the current line -- so every span was shifted forward by the
+  // length of all preceding lines.
+  const lineOffsets = [];
+  for (let i = 0, at = 0; i < lines.length; i++) { lineOffsets.push(at); at += lines[i].length + 1; }
+
   let lineStart = 0;
-  for (const rawLine of lines) {
-    const line = rawLine;
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
     const stripped = line.trim();
     const indent = line.length - line.replace(/^[ \t]*/, "").length;
 
@@ -996,9 +1068,97 @@ export function parseYamlBindings(text) {
     }
 
     // ---- value ----
-    if (rest === "" || rest.startsWith("|") || rest.startsWith(">")) {
-      // Empty value, or a block scalar: D2b territory. Record the key in the stack
-      // so descendants are still attributable, but emit no binding.
+    if (rest === "") {
+      // Empty value: record the key so descendants stay attributable, emit nothing.
+      stack.push({ indent, key });
+      lineStart += line.length + 1;
+      continue;
+    }
+
+    const blockMatch = BLOCK_SCALAR_HEADER_RE.exec(rest);
+    if (blockMatch) {
+      // YAML 9.1.1 allows chomping and the indentation indicator in either order:
+      // `|2-`, `|-2`, `|2`, `|-`. The regex captures the digit in two possible
+      // groups, so neither order is silently rejected.
+      // D2b-2. The indicator line is not the value; the body is.
+      const loc = findBlockScalarBody(lines, lineIndex, indent);
+      if (loc) {
+        const startOfLine = (idx) => lineOffsets[idx];
+        const firstLineStart = startOfLine(loc.firstContentLine);
+        const indentOfFirst = lines[loc.firstContentLine].match(/^[ \t]*/)[0].length;
+        const lastLine = lines[loc.lastContentLine];
+        const multiLine = loc.firstContentLine !== loc.lastContentLine;
+        // A single-line body can be spanned directly. A multi-line body must NOT be
+        // spanned as a whole: replacing lines with one unindented token violates the
+        // block's indentation requirement and yields invalid YAML.
+        // Per-LINE candidates: a span that crosses lines cannot be replaced
+        // without breaking the block's indentation requirement, which produces
+        // invalid YAML (measured: `ScannerError`). Every line therefore gets its
+        // own span with its own indentation left outside it. The weak-key gate
+        // does not apply here -- a TLS key under `notes: |` is still a key.
+        for (let i = loc.firstContentLine; i <= loc.lastContentLine; i++) {
+          const lineText = lines[i];
+          const lineIndent = lineText.match(/^[ \t]*/)[0].length;
+          const lineBody = lineText.slice(lineIndent).replace(/[ \t]+$/, "");
+          if (lineBody.length === 0) continue;
+          const lineStartOffset = startOfLine(i);
+          // The body starts right after the indentation. `indexOf(lineBody, ...)`
+          // returns a LINE-RELATIVE index, and adding it to the line start offset
+          // double-counted the indentation, shifting every span right by `lineIndent`
+          // (and, on a line whose text repeated earlier in the line, by more).
+          const bodyOffset = lineIndent;
+          out.push({
+            kind: "binding",
+            key,
+            normalizedKey: normalizeBindingKey(key),
+            valueStart: lineStartOffset + bodyOffset,
+            valueEnd: lineStartOffset + bodyOffset + lineBody.length,
+            syntax: "yaml",
+            evidence: ["block_scalar_body"],
+            strength: KEY_STRENGTH.NONE,
+            raw: lineBody,
+            indent: structural.indent,
+            pathSegments: structural.pathSegments,
+            pathConfidence: structural.pathConfidence,
+            bodyCandidate: true,
+          });
+        }
+
+        // A STRONG key adds a direct binding, but only for a single-line body:
+        // spanning a multi-line body as one unit is exactly the invalid-YAML case
+        // above. Multi-line bodies are covered by the per-line candidates plus the
+        // content detectors.
+        if (!multiLine) {
+          const valueStart = firstLineStart + indentOfFirst;
+          const valueEnd = startOfLine(loc.lastContentLine) + lastLine.replace(/[ \t]+$/, "").length;
+          const body = text.slice(valueStart, valueEnd);
+          const strength = classifyKeyStrength(key);
+          const evidence = ["structured_binding", "block_scalar"];
+          if (strength === KEY_STRENGTH.STRONG) evidence.push("strong_secret_key");
+          if (docShapeKnown) {
+            structural.pathSegments = [...stack.map((e) => e.key), key];
+            structural.pathConfidence = PATH_CONFIDENCE.SIMPLE_MAPPING;
+          } else {
+            structural.pathSegments = [];
+            structural.pathConfidence = PATH_CONFIDENCE.UNKNOWN;
+            evidence.push("path_unknown");
+          }
+          out.push({
+            kind: "binding",
+            key,
+            normalizedKey: normalizeBindingKey(key),
+            valueStart,
+            valueEnd,
+            syntax: "yaml",
+            evidence,
+            strength,
+            raw: body,
+            indent: structural.indent,
+            pathSegments: structural.pathSegments,
+            pathConfidence: structural.pathConfidence,
+          });
+        }
+      }
       stack.push({ indent, key });
       lineStart += line.length + 1;
       continue;
@@ -1018,13 +1178,13 @@ export function parseYamlBindings(text) {
       lineStart += line.length + 1;
       continue;
     } else {
-      // Plain scalar runs to the end of the line. A trailing ` #comment` is left in
-      // the raw value on purpose: this layer must not rewrite the host syntax, and
-      // trimming a comment is a rewrite. A path/key judgement on such a record is
-      // the caller's business.
-      raw = rest;
+      // Plain scalar: ends at a separation-whitespace `#`, which starts a comment.
+      // The comment and the whitespace before it stay outside the span, so a
+      // redaction cannot delete them.
+      const split = splitPlainScalar(rest);
+      raw = split.value;
       valueStart = restStart;
-      valueEnd = restStart + raw.length;
+      valueEnd = restStart + split.end;
     }
     if (raw.length === 0) { stack.push({ indent, key }); lineStart += line.length + 1; continue; }
 
@@ -1143,13 +1303,13 @@ export function parseBindings(text) {
  */
 export function bindingSpansOf(text, kind = "binding", parser = parseBindings) {
   return parser(text)
-    .filter((b) => b.strength === KEY_STRENGTH.STRONG)
-    .filter((b) => !b.evidence.includes("reference_value"))
+    .filter((b) => b.bodyCandidate === true
+      || (b.strength === KEY_STRENGTH.STRONG && !b.evidence.includes("reference_value")))
     .map((b) => ({
       start: b.valueStart,
       end: b.valueEnd,
-      type: kind,
-      priority: 60,
+      type: b.bodyCandidate ? "block_scalar" : kind,
+      priority: b.bodyCandidate ? 55 : 60,
       key: b.key,
       normalizedKey: b.normalizedKey,
       syntax: b.syntax,

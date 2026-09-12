@@ -550,6 +550,63 @@ apiVersion == v1  AND  kind == Secret  AND  path under root `stringData` → 普
 | D2c | K8s Secret schema + base64 surrogate | 待做 |
 | D3 | HTTP header + URL query | 待做 |
 
+## 9.8 D2b-1 / D2b-2（已实现）与 D2c 基线
+
+### 9.8.1 D2b-1 plain scalar 注释边界
+
+**更正一个此前写错的口径**：把 ` # comment` 留在 raw value 内**不是**"为了避免改写宿主语法"，恰恰相反——**那才会改坏宿主内容**：redaction 会把注释连同值一起吃掉，且 restore 无法逐字节还原。
+
+正确规则（YAML 词法）：**只有前置 separation whitespace 的 `#` 才开始注释**。
+
+```
+password: abc#123          # `#` 属于值
+password: abc123!  # note  # 注释，span 只覆盖 abc123!
+```
+
+实测：注释与其前的空白均保留，`round-trip` 逐字节一致；引号内的 `#` 不受影响。
+
+### 9.8.2 D2b-2 block scalar
+
+识别指示符族：`|` `|-` `|+` `>` `>-` `>+` 以及显式缩进指示符的**两种顺序**（`|2+` 与 `|+2`）。body 定位遵循 YAML 9.1.1：内容缩进由首个非空行决定，块在首个缩进更小的非空行结束。
+
+**关键实测结论：跨行 span 不能用来替换多行块体。** 把多行体替换成单个无缩进的 token 会产生非法 YAML（PyYAML `ScannerError: while scanning a simple key`）——因为块体必须保持缩进。四种形态实测全部失败，这个结论是测出来的，不是推出来的。
+
+因此：
+
+- 块体的每一行**各自成为一个候选**（`block_scalar_body`，优先级 55），每行自己的缩进留在 span 之外；
+- 单行体才允许由 key 强度直接产出 binding；
+- 多行体由逐行候选 + 内容检测器共同覆盖。
+
+实测验证（13 种形态，真实 PyYAML 解析 + restore 逐字节比对）：全部输出仍是合法 YAML，且 round-trip 全部一致，包含 `|`/`|-`/`|+`/`>`/`|2`/`|+2`/`|-2`、嵌套块、空行、注释、`abc#123`、同一文档两个块。
+
+### 9.8.3 三个偏移 bug（都是"看起来对、实测错"）
+
+写这一段代码时连续踩了三个**静默偏移**错误，全部由真 YAML 解析器和 round-trip 断言抓出，靠阅读代码是发现不了的：
+
+1. `startOfLine(idx)` 用 `lines.slice(0, idx).reduce((n, l) => n + l.length + 1, lineStart)`，而 `lineStart` 本身已是当前行的前缀累计长度 ⇒ **每行前缀被加了两次**，所有 span 前移。改为预计算 `lineOffsets[]`。
+2. 逐行候选里 `lineText.indexOf(lineBody, lineIndent)` 返回的是**行内相对偏移**，再加 `lineStartOffset` 相当于把缩进算了两遍。
+3. 早期版本用"去尾空白后的长度"算 span 末尾，未计入尾部空白差值，导致 span 越过行尾、吞掉下一行开头。
+
+### 9.8.4 D2c 已知缺口（executable spec，未实现）
+
+**D2a 已经会破坏 K8s `Secret.data` 的 base64 约束**：
+
+```yaml
+apiVersion: v1
+kind: Secret
+data:
+  password: cGFzc3dvcmQ=        # → password: CRG_XXXXXX_0001
+```
+
+结果对 YAML 合法，对 Kubernetes 非法（API server：`illegal base64 data at input byte 3`）。测试 `D2c: a v1 Secret under root data.* keeps a valid base64 replacement [RED]` 把这条缺口固定成可执行规格，避免 129 pass 给人"只剩 block scalar/header/URL"的错觉。
+
+同时固定两条对照：
+
+- `stringData.*` → 普通 portable token 可以接受（本来就是任意文本）
+- 普通 `data.password`（非 Secret 对象）→ **不得**被判为 base64
+
+D2c 的判据必须是对象级：`apiVersion == v1` AND `kind == Secret` AND path under root `data`。仅凭 path 相同不够。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

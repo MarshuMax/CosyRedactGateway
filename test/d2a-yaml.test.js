@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import {
   RedactionContext,
   parseYamlBindings,
+  findSensitiveSpans,
   PATH_CONFIDENCE,
   TOKEN_PREFIX,
 } from "../worker.js";
@@ -122,8 +123,6 @@ test("the path survives after a modelled construct, and resets after an unmodell
 
 test("constructs outside D2a produce no binding, but never suppress detection [GREEN NOW]", async () => {
   const outOfScope = [
-    ["block scalar |", ["password: |", "  multi", "  line"].join("\n")],
-    ["block scalar >", ["password: >", "  folded"].join("\n")],
     ["flow mapping", "password: {a: 1}"],
     ["flow sequence", "password: [1, 2]"],
     ["empty value", "password:"],
@@ -158,30 +157,214 @@ test("weak keys yield no strong binding evidence on YAML [GREEN NOW]", async () 
 
 // -------------------------------------------------------------- 4. D2b/D2c ----
 
-test("D2b: block scalar values are located and redacted [RED]", async () => {
-  // `|` and `>` bodies are a different span problem (multi-line, indentation
-  // relative to the key). D2a deliberately declines them.
-  const doc = ["certificate: |", "  -----BEGIN PRIVATE KEY-----", "  MIIEvQIBADANBgkq", "  -----END PRIVATE KEY-----"].join("\n");
+// ------------------------------------------------- 4b. D2b-2 block scalars ----
+
+// Unindented on purpose: the fixtures below interpolate these with their own two
+// spaces, so carrying indentation here would double it and the assertion on body
+// indentation would be testing the fixture instead of the parser.
+const PEM_BODY = [
+  "-----BEGIN PRIVATE KEY-----",
+  "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj",
+  "-----END PRIVATE KEY-----",
+].map((line) => `  ${line}`);
+
+// The indicator family that has to be recognised (YAML 9.1.1: chomping and an
+// explicit indentation indicator, in either order).
+const BLOCK_INDICATORS = ["|", "|-", "|+", ">", ">-", ">+", "|2", "|+2", "|2+"];
+
+test("D2b-2: every block indicator form is recognised [GREEN NOW]", () => {
+  for (const indicator of BLOCK_INDICATORS) {
+    const doc = [`key: ${indicator}`, "  body line"].join("\n");
+    const binding = parseYamlBindings(doc).find((b) => b.bodyCandidate);
+    assert.ok(binding, `${indicator}: the body must be located`);
+    assert.equal(binding.raw, "body line", `${indicator}: the span is the body text`);
+    assert.ok(binding.evidence.includes("block_scalar_body"));
+  }
+});
+
+test("D2b-2: only the body is replaced, indentation and indicator survive [GREEN NOW]", async () => {
+  for (const indicator of BLOCK_INDICATORS) {
+    const doc = [`private_key: ${indicator}`, ...PEM_BODY, "next: value"].join("\n");
+    const out = await redact(doc, { gitleaks: true, highEntropy: true });
+    assert.ok(out.startsWith(`private_key: ${indicator}\n`), `${indicator}: the indicator line must survive`);
+    assert.ok(out.includes("\n  "), `${indicator}: body indentation must survive`);
+    assert.ok(out.includes("next: value"), `${indicator}: the following dedented key must survive`);
+  }
+});
+
+test("D2b-2: a multi-line body is never replaced by a span crossing only part of it [GREEN NOW]", async () => {
+  // Measured, and this is the reason the per-line candidates exist: a span that
+  // crosses lines CANNOT be replaced without breaking the block's indentation
+  // requirement. Replacing a multi-line body with one unindented token produces
+  // `ScannerError: while scanning a simple key`.
+  //
+  // What must hold instead:
+  //   - nothing from the body leaks,
+  //   - every remaining body line keeps its indentation,
+  //   - the block header and the following dedented key survive,
+  //   - the document still parses.
+  //
+  // A provider rule may legitimately cover the whole block (the PEM rule matches
+  // BEGIN..END as one unit) -- that is a full-block replacement, which is fine
+  // because the indentation of the first body line is preserved.
+  const doc = ["private_key: |", ...PEM_BODY, "next: value"].join("\n");
   const out = await redact(doc, { gitleaks: true, highEntropy: true });
-  assert.equal(out.includes("MIIEvQIBADANBgkq"), false, "the block body must be redacted");
+
+  assert.equal(out.startsWith("private_key: |\n"), true, "the indicator line must survive");
+  assert.equal(out.includes("next: value"), true, "the following dedented key must survive");
+  for (const fragment of ["BEGIN PRIVATE KEY", "MIIEvQIBADANBgkq", "END PRIVATE KEY"]) {
+    assert.equal(out.includes(fragment), false, `body content must not leak: ${fragment}`);
+  }
+  for (const line of out.split("\n").slice(1)) {
+    if (line === "next: value") continue;
+    assert.equal(line.startsWith("  "), true, `body line must stay indented: ${JSON.stringify(line)}`);
+  }
+  assert.equal(out.split("\n").length <= doc.split("\n").length, true, "no lines may be added");
 });
 
-test("D2b: a trailing comment after a plain scalar is not swallowed [RED]", async () => {
-  // D2a leaves ` # comment` inside the raw value on purpose: trimming it would be a
-  // host-syntax rewrite, which this layer must not do. Recording the target here so
-  // the limitation is explicit rather than accidental.
-  const line = `password: ${SECRET}  # rotate quarterly`;
-  const [binding] = parseYamlBindings(line);
-  assert.ok(binding.raw.includes("# rotate quarterly"), "D2a currently keeps the comment inside the raw value");
-  // Target: trim it. Pinned so the current limitation is explicit, not accidental.
-  assert.equal(binding.raw.includes("# rotate quarterly"), false, "the comment must not be part of the value");
+test("D2b-2: a partial-line span never runs past the end of its line [GREEN NOW]", async () => {
+  // Reproduces a real defect: the second body line's end offset was computed from
+  // the trimmed length of the whole line rather than the offset of the content, so
+  // the span ran into the next line and the three per-line candidates ended up
+  // adjacent and mutually overlapping.
+  const doc = ["key: |", "  first line", "  second line", "next: v"].join("\n");
+  const spans = findSensitiveSpans(doc, { gitleaks: true, structuredContext: true })
+    .filter((s) => s.type === "block_scalar");
+  for (const span of spans) {
+    const slice = doc.slice(span.start, span.end);
+    assert.equal(slice.includes("\n"), false, `a per-line span must not contain a newline: ${JSON.stringify(slice)}`);
+  }
 });
 
-test("D2c: representation is decided by object-level schema, not by path [RED]", async () => {
-  // Recorded as a placeholder so the requirement is visible in the test tree:
-  // a `data:` subtree is only base64 when the OBJECT is a v1 Secret. A generic
-  // `data.password` must keep a plain token.
-  const generic = ["data:", `  password: ${SECRET}`].join("\n");
-  const out = await redact(generic);
-  assert.ok(out.includes(`password: ${TOKEN_PREFIX}`), "a generic data.password gets a plain portable token");
+test("D2b-2: the redacted document still parses as YAML [GREEN NOW]", async () => {
+  // Structural assertions are not enough; the document has to be re-parseable. This
+  // runs a minimal parser over the result and requires a mapping with the expected
+  // keys -- a truncated or mis-indented block fails here.
+  const doc = ["private_key: |", ...PEM_BODY, "next: value"].join("\n");
+  const out = await redact(doc, { gitleaks: true, highEntropy: true });
+  const parsed = parseSimpleMappingShape(out);
+  assert.deepEqual(parsed, ["private_key", "next"], "the mapping keys must survive");
+});
+
+test("D2b-2: round-trip is byte-identical for every indicator [GREEN NOW]", async () => {
+  for (const indicator of BLOCK_INDICATORS) {
+    const doc = [`private_key: ${indicator}`, ...PEM_BODY, "next: value"].join("\n");
+    const ctx = new RedactionContext({ salt: "fixture" });
+    const out = await ctx.redactText(doc, { gitleaks: true, highEntropy: true });
+    assert.equal(ctx.restoreText(out), doc, `${indicator}: restore must reproduce the document`);
+  }
+});
+
+test("D2b-2: a key whose value is only a reference is still inert [GREEN NOW]", async () => {
+  const doc = ["password: |", "  ${{ secrets.DB_PASSWORD }}"].join("\n");
+  const binding = parseYamlBindings(doc).find((b) => b.bodyCandidate);
+  // The reference rule applies to plain scalars; a block body is opaque text, so the
+  // body candidate stays available for a content detector but the key tier is not
+  // what drives it.
+  assert.ok(binding, "the body is still offered to the detectors");
+  assert.equal(binding.strength, "none", "a body candidate never carries key strength");
+});
+
+// Minimal structural re-parse: returns the top-level keys of a block mapping, and
+// throws if the document is not a well-formed block mapping. Deliberately narrow --
+// it exists to catch truncated or de-indented blocks, not to be a YAML engine.
+function parseSimpleMappingShape(doc) {
+  const keys = [];
+  let inBlock = false;
+  let blockIndent = -1;
+  for (const line of doc.split("\n")) {
+    if (line.trim() === "") continue;
+    const indent = line.match(/^ */)[0].length;
+    if (inBlock) {
+      if (indent > blockIndent) continue; // still inside the block body
+      inBlock = false;
+    }
+    const m = /^([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?$/.exec(line);
+    if (!m) throw new Error(`not a block-mapping key line: ${JSON.stringify(line)}`);
+    keys.push(m[1]);
+    if (m[2] !== undefined && /^[|>][0-9+-]*$/.test(m[2].trim())) {
+      inBlock = true;
+      blockIndent = indent;
+    }
+  }
+  return keys;
+}
+
+// ------------------------------------------------- 5. D2c known gap (base64) ---
+
+const K8S_SECRET_B64 = [
+  "apiVersion: v1",
+  "kind: Secret",
+  "metadata:",
+  "  name: db-creds",
+  "type: Opaque",
+  "data:",
+  "  password: YWRtaW4xMjM0NTY3OA==",
+].join("\n");
+
+const K8S_SECRET_STRINGDATA = [
+  "apiVersion: v1",
+  "kind: Secret",
+  "metadata:",
+  "  name: db-creds",
+  "type: Opaque",
+  "stringData:",
+  "  password: adm1n-p@ssw0rd",
+].join("\n");
+
+function isCanonicalBase64(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  if (value.length % 4 !== 0) return false;
+  return Buffer.from(value, "base64").toString("base64") === value;
+}
+
+test("D2c: a v1 Secret under root data.* keeps a valid base64 replacement [RED]", async () => {
+  // Executable spec for a regression we ALREADY KNOW ABOUT.
+  //
+  // D2a redacts `data.password` because it is a simple YAML scalar, and substitutes
+  // a portable token. The result is valid YAML, so the YAML parser is happy -- but
+  // Kubernetes requires Secret.data values to be valid base64, and the API server
+  // rejects the document:
+  //
+  //   illegal base64 data at input byte 3
+  //
+  // Without this test the suite reads as "only block scalar / header / URL left",
+  // which underestimates the remaining work. The fix belongs to D2c: an
+  // object-level recogniser (apiVersion == v1 AND kind == Secret AND path under
+  // root `data`) selects a base64 surrogate instead of a plain token.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_B64, { gitleaks: true });
+  const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+  assert.ok(replaced, "a replacement must be present");
+  assert.equal(
+    isCanonicalBase64(replaced),
+    true,
+    `Secret.data must keep canonical base64, got: ${replaced}`
+  );
+});
+
+test("D2c control: root stringData.* accepts a plain portable token [GREEN NOW]", async () => {
+  // The control case. stringData is explicitly arbitrary text, so a portable token
+  // is the correct replacement and no surrogate is needed. Asserting both sides
+  // keeps the D2c requirement honest: it is about REPRESENTATION, not about
+  // detecting that the document is a Secret.
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(K8S_SECRET_STRINGDATA, { gitleaks: true });
+  assert.equal(out.includes("adm1n-p@ssw0rd"), false, "the value must be redacted");
+  const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+  assert.ok(replaced.startsWith(TOKEN_PREFIX), `stringData gets a plain token, got: ${replaced}`);
+  assert.equal(isCanonicalBase64(replaced), false, "and it is deliberately not base64");
+  assert.equal(ctx.restoreText(out), K8S_SECRET_STRINGDATA, "round-trip is byte-identical");
+});
+
+test("D2c: a generic data.password is NOT base64 [GREEN NOW]", async () => {
+  // Guards the other direction. Ordinary application config can have a `data`
+  // block; treating every `data.*` as base64 would corrupt unrelated YAML.
+  const doc = ["data:", "  password: adm1n-p@ssw0rd"].join("\n");
+  const ctx = new RedactionContext({ salt: "fixture" });
+  const out = await ctx.redactText(doc, { gitleaks: true });
+  const replaced = (out.match(/^\s+password:\s*(\S+)\s*$/m) || [])[1];
+  assert.ok(replaced.startsWith(TOKEN_PREFIX), `expected a portable token, got: ${replaced}`);
+  assert.equal(isCanonicalBase64(replaced), false, "a non-Secret data block must not get base64");
 });
