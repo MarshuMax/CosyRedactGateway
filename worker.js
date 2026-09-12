@@ -3913,6 +3913,55 @@ async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trust
   return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
 }
 
+/**
+ * Read a request body with a hard byte cap, stopping as soon as the cap is exceeded.
+ *
+ * `await request.arrayBuffer()` buffers the WHOLE body before any size check can run, so an
+ * oversized request is fully materialised in memory even though it is then rejected. Measured: a
+ * body of 20000 bytes against a 1000-byte cap was read to completion and only then answered 413 --
+ * and the same for a `Content-Length` that already declared it oversized.
+ *
+ * The contract is split in two, and only the second is affected:
+ *
+ *   semantic   an oversized body never reaches JSON.parse, redaction or the upstream forward.
+ *              This already held and still holds.
+ *   resource   the read STOPS once the cap is exceeded, instead of materialising the body.
+ *
+ * `Content-Length` is deliberately not used as the boundary. It may be absent (chunked) or untrue
+ * (the final case in the table above: a header claiming more than the real body, which must NOT be
+ * trusted either). It is at most an early hint, and the counted read is the actual enforcement.
+ *
+ * @returns {{bytes: Uint8Array|null, exceeded: boolean}}
+ */
+async function readBodyCapped(request, maxBytes) {
+  if (!request.body) return { bytes: new Uint8Array(0), exceeded: false };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        // Stop pulling and release the source. `cancel()` is what makes the saving real: without it
+        // the rest of the stream may still be transported and buffered by the runtime.
+        try { await reader.cancel(); } catch { /* the source may already be closed */ }
+        return { bytes: null, exceeded: true };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  if (chunks.length === 1) return { bytes: chunks[0], exceeded: false };
+  const bytes = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.byteLength; }
+  return { bytes, exceeded: false };
+}
+
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
@@ -3945,8 +3994,8 @@ export async function handleRequest(request, env = {}, options = {}) {
   const headers=filteredRequestHeaders(request.headers);
   let body;
   if (request.method !== "GET" && request.method !== "HEAD") {
-    const bytes=await request.arrayBuffer();
-    if (bytes.byteLength > maxBody) return jsonError(413,`Request body exceeds ${maxBody} bytes`);
+    const { bytes, exceeded } = await readBodyCapped(request, maxBody);
+    if (exceeded) return jsonError(413,`Request body exceeds ${maxBody} bytes`);
     const ct=request.headers.get("content-type") || "";
     if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
     if (bytes.byteLength) {

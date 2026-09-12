@@ -113,6 +113,44 @@
       "fix": "stripTrailing(text, isStrip) walks backwards once and stops at the first character outside the set. Both regex forms are replaced, not only the `\\s` one, because `[ \\t]+$` measured just as badly (1985ms at 32768). `String.prototype.trimEnd()` would also be linear but strips a fixed Unicode set, so a character walk was used instead to keep each call site's exact set. Four sites: parseYamlBindings' trimmedEnd, the block-scalar region end, the block-scalar body line, and splitPlainScalar's value. Equivalence was checked EXHAUSTIVELY against both original regexes over every string of length 0..4 on a 9-character alphabet including NBSP and ideographic space: 7381/7381 identical. Measured after the fix at 32 KB: 1806ms -> 3.43ms.",
       "regression": "scripts/perf-redos.mjs family A-assignment-delimiter, whose adversarial/control ratio is the detector for this class.",
       "measurement_note": "This finding was NOT in a regex I suspected. The YAML mapping pattern, `([^\\s:#][^:#]*?)[ \\t]*:`, does contain an ambiguous nested quantifier and measured 0.044ms -- innocent. Isolating each STEP of the same line (exec, trimEnd, dash-strip) is what located the real cost."
+    },
+    {
+      "id": "R3-LIMIT-001",
+      "seed": "n/a (deterministic)",
+      "input": "a request body larger than REDACT_MAX_BODY_BYTES, in four Content-Length shapes: declared oversized, absent, understated, and overstated-but-small",
+      "config": "REDACT_MAX_BODY_BYTES=1000, body=200055 bytes",
+      "expected_invariant": "Split into two layers. SEMANTIC: an oversized body never reaches JSON.parse, redaction or the upstream forward -- that already held. RESOURCE: the read stops once the cap is exceeded instead of materialising the body first.",
+      "observed": "`await request.arrayBuffer()` read the WHOLE body before any size check could run, so all 200055 bytes were materialised and only then answered 413 -- including when Content-Length had already declared the body oversized. The 415 content-type check had the same shape. Measured with a 1024-byte chunk source: deliveredBytes == totalBytes in every refused case.",
+      "impact": "Resource / deployment robustness. No security consequence: the semantic limit held, so no oversized body was parsed, redacted or forwarded, and an untrue Content-Length could not move the cap in either direction. The exposure is memory only, and the request was refused either way.",
+      "status": "fixed",
+      "root_cause": "The size check ran after the buffering call rather than during the read.",
+      "fix": "readBodyCapped() pulls from request.body chunk by chunk, counts, and on exceeding the cap calls reader.cancel() and returns. cancel() is what makes the saving real: without it the rest of the stream may still be transported and buffered by the runtime. Content-Length is deliberately NOT used as the boundary -- it can be absent or untrue -- so it remains at most an early hint and the counted read is the enforcement. Measured after: deliveredBytes 1024 of 200055 in all three refused shapes, cancelled=true, status 413, upstream 0.",
+      "regression": "test/r35-limits.test.js -- L1 across four Content-Length shapes and a huge non-JSON body; L4 requiring deliveredBytes <= 2 chunks AND < total AND cancelled; L5 that an understated header cannot smuggle an oversized body through and an overstated one cannot refuse a body that fits; L2 boundary precision at exactly the cap and one byte over; L3 that a huge non-JSON body fails the SIZE check rather than the content-type check.",
+      "found_via": "Reading the production path (arrayBuffer -> check) and then measuring, rather than assuming. The measurement required counting bytes DELIVERED TO THE READER: an earlier probe counted what the source had queued, which reports the whole body regardless and would have hidden the finding."
+    },
+    {
+      "id": "R3-LIMIT-002",
+      "seed": "n/a (deterministic)",
+      "input": "10000 candidates with 1 unique plaintext, versus 100 unique, versus 10000 unique; and 1000 candidates / 1 unique against 1000 / 1000",
+      "config": "REDACT_MAX_REDACTIONS=1 versus 1000000 on the same document",
+      "expected_invariant": "A limit named MAX_REDACTIONS and documented as something to lower on memory-constrained deployments should bound the work of processing candidates, not only the allocation that follows it.",
+      "observed": "Two results. (1) SEMANTICS: the limit is `rawToToken.size`, so it bounds UNIQUE ENTITY IDENTITIES -- not spans and not occurrences. Measured: 200 spans over 2 unique values passes a limit of 2 (rawToToken.size 2), while 5 spans over 5 unique values trips a limit of 2. The boundary is exact: limit=N admits exactly N unique values. (2) TIMING: the differential between maxRedactions=1 and maxRedactions=1000000 is 0.63-0.95, i.e. the expensive stages cost the same either way. A 10000-candidate document still spends 3.8s before the limit fires and 5.1s when it does not. findSensitiveSpans runs its parsers, detectors, envelopes and merge BEFORE the first tokenFor, so the limit cannot influence any of it.",
+      "impact": "Documentation and contract mismatch, with no security consequence. L1 holds: a request that trips the limit is answered 413 with upstreamFetch 0, and the failure throws so no partial document is returned. The problem is that SECURITY.md and README.md present lowering REDACT_MAX_REDACTIONS as a memory-constrained-deployment knob, which reads as a resource guard. It is an entity-allocation and output limit; CPU and memory before the first mint are unaffected by it. Severity Low / docs.",
+      "status": "open",
+      "recommendation": "Keep the mechanism, fix the description: state that it caps distinct entity identities and that it takes effect at the minting stage, so it does not bound candidate processing. The name MAX_REDACTIONS was accurate for its semantics but invites the wrong reading; a comment and doc line should say which stage it fires at. Any actual CPU bound would be a separate candidate-count or time budget enforced BEFORE the merge.",
+      "regression": "test/r35-limits.test.js -- the unique-versus-span-versus-occurrence distinction, the exact boundary for limits 1/2/3/5, fail-closed with no partial output, 413 with no upstream fetch, and an explicit L4 test recording that maxRedactions does NOT bound the pre-mint stages (asserting the span set is a function of the document, not of the limit).",
+      "verification": "The sweep this replaces was a same-document differential, which is what makes the timing claim a measurement rather than an inference from source order."
+    },
+    {
+      "id": "R3-LIMIT-003",
+      "seed": "n/a",
+      "input": "a non-stream upstream response larger than any configured bound",
+      "config": "default deployment configuration",
+      "expected_invariant": "If a request body has a size limit, the analogous response path should be documented as having one too, or the absence should be stated.",
+      "observed": "The non-stream response path calls `await upstreamResponse.text()`, which materialises the entire textual response, and there is no REDACT_MAX_RESPONSE_BYTES or equivalent. A request body is bounded; the response is not. The SSE path is separate and streams.",
+      "impact": "Deployment robustness gap, recorded as an OBSERVATION rather than a finding: no documentation promises a response limit, so nothing is contradicted. The asymmetry is still worth knowing, because a deployment sizing memory from REDACT_MAX_BODY_BYTES would be sizing only half the path.",
+      "status": "open",
+      "recommendation": "Either add a response size bound with the same capped-read treatment as the request side, or state in the deployment notes that response buffering is unbounded and the upstream is expected to be trusted for response size. Do not treat this as an implementation bug until a limit is actually promised."
     }
   ]
 }
