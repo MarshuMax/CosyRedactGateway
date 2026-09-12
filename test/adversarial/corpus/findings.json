@@ -498,6 +498,23 @@
       },
       "closing_basis": "Closed on the stated condition: the 8000/16000 totals approach ~2x per doubling, us/span no longer rises, and every stage measures linear-ish. Not closed merely because the three known passes were each reduced to sorting cost -- the curve was re-measured after the last change and the whole pipeline, not just the named passes, is what the numbers above describe.",
       "regression": "test/b2-containment.test.js now also pins: (a) the zero-width containment argument, exhaustively over bounds pairs; (b) the disjoint detector against a pairwise overlaps oracle, 9 edge shapes plus 50000 seeded sets; (c) a bounded linearity check on span density, which is the only kind of assertion that can catch this class of defect -- all three fast paths replaced passes that provably reproduced their own input, so every semantic assertion passed while the pipeline was quadratic."
+    },
+    {
+      "id": "R3-REDOS-004",
+      "seed": "n/a (deterministic)",
+      "input": "a repeated SIMPLE opener with no closer anywhere after it: `'<'` repeated with no `>`, or an isolated `'{'` repeated with no `}`",
+      "config": "default detectors; one real surviving span present so the Phase 3 fast-path does not skip the scanner",
+      "expected_invariant": "The simple-opener branch asks one question per hit -- where is the first closer at or after `from`? -- and `from` is non-decreasing across the whole scan, so answering it must not cost a fresh suffix scan each time.",
+      "observed": "`text.indexOf(closer, from)` was called afresh for every occurrence, each walking the entire remaining suffix. Measured on the exported helper (unlimited budget, so this is the algorithm): `'<'` repeated 1.1 / 3.8 / 23.1ms at 2K / 8K / 32K, and an isolated `'{'` repeated 30.4 / 350.9 / 4968.9ms. Both quadratic.",
+      "impact": "Availability / CPU, and it was NOT covered by the R3-REDOS-002 work budget -- that budget deliberately charges only the JS balanced scan, and charging indexOf instead destroyed the budget's discriminating power.",
+      "status": "fixed",
+      "severity": "release-blocking (same gate as R3-REDOS-002: attacker-controlled legal input must not put the production path into unbounded quadratic CPU)",
+      "fix": "ALGORITHMIC, not a budget. A per-closer monotone cache: if the cached index is still >= `from` it is still the FIRST closer at or after it, and once indexOf returns -1 for a position every later position also gets -1, so the family is never searched twice. No O(n) side array is needed; the cached position only ever moves forward.",
+      "why_this_class_is_not_redos_002": "Different mechanism and different code path. R3-REDOS-002 is the balanced `owed` scan over repeated FAILED starts and is bounded by the work budget. This is ordinary indexOf suffix re-scanning in the SIMPLE branch and is fixed algorithmically.",
+      "correction_of_my_earlier_claim": "My earlier note named 'one `%` per line' as the reproducer. That was WRONG and the code comment said so too, now corrected: `%` has no name-only constraint to fail against and `%%` closes immediately, so a repeated `%` measures 3.8 / 5.9 / 6.4ms at 4K / 16K / 64K -- linear. The real reproducers are `<` with no `>` and an isolated `{` with no `}`.",
+      "which_branch_each_family_takes": "`<` -> simple branch -> now LINEAR via the cache, and it SUCCEEDS (status 200, ~60ms flat from 4K to 64K). An isolated `{` -> simple branch -> LINEAR (5.3 / 8.6 / 11.6ms at 8K / 32K / 128K). A REPEATED `{{` -> the balanced branch, because two adjacent braces form the `{{` opener, so that family is R3-REDOS-002 and is bounded to a 413 by the work budget.",
+      "differential": "The cache is verified as a QUERY equivalence, not merely a result equivalence: for every simple-opener hit the cached answer was compared with the unsuffixed indexOf answer, position by position. 14 targeted cases producing 3030 calls with 0 differences, plus 60000 seeded random strings with 0 differences, plus exact-array comparison of start/end/opener/order throughout. The cases cover repeated `<` with no `>`, repeated isolated `{` with no `}`, one final closer shared by many invalid openers, valid siblings, invalid name then later valid name, adjacent `%VAR%%OTHER%`, a stray `%` in prose, mixed simple and balanced constructs, success jumping i=end, and failure advancing i.",
+      "regression": "test/redos-work-budget.test.js -- linearity of the repeated-opener family, per-call query equivalence with over 1000 compared calls, and that isolated simple openers SUCCEED rather than being refused."
     }
   ],
   "r3_3_baselines": {

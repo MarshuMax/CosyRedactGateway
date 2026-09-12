@@ -1177,6 +1177,33 @@ export function referenceEnvelopes(text, options = {}) {
   // path passes a capped budget explicitly.
   const maxWork = options.maxWork;
   if (typeof text !== "string" || text.length === 0) return [];
+  // Monotone cache for the SIMPLE opener families (`%VAR%`, `<VAR>`, `{var}`).
+  //
+  // Those branches ask one question: where is the FIRST closer at or after `from`? Both loops only
+  // ever move forward -- the outer `i` advances on every iteration and `from` is derived from it --
+  // so for each closer the query position is NON-DECREASING. Caching the last answer therefore makes
+  // the whole family linear: a cached index at or after `from` is still the first one, and once
+  // indexOf returns -1 for a position, every later position gets -1 too.
+  //
+  // This is what makes a repeated opener with NO closer after it linear. Before, each occurrence ran
+  // indexOf across the entire remaining suffix: measured 30.4ms / 350.9ms / 4968.9ms at 2K / 8K /
+  // 32K for `'{'` repeated with no `}` (R3-REDOS-004).
+  //
+  // Recorded separately because it is NOT the same defect as R3-REDOS-002: this is ordinary
+  // `indexOf` re-scanning, not the balanced `owed` scan, and it is fixed algorithmically rather than
+  // by the work budget.
+  const simpleCloserCache = new Map();
+  const nextSimpleCloser = (closer, from) => {
+    const state = simpleCloserCache.get(closer);
+    if (state !== undefined) {
+      if (state < 0) return -1;              // exhausted: every later `from` is larger, so still -1
+      if (state >= from) return state;       // still the first closer at or after `from`
+    }
+    const index = text.indexOf(closer, from);
+    simpleCloserCache.set(closer, index);
+    return index;
+  };
+
   let work = 0;
   const charge = (n) => {
     work += n;
@@ -1196,19 +1223,17 @@ export function referenceEnvelopes(text, options = {}) {
       // `%VAR%`, `<VAR>`, `{var}`: no nesting, and a name-only body, so a stray `%` in prose
       // or a stray `<` in a comparison cannot open a region.
       //
-      // NOT charged, deliberately, and this is a KNOWN GAP rather than an oversight.
+      // Not charged: the query below is answered by a MONOTONE CACHE, so it is linear by construction
+      // rather than by budget. See `nextSimpleCloser`.
       //
-      // indexOf may walk the whole remaining suffix, so a document with many UNCLOSED simple openers
-      // (e.g. one `%` per line) is ALSO quadratic, inside a native call. Charging the suffix length
-      // here would bound it -- but measurement showed the charge destroys the budget's
-      // discriminating power: legitimate corpora then reach work/len of 305 at 4 KiB rising to 4109
-      // at 64 KiB (measurably per-length, not constant), against the JS-loop attack's 1021, so no
-      // per-length factor separates them and ordinary documents containing percent signs would be
-      // refused.
+      // The class that was quadratic here is a REPEATED OPENER with NO closer anywhere after it --
+      // `<` with no `>`, or an isolated `{` with no `}` -- where every occurrence ran indexOf over
+      // the whole remaining suffix. A repeated `%` is NOT a proven member of that class, because `%`
+      // has no name-only constraint to fail against and `%%` closes immediately.
       //
-      // So this budget covers the JS balanced-scan class only. The simple-opener class needs its own
-      // treatment and is recorded as an open finding rather than papered over here.
-      const end = text.indexOf(found.closer, i + found.opener.length);
+      // (An earlier version of this comment said "one `%` per line" and cited a known gap. The
+      // example was wrong and the gap is now closed algorithmically.)
+      const end = nextSimpleCloser(found.closer, i + found.opener.length);
       if (end < 0) { i++; continue; }
       const candidate = text.slice(i, end + found.closer.length);
       if (found.namePattern && !found.namePattern.test(candidate)) { i++; continue; }
