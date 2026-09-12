@@ -1217,8 +1217,28 @@ export function referenceEnvelopes(text) {
     out.push({ start: i, end, opener: found.opener });
     i = end;
   }
-  // Drop envelopes fully contained in another: the OUTERMOST construct is the boundary.
-  return out.filter((env) => !out.some((other) => other !== env && other.start <= env.start && other.end >= env.end && (other.end - other.start) > (env.end - env.start)));
+  // NO containment filter here, deliberately. There used to be one:
+  //
+  //   return out.filter((env) => !out.some((other) => ... contains ...));
+  //
+  // It was O(|out|^2) and it never removed anything. `out` is sorted and strictly DISJOINT by
+  // construction -- on success the loop sets i = envelope.end, and on failure it advances i by one
+  // without pushing -- so no envelope can overlap another, and containment requires overlap.
+  //
+  // Measured before deleting it: raw vs filtered were identical over every string of length 0..5 on
+  // a 10-character alphabet (111111 strings), over 120000 pseudo-random strings of length 1..64, and
+  // over the corpus that exposed the cost (49843 sibling envelopes, raw == filtered, zero overlaps,
+  // zero containments). `${{ a: {b:1}}}`, the nearest thing to a nested case, yields a single
+  // envelope: the balanced scan already consumed the inner construct.
+  //
+  // The cost of keeping it was not academic: on a document with one construct per line it was 9.5
+  // seconds out of 9.8 at 4 MiB -- 97% of the function, all of it wasted (R3-BODY-002).
+  //
+  // Deleting beats rewriting here. A step that provably never changes its input should be removed
+  // rather than made faster, and a deletion cannot hide a semantic drift the way an equivalent-but-
+  // different algorithm could: anything this filter was quietly providing now shows up as a
+  // differential failure immediately.
+  return out;
 }
 
 /** The innermost reference envelope strictly containing [start,end), if any. */
