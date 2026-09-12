@@ -3831,6 +3831,78 @@ export function applyResponsePolicy(data, ctx, trusted = null, registry = null) 
   return data;
 }
 
+/**
+ * Wrap an upstream SSE body, checking each completed event for over-deep nesting.
+ *
+ * PASS-THROUGH by design: every chunk is forwarded exactly as it arrived. An earlier version
+ * accumulated whole events and re-emitted them, which quietly destroyed the streaming contract --
+ * chunks stopped corresponding to upstream chunks and incremental delivery broke. This wrapper may
+ * only OBSERVE.
+ *
+ * The check runs BEFORE the event reaches streamFields(), because streamFields collects string
+ * leaves recursively: guarding after it would guard the wrong side of the recursion.
+ *
+ * When it trips, the offending event is not emitted, an error event is written and the upstream
+ * reader is cancelled. It deliberately does NOT fall back to the assistant_text policy on the raw
+ * payload -- that downgrade is what turned a deep untrusted tool operand into plaintext on the
+ * non-stream path.
+ */
+export function guardSseDepth(body, maxDepth = MAX_JSON_DEPTH) {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const reader = body.getReader();
+  // A small tail is retained purely so a delimiter spanning two chunks is still seen.
+  let tail = "";
+  let tripped = false;
+  const DELIM = /\r?\n\r?\n/g;
+
+  const inspect = (window) => {
+    DELIM.lastIndex = 0;
+    let match;
+    while ((match = DELIM.exec(window)) !== null) {
+      const start = window.lastIndexOf("\n", match.index);
+      const raw = window.slice(window.lastIndexOf("\n\n", match.index) + 2 >= 0 ? 0 : 0, match.index);
+      void raw;
+    }
+    // Split the window into event blocks and check each complete one.
+    const blocks = window.split(/\r?\n\r?\n/);
+    for (let i = 0; i < blocks.length - 1; i++) {
+      const dataLine = blocks[i].split(/\r?\n/).filter((l) => l.startsWith("data:")).map((l) => l.slice(5).replace(/^ /, "")).join("\n");
+      if (!dataLine || dataLine === "[DONE]") continue;
+      let parsed = null;
+      try { parsed = JSON.parse(dataLine); } catch { continue; }
+      if (parsed !== null && exceedsJsonDepth(parsed, maxDepth)) return true;
+    }
+    return false;
+  };
+
+  return new ReadableStream({
+    async pull(controller) {
+      if (tripped) return;
+      const { done, value } = await reader.read();
+      if (done) { controller.close(); return; }
+      // Inspect a window that ends at the last complete delimiter, then forward `value` UNCHANGED.
+      const window = tail + decoder.decode(value, { stream: true });
+      if (inspect(window)) {
+        tripped = true;
+        controller.enqueue(encoder.encode(
+          `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "gateway_depth_limit", message: `SSE event exceeds structural depth limit (${maxDepth})` } })}\n\n`
+        ));
+        try { await reader.cancel(); } catch { /* already closed */ }
+        controller.close();
+        return;
+      }
+      // Keep only the unconsumed tail: everything before the final delimiter has been inspected.
+      const lastDelim = Math.max(window.lastIndexOf("\n\n"), window.lastIndexOf("\r\n\r\n"));
+      tail = lastDelim >= 0 ? window.slice(lastDelim) : window;
+      // Bound the tail so a pathological event cannot grow it without limit.
+      if (tail.length > 1 << 20) tail = tail.slice(-(1 << 20));
+      controller.enqueue(value);
+    },
+    async cancel() { try { await reader.cancel(); } catch { /* already closed */ } },
+  });
+}
+
 export function restoreSseStream(body, ctx, trusted = null, registry = null) {
   const reader=body.getReader();
   const decoder=new TextDecoder();
@@ -3890,7 +3962,7 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null) {
   });
 }
 
-async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trusted = null, registry = null) {
+async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trusted = null, registry = null, maxDepth = MAX_JSON_DEPTH) {
   const headers=withCors(upstreamResponse.headers,corsOrigin); headers.delete("content-encoding");
   if (!upstreamResponse.body || upstreamResponse.status===204 || upstreamResponse.status===304) return new Response(null,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
   const ct=headers.get("content-type") || "";
@@ -3898,17 +3970,29 @@ async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trust
   const text=await upstreamResponse.text();
   let out=text;
   if (isJsonContentType(ct)) {
+    // ONLY malformed JSON reaches the inert-text fallback. The previous form wrapped
+    // JSON.parse, applyResponsePolicy AND JSON.stringify in one try, so ANY traversal failure --
+    // including the RangeError a deep operand used to cause -- silently downgraded the whole
+    // response to the assistant_text policy. That is a sink-policy fail-open: the response text
+    // still contains the tokens, and assistant_text RESOLVES them, so a token sitting inside an
+    // untrusted tool operand came back as plaintext. Measured before this split, fresh process:
+    // depth 2500 preserved the token, depth 2800 returned the plaintext.
+    //
+    //   parser failure MAY choose inert-text fallback
+    //   policy / traversal failure MUST fail closed
+    let data;
     try {
-      const data=JSON.parse(text);
-      // Protocol-aware: every string is delivered under the sink it belongs to, so a
-      // tool-call operand is not silently substituted.
-      applyResponsePolicy(data, ctx, trusted, registry);
-      out=JSON.stringify(data);
+      data=JSON.parse(text);
     } catch {
-      // Not JSON we can walk: treat the whole body as inert text rather than resolving
-      // tokens we cannot attribute to a channel.
       out=applySinkPolicy(text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted, registry).text;
+      return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
     }
+    if (exceedsJsonDepth(data, maxDepth)) {
+      return jsonError(502, `Upstream response exceeds structural depth limit (${maxDepth})`);
+    }
+    // Not wrapped: a policy failure must propagate rather than quietly become inert text.
+    applyResponsePolicy(data, ctx, trusted, registry);
+    out=JSON.stringify(data);
   } else out=applySinkPolicy(text, ctx, { kind: SINK_KIND.ASSISTANT_TEXT }, trusted, registry).text;
   return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
 }
@@ -3962,6 +4046,45 @@ async function readBodyCapped(request, maxBytes) {
   return { bytes, exceeded: false };
 }
 
+// ------------------------------------------------------------------ depth guard ---
+//
+// One structural depth contract for every recursive path. Deliberately NOT four limits invented
+// per walker: a document's nesting depth is a property of the document, and four numbers would
+// disagree under maintenance.
+//
+// Non-recursive by construction. A guard that recursed would overflow for the very input it exists
+// to catch, which is the trap that produced R3-DEPTH-001.
+//
+// Measured, fresh `node` process, first call: the recursive walkers survive depth 2500 and throw
+// RangeError from 2800 upward. The promised minimum is 128, so 512 leaves a 4x margin over the
+// contract while staying far below the stack boundary.
+export const MAX_JSON_DEPTH = 512;
+
+/**
+ * @returns {boolean} true when `value` nests deeper than `max`.
+ */
+export function exceedsJsonDepth(value, max = MAX_JSON_DEPTH) {
+  if (value === null || typeof value !== "object") return false;
+  // Each stack entry is [node, depth]. Iterative so the check itself cannot overflow.
+  const stack = [[value, 1]];
+  while (stack.length > 0) {
+    const [node, depth] = stack.pop();
+    if (depth > max) return true;
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        const child = node[i];
+        if (child !== null && typeof child === "object") stack.push([child, depth + 1]);
+      }
+      continue;
+    }
+    for (const key of Object.keys(node)) {
+      const child = node[key];
+      if (child !== null && typeof child === "object") stack.push([child, depth + 1]);
+    }
+  }
+  return false;
+}
+
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
@@ -3983,6 +4106,7 @@ export async function handleRequest(request, env = {}, options = {}) {
     || (env?.REDACT_TRUSTED_BROKERS ? String(env.REDACT_TRUSTED_BROKERS).split(",").map((x) => x.trim()).filter(Boolean) : null);
   const maxBody=intSetting(env?.REDACT_MAX_BODY_BYTES,DEFAULT_MAX_BODY_BYTES);
   const maxRedactions=intSetting(env?.REDACT_MAX_REDACTIONS,DEFAULT_MAX_REDACTIONS);
+  const maxDepth=intSetting(env?.REDACT_MAX_JSON_DEPTH,MAX_JSON_DEPTH);
   // Both of these are PROGRAMMATIC production inputs, not test-only knobs, and both were
   // missing here. The consequences were easy to miss because each feature looked wired:
   //
@@ -4001,6 +4125,9 @@ export async function handleRequest(request, env = {}, options = {}) {
     if (bytes.byteLength) {
       let data;
       try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
+      // A payload resource limit, checked before redactJson walks the structure. Refused as 413
+      // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
+      if (exceedsJsonDepth(data, maxDepth)) return jsonError(413, `JSON nesting exceeds ${maxDepth}`);
       try {
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
@@ -4018,7 +4145,11 @@ export async function handleRequest(request, env = {}, options = {}) {
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
     const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
-    return new Response(restoreSseStream(upstreamResponse.body,ctx,trustedSinks,foreignRegistry),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
+    const guarded = guardSseDepth(upstreamResponse.body, maxDepth);
+    // Once the first byte is streaming a 502 is no longer available, so an over-deep event becomes
+    // a stream error and the offending event is never emitted. It must NOT fall back to
+    // assistant_text: that is the fail-open this guard exists to prevent.
+    return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
   }
   return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry);
 }

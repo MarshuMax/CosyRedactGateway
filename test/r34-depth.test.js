@@ -26,7 +26,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { handleRequest, RedactionContext, restoreSseStream } from "../worker.js";
+import { handleRequest, RedactionContext, restoreSseStream, guardSseDepth, exceedsJsonDepth } from "../worker.js";
 
 const FLAGS = "H";
 const SECRET = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
@@ -194,22 +194,137 @@ test("R3.4: container shape is unchanged at depth 128 [GREEN NOW]", async () => 
 // The measured runtime boundary -- recorded, not pinned
 // =====================================================================================
 
-test("R3.4: the runtime boundary is far above the contract, and it is recorded not asserted [GREEN NOW]", async () => {
-  // What this asserts: a depth well inside the contract is safe with a wide margin, and a depth
-  // that IS expected to overflow is not exercised here (it would throw out of the test process).
+test("R3.4: the structural depth guard is exact at 512 [GREEN NOW]", async () => {
+  // The guard measures the depth of the WHOLE body, and the request envelope adds one level
+  // (`{ model, messages, deep }`), so a fixture chain of N sits at depth N+1. An earlier version of
+  // this test treated the fixture depth as the body depth and expected a chain of 512 to pass.
   //
-  // What it records: measured on a fresh `node` process, first call, three repetitions per point,
-  // the boundary sits between 2200 (ok) and 2300 (RangeError) for object, array and alternating
-  // chains alike -- roughly 12-15 KB of body, against a 16 MiB body cap. JSON.parse itself handles
-  // 2500 fine, so the limit is the gateway's own recursion, not the JSON parser.
-  const margin = await roundTrip({ depth: 512, kind: "object", leaf: SECRET });
-  assert.equal(margin.status, 200, "512 is 4x the contract and still completes");
+  // 510 -> body depth 511 -> pass; 511 -> 512 -> pass; 512 -> 513 -> refused.
+  for (const kind of Object.keys(KINDS)) {
+    for (const [chain, expected] of [[128, 200], [510, 200], [511, 200], [512, 413]]) {
+      const result = await roundTrip({ depth: chain, kind, leaf: SECRET });
+      assert.equal(result.status, expected, `${kind} chain=${chain}: expected ${expected}, got ${result.status}`);
+    }
+  }
+});
 
-  // The contract has a wide margin on both sides, which is the actual claim: 128 is required, and
-  // the first failure measured ~2200, so a guard is not needed to satisfy the contract. An earlier
-  // version of this last line was a tautology (`512 * 4 > 2200` is false), which is not an
-  // assertion about anything.
-  assert.ok(2200 > 128 * 4, "the measured boundary is many times the required depth");
+test("R3.4 L1: an over-deep request is refused with no upstream fetch [GREEN NOW]", async () => {
+  const payload = KINDS.object(513, SECRET);
+  const body = JSON.stringify({ model: "g", messages: [{ role: "user", content: "hi" }], deep: payload });
+  let upstreamFetch = 0;
+  const fetchImpl = async () => { upstreamFetch++; return new Response("{}", { headers: { "content-type": "application/json" } }); };
+  const request = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/chat/completions`, {
+    method: "POST", headers: { "content-type": "application/json" }, body,
+  });
+  const response = await handleRequest(request, {}, { fetchImpl, salt: "depth" });
+  assert.equal(response.status, 413, "a payload resource limit is a 413");
+  assert.match(await response.text(), /nesting exceeds 512/, "and names the limit");
+  assert.equal(upstreamFetch, 0, "nothing may be forwarded for a body that was never accepted");
+});
+
+test("R3.4: an over-deep upstream RESPONSE is a 502, not a 413 and not a fallback [GREEN NOW]", async () => {
+  // The upstream call already happened, so this is not the client's bad request. It must fail closed
+  // rather than downgrade the body to inert text.
+  const body = JSON.stringify({ model: "c", max_tokens: 20, messages: [{ role: "user", content: `PASSWORD=${SECRET}` }] });
+  const fetchImpl = async () => new Response(
+    JSON.stringify({ type: "message", role: "assistant", content: [{ type: "text", text: KINDS.object(513, "plain") }] }),
+    { headers: { "content-type": "application/json" } }
+  );
+  const request = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/messages`, {
+    method: "POST", headers: { "content-type": "application/json" }, body,
+  });
+  const response = await handleRequest(request, {}, { fetchImpl, salt: "depth" });
+  assert.equal(response.status, 502, "an over-deep response is an upstream failure");
+  assert.match(await response.text(), /depth limit/);
+});
+
+// =====================================================================================
+// THE REGRESSION THAT MATTERS: an over-deep operand must never yield plaintext
+// =====================================================================================
+
+test("R3.4 SECURITY: an over-deep untrusted tool operand never exposes the token's plaintext [GREEN NOW]", async () => {
+  // The sink-policy fail-open this guard was written for. Before the fix, restoreNonStreamResponse
+  // wrapped JSON.parse, applyResponsePolicy and JSON.stringify in ONE try, so the RangeError from a
+  // deep operand was caught and the WHOLE raw response was re-processed under the assistant_text
+  // policy -- which RESOLVES tokens. A token sitting inside an untrusted tool operand came back as
+  // plaintext, at status 200. Measured fresh-process before the fix: depth 2500 preserved the
+  // token, depth 2800 returned the plaintext, 3/3 each time.
+  const body = JSON.stringify({ model: "c", max_tokens: 20, messages: [{ role: "user", content: `PASSWORD=${SECRET}` }] });
+  for (const depth of [513, 1000, 2800, 3200]) {
+    let token = null;
+    const fetchImpl = async (_u, init) => {
+      const seen = JSON.parse(init.body);
+      token = (JSON.stringify(seen).match(/CRG_[A-Z0-9]+_[A-Z0-9]+/) || [])[0] || null;
+      const response = {
+        type: "message", role: "assistant",
+        content: [{ type: "tool_use", id: "tu", name: "untrusted_tool", input: KINDS.object(depth, token) }],
+      };
+      return new Response(JSON.stringify(response), { headers: { "content-type": "application/json" } });
+    };
+    const request = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body,
+    });
+    const response = await handleRequest(request, {}, { fetchImpl, salt: "depth" });
+    const out = await response.text();
+    assert.ok(token, `depth=${depth}: the fixture must mint a token`);
+    assert.equal(out.includes(SECRET), false, `depth=${depth}: PLAINTEXT MUST NOT APPEAR -> ${JSON.stringify(out.slice(0, 120))}`);
+    assert.equal(response.status, 502, `depth=${depth}: and the response fails closed`);
+  }
+});
+
+test("R3.4 SECURITY: a trajectory that is NOT over-deep still preserves the operand [GREEN NOW]", async () => {
+  // The counterpart, so the test above cannot pass by refusing everything: a shallow operand is
+  // still preserved under the untrusted sink, and a trusted one still resolves.
+  const body = JSON.stringify({ model: "c", max_tokens: 20, messages: [{ role: "user", content: `PASSWORD=${SECRET}` }] });
+  for (const [depth, trusted] of [[1, false], [128, false], [1, "broker"]]) {
+    let token = null;
+    const fetchImpl = async (_u, init) => {
+      const seen = JSON.parse(init.body);
+      token = (JSON.stringify(seen).match(/CRG_[A-Z0-9]+_[A-Z0-9]+/) || [])[0] || null;
+      const response = {
+        type: "message", role: "assistant",
+        content: [{ type: "tool_use", id: "tu", name: trusted || "untrusted_tool", input: KINDS.object(depth, token) }],
+      };
+      return new Response(JSON.stringify(response), { headers: { "content-type": "application/json" } });
+    };
+    const request = new Request(`https://proxy.example/${FLAGS}$https://api.example/v1/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body,
+    });
+    const response = await handleRequest(request, {}, { fetchImpl, salt: "depth", trustedSinks: ["broker"] });
+    const out = await response.text();
+    assert.equal(response.status, 200, `depth=${depth} trusted=${trusted}: must succeed`);
+    if (trusted) {
+      assert.ok(out.includes(SECRET), "a trusted broker resolves the value");
+    } else {
+      assert.equal(out.includes(SECRET), false, "an untrusted operand must not resolve it");
+      assert.ok(out.includes(token), "and must keep the token");
+    }
+  }
+});
+
+test("R3.4: an over-deep SSE event becomes a stream error and cancels the upstream [GREEN NOW]", async () => {
+  // After the first byte is streaming a 502 is no longer available, so the contract is: do not emit
+  // the offending event, emit an error, cancel the reader, and never fall back to assistant_text.
+  let cancelled = false;
+  const deepEvent = `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "x", nested: KINDS.object(513, "y") })}\n\n`;
+  const stream = new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(deepEvent)); },
+    cancel() { cancelled = true; },
+  });
+  const ctx = new RedactionContext({ salt: "depth", requestId: "AAAAAA" });
+  const guarded = guardSseDepth(stream, 512);
+  const out = await new Response(restoreSseStream(guarded, ctx)).text();
+  assert.match(out, /gateway_depth_limit/, "an error event must be emitted");
+  assert.equal(out.includes("\"delta\":\"x\""), false, "and the offending event must not be emitted");
+  assert.equal(cancelled, true, "the upstream reader must be cancelled");
+});
+
+test("R3.4: the guard is non-recursive, so it cannot overflow on the input it catches [GREEN NOW]", () => {
+  // A guard that recursed would fail on exactly the input it exists to reject.
+  let node = "leaf";
+  for (let i = 0; i < 100000; i++) node = { c: node };
+  assert.equal(exceedsJsonDepth(node, 512), true, "a 100000-deep chain is refused without throwing");
+  assert.equal(exceedsJsonDepth({ a: [1, { b: 2 }, [3]] }, 512), false, "and a shallow tree passes");
 });
 
 test("R3.4: every recursive path shares one depth notion [GREEN NOW]", async () => {
