@@ -1384,6 +1384,63 @@ const INFRA_ENVELOPES = Object.freeze([
   },
 ]);
 
+// ------------------------------------------------ base64 representation envelope ---
+//
+// `tokenizeBlocks()` scores runs of `[A-Za-z0-9]+` for entropy, so for a base64 scalar the
+// EVIDENCE covers the core and stops before the padding:
+//
+//   A=cGFzc3dvcmQxMjM0NTY3OA==
+//     ^^^^^^^^^^^^^^^^^^^^^^ evidence      ^^ representation residue left behind
+//
+// The defect is a boundary mismatch, not a scoring mistake: the detector has already shown the
+// core is worth protecting, but nothing treated the trailing `=` as part of the ENCODED SCALAR.
+// Two tempting non-fixes and why they are wrong:
+//
+//   entropy alphabet := [A-Za-z0-9=]+   pollutes the entropy model to solve a representation
+//                                       problem, and would change every score
+//   merge special-cases entropy+gitleaks overlap on `=`   teaches the geometry layer to parse
+//                                       base64 syntax, which it must not know
+//
+// So this is a REPRESENTATION envelope, like the reference and infra ones: the detector keeps the
+// verdict, the representation supplies the boundary. It widens by at most the padding bytes, only
+// when the result is a complete, canonical base64 scalar that STARTS where the detector span
+// starts, and only after more than the declared maximum padding. Anything else is left alone, so a
+// high-entropy run followed by `==` in code or as an operator is not swallowed.
+const BASE64_PAD_MAX = 2;
+
+/**
+ * A complete, canonical base64 scalar that begins at `start` and ends at or after `end`.
+ * @returns {{end:number}|null}
+ */
+function base64ScalarAt(text, start, end) {
+  if (start < 0 || end <= start || end > text.length) return null;
+  // The scalar must begin where the evidence begins, so the envelope can only extend rightwards.
+  if (start > 0) {
+    const before = text[start - 1];
+    // A base64 alphabet character immediately before the span means the span is not the start of a
+    // scalar; the detector simply began mid-run.
+    if (/[A-Za-z0-9+/]/.test(before)) return null;
+  }
+  // Walk right over the base64 alphabet INCLUDING padding, then require canonical form.
+  let at = end;
+  while (at < text.length && /[A-Za-z0-9+/=]/.test(text[at])) at++;
+  const candidate = text.slice(start, at);
+  if (candidate.length < 4 || candidate.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(candidate)) return null;
+  const firstPad = candidate.indexOf("=");
+  if (firstPad >= 0 && firstPad < candidate.length - 2) return null;
+  // The character after the scalar must not be able to continue one.
+  if (at < text.length && /[A-Za-z0-9+/=]/.test(text[at])) return null;
+  // Decoding is only used to confirm the scalar is real; it is not a source of ownership.
+  try {
+    const decoded = atob(candidate);
+    if (/[^\x09\x0a\x0d\x20-\x7e]/.test(decoded)) return null;
+  } catch {
+    return null;
+  }
+  return { end: at };
+}
+
 /**
  * Expand a detector span to the enclosing infrastructure entity, if there is one.
  *
@@ -2699,7 +2756,31 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   //
   // The envelope is the mutation boundary. Detector attribution is preserved: the inner
   // detector decides the ACTION, the construct decides the BOX.
-  const enveloped = selected.map((span) => {
+  // A narrow representation envelope: extend an evidence span across base64 padding only, and
+  // only when the result is a canonical scalar beginning at the span. This runs BEFORE the
+  // reference widening, which may then widen the whole construct as usual.
+  const padded = selected.map((span) => {
+    const end = span.end;
+    if (end >= text.length || text[end] !== "=") return span;
+    // How much padding follows, and no more than the encoding allows.
+    let pad = 0;
+    while (end + pad < text.length && text[end + pad] === "=") pad++;
+    if (pad < 1 || pad > BASE64_PAD_MAX) return span;
+    const scalar = base64ScalarAt(text, span.start, end);
+    if (!scalar || scalar.end !== end + pad) return span;
+    // Widen the BOX, keep the classification input: boundary widening must not change what the
+    // detector is asked to classify, exactly as the reference envelope does.
+    return {
+      ...span,
+      start: span.start,
+      end: scalar.end,
+      classifiedText: text.slice(span.start, span.end),
+      base64Envelope: { coreEnd: span.end, paddingEnd: scalar.end },
+      evidence: [...new Set([...(span.evidence || []), "base64_padding_envelope"])],
+    };
+  });
+
+  const enveloped = padded.map((span) => {
     const env = enclosingReference(text, span.start, span.end);
     if (!env) return span;
     return {

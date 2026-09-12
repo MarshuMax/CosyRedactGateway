@@ -2100,7 +2100,7 @@ surrogate then base64           → UNKNOWN   not protected
 
 构造 `tokenToRaw: {outer → inner(CRG-looking), inner → plaintext}`，验证 `restoreText(outer)` **单趟**返回 `inner`，不会继续解析成明文。**无级联。**
 
-### R2-REP-001（open，未修）
+### R2-REP-001 已修复（fixed）
 
 **一个真实 finding。** 在 K8s Secret 文档探索中发现。
 
@@ -2129,6 +2129,83 @@ data:
 **既有性**：`git stash` 验证修复前后行为一致 ⇒ 与 R2-REG-001/002 无关。
 
 **R1 为何漏掉**：R1 的 token-shape 性质先移除所有完整 token、再检查无 `CRG_` **前缀**残留。**位于完整 token 之后**的残留对该检查不可见——该性质只覆盖了截断，没覆盖尾部残留。这是**性质表述不完整**，不是实现回归。
+
+#### 根因（重新表述）
+
+**"同一明文两个 identity"是后果，不是 ledger 缺陷。** 实际送入 mapping 的 raw 本就不同：
+
+```
+occurrence 1 raw = cGFzc3dvcmQxMjM0NTY3OA==
+occurrence 2 raw = cGFzc3dvcmQxMjM0NTY3OA
+```
+
+`rawToToken` 按自己的 contract 正常分配了第二个 identity。真实链条：
+
+```
+entropy boundary truncation
+  → original representation residue survives
+    → 第二个 occurrence 的 raw 不同
+      → mapping 合法地分配第二个 identity
+```
+
+**真正的缺陷是 `detector evidence boundary ≠ representation mutation boundary`**：detector 已证明核心值得保护，但没有任何环节把尾部 `=` 当作**编码标量的结构边界**。
+
+#### 修复：base64 representation envelope
+
+与 reference / infra envelope 同层同原则——**detector 决定 verdict，representation 决定 mutation boundary**。
+
+`base64ScalarAt()` 仅在以下条件全满足时，把 evidence span 向右扩最多 padding 字节：
+
+```
+1. span 起点就是标量起点（前一字符不属于 base64 字母表）
+2. 追加 1~2 个 padding 后构成完整 canonical base64（长度 %4==0、padding 位置合法）
+3. padding 之后已到标量边界（后续字符不能继续该标量）
+4. 解码为可打印文本
+```
+
+**保留 `classifiedText = 原 detector core`**——boundary widening 不改变分类输入，与 reference envelope 完全一致。
+
+**刻意未做**（按你的判断）：
+
+```
+✗ entropy 字母表加 '='        → 为表示问题污染评分模型，且会移动每一个 score
+✗ merge 里对 entropy+gitleaks overlap 特判 padding
+                              → 让 geometry 层开始解释 base64 语法
+```
+
+#### 修复前先修正两个 regression oracle
+
+**(1) `assert.equal(out.includes(residue), false)` 对 `residue === "="` 永不成立**——赋值语句自身就含 `=`。改为**提取 RHS** 后断言其为一个完整 token。非 canonical 的单 `=` 输入，诚实结果是「token + 遗留字符」，已显式断言。
+
+**(2) `assert.deepEqual(covered, [B64, B64.slice(0, -2)])` 把旧缺陷的形状锁进了测试**——实现变正确后它必然失败。改为期望契约：**每个 occurrence 的 mutation boundary 必须覆盖完整 encoded scalar**。
+
+#### 新 oracle（比"能 base64 round-trip"更接近契约）
+
+K8s 侧现在同时断言：emitted 是 **canonical base64**、**`ctx.ledger.lookup(emitted)` 命中**、**`resolveSurrogate` 是 OWN token**。
+
+#### 实测
+
+```
+修复前： a: Q1JHX0FBQUFBQV8wMDAx    b: Q1JHX0FBQUFBQV8wMDAy==   同一明文两个 identity
+修复后： a: Q1JHX0FBQUFBQV8wMDAx    b: Q1JHX0FBQUFBQV8wMDAx     同一 token、ledger 单条、无残留
+```
+
+#### Negative controls（证明修的是 base64 边界，不是"看见等号就多吃两个字符"）
+
+```
+operator ==           → 不吞 ✅
+代码里的 ==            → 不吞 ✅
+比较链 == ... ==       → 不吞 ✅
+长度 %4≠0             → 不扩大 ✅（单 = 案例：cGFzc3dvcmQxMjM0NTY3OA= 长度 23，本就不是 canonical base64）
+padding 后仍有字母      → 不扩大 ✅
+三段 padding          → 不扩大 ✅
+span 不从标量起点开始    → 不扩大 ✅
+canonical ==          → 扩大 ✅（否则前述 controls 全部空转）
+```
+
+#### 一处实测发现（非缺陷）
+
+`G only` 时 gitleaks **不报**这个 base64 块——该规则**自带 entropy 门槛**，H 关闭即不命中，因而输出原样。所以"无 padding 残留"只在该 flag 组合确实发生脱敏时才适用。
 
 ## 10. 未解决问题 / 待验证
 

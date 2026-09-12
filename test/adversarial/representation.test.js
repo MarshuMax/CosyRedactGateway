@@ -219,83 +219,219 @@ test("R2.5: a restored value that looks like a token is not restored again [RED]
 });
 
 // =====================================================================================
-// FINDING R2-REP-001
+// R2-REP-001 -- FIXED. Base64 representation envelope.
+//
+// Root cause, stated precisely. The consequence was "one plaintext, two identities", but that is
+// NOT a ledger defect: the raw strings handed to the mapping genuinely differed --
+//
+//   occurrence 1 raw: cGFzc3dvcmQxMjM0NTY3OA==
+//   occurrence 2 raw: cGFzc3dvcmQxMjM0NTY3OA
+//
+// -- so rawToToken legitimately allocated two identities. The chain is:
+//
+//   entropy boundary truncation
+//     -> original representation residue survives
+//       -> the second occurrence's raw differs
+//         -> the mapping allocates a second identity, exactly as its contract says
+//
+// The fix is a narrow REPRESENTATION envelope. `tokenizeBlocks()` scores `[A-Za-z0-9]+`, so the
+// evidence stops before the padding; the detector has already shown the core is worth protecting,
+// and what was missing is that the trailing `=` belongs to the ENCODED SCALAR.
+//
+// Deliberately NOT done:
+//   - entropy alphabet := [A-Za-z0-9=]+   that pollutes the entropy model to solve a
+//                                         representation problem, and moves every score
+//   - a merge special case for entropy+gitleaks overlap   that teaches the geometry layer to
+//                                         parse base64, which it must not know
 // =====================================================================================
 
-test("R2-REP-001: a redaction never leaves a partial value beside the replacement [RED]", async () => {
-  // DISCOVERED while exercising K8s Secret documents. The entropy detector's span stops before
-  // base64 padding, so the padding survives next to the replacement:
-  //
-  //   apiVersion: v1
-  //   kind: Secret
-  //   data:
-  //     a: cGFzc3dvcmQxMjM0NTY3OA==   ->  a: Q1JHX0FBQUFBQV8wMDAx        (correct)
-  //     b: cGFzc3dvcmQxMjM0NTY3OA==   ->  b: Q1JHX0FBQUFBQV8wMDAy==      (padding left behind)
-  //
-  // MINIMAL REPRODUCER, no other mechanism involved:
-  //
-  //   A=cGFzc3dvcmQxMjM0NTY3OA==   ->  A=CRG_AAAAAA_0001==
-  //   A=cGFzc3dvcmQxMjM0NTY3OA=    ->  A=CRG_AAAAAA_0001=
-  //   A=cGFzc3dvcmQxMjM0NTY3OA     ->  A=CRG_AAAAAA_0001
-  //
-  // VIOLATED CONTRACT: the replacement is self-delimiting. R1 already asserts that every emitted
-  // token matches ^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$ and that no TRUNCATED PREFIX survives; the
-  // converse -- a complete replacement with leftover characters glued to it -- was never covered.
-  // The emitted value is therefore neither the replacement nor the original.
-  //
-  // IMPACT: integrity and representation correctness, in EVERY context, not only K8s. Round-trip
-  // happens to survive because the surviving `==` is still the original's padding and restoration is
-  // substring-based; that is asserted separately so the claim stays exact. No confidentiality
-  // fail-open.
-  for (const [label, value, residue] of [
-    ["two padding chars", "cGFzc3dvcmQxMjM0NTY3OA==", "=="],
-    ["one padding char", "cGFzc3dvcmQxMjM0NTY3OA=", "="],
-  ]) {
-    // a) the ordinary binding path emits an ASCII token with padding glued on.
-    const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
-    const out = await ctx.redactText(`A=${value}`, FLAGS_PAT);
-    assert.equal(out.includes(residue), false, `${label}: ${JSON.stringify(residue)} must not be left beside the token -> ${JSON.stringify(out)}`);
+const TOKEN_FULL = /^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$/;
+const PADDED = "cGFzc3dvcmQxMjM0NTY3OA==";
+const CORES = { "no padding": PADDED.slice(0, -2), "one =": null, "two ==": PADDED };
 
-    // b) the base64-representation path emits a base64 surrogate, which must still be valid base64
-    //    of a replacement rather than a truncated encode with the original padding appended.
-    const k8s = ["apiVersion: v1", "kind: Secret", "data:", `  a: ${value}`].join("\n");
-    const kctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
-    const kout = await kctx.redactText(k8s, FLAGS_PAT);
-    const emitted = (kout.match(/a: (\S+)/) || [])[1];
-    assert.ok(emitted, `${label}: the fixture must produce a value`);
+/** The value a K8s entry holds, i.e. the RHS of `key:`. */
+const rhsOf = (text, key) => {
+  const m = new RegExp(`(?:^|\\n)\\s*${key}: (\\S+)`).exec(text);
+  return m ? m[1] : null;
+};
+
+test("R2-REP-001: the replacement occupies the whole encoded scalar [RED]", async () => {
+  // ORACLE CORRECTION. An earlier version searched the whole LINE for the residue, which can never
+  // pass for the single-`=` case: the assignment's own `=` is in the line. The contract is about the
+  // VALUE, so the value is extracted and asserted to BE a complete token.
+  const cases = [
+    ["env, two ==", `A=${PADDED}`],
+    ["env, no padding", `A=${PADDED.slice(0, -2)}`],
+    ["yaml, two ==", `a: ${PADDED}`],
+    ["env, padding followed by other text", `A=${PADDED} B=plain`],
+  ];
+  for (const [label, doc] of cases) {
+    const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
+    const out = await ctx.redactText(doc, FLAGS_PAT);
+    const emitted = label.startsWith("yaml") ? rhsOf(`\n${out}`, "a") : out.slice("A=".length).split(" ")[0];
+    assert.ok(emitted, `${label}: a value must be emitted`);
+    assert.match(emitted, TOKEN_FULL, `${label}: the emitted VALUE must be exactly one token -> ${JSON.stringify(out)}`);
+    assert.equal(ctx.restoreText(out), doc, `${label}: round trip exact`);
+  }
+});
+
+test("R2-REP-001: one `=` is not canonical base64 and is correctly not treated as padding [GREEN NOW]", async () => {
+  // `cGFzc3dvcmQxMjM0NTY3OA=` has length 23, so it is NOT a complete base64 scalar; the envelope
+  // must decline it, and the earlier regression asserted the opposite. Asserting the corrected
+  // contract here keeps the negative case explicit rather than silently dropped.
+  const notCanonical = `${PADDED.slice(0, -2)}=`;
+  assert.equal(notCanonical.length % 4 === 0, false, "the fixture must not be canonical base64");
+
+  const doc = `A=${notCanonical}`;
+  const spans = findSensitiveSpans(doc, FLAGS_PAT);
+  assert.equal(spans.length, 1, "the core is still claimed");
+  assert.equal(spans[0].base64Envelope, undefined, "but no padding envelope is applied");
+
+  const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
+  const out = await ctx.redactText(doc, FLAGS_PAT);
+  // The value here is `CRG_..._0001=` -- the token followed by the original's stray `=`. That is the
+  // honest outcome for a non-canonical input: the core is replaced and the character that does not
+  // belong to any encoded scalar is left as ordinary text. An earlier assertion demanded the whole
+  // value be a token, which is the contract for a CANONICAL scalar, not for this one.
+  const emitted = out.slice("A=".length);
+  assert.equal(emitted.startsWith("CRG_"), true, `the core must be replaced -> ${JSON.stringify(out)}`);
+  assert.equal(emitted.endsWith("="), true, "and the non-canonical trailing character is left alone");
+  assert.match(emitted.replace(/=+$/, ""), TOKEN_FULL, "the token itself is complete and well-formed");
+  assert.equal(ctx.restoreText(out), doc, "round trip exact");
+});
+
+test("R2-REP-001: every occurrence's mutation boundary covers its full encoded scalar [RED]", async () => {
+  // ORACLE CORRECTION. The old regression pinned the BUG's shape:
+  //     assert.deepEqual(covered, [B64, B64.slice(0, -2)])
+  // which would fail the moment the implementation became correct. Replaced with the contract: for
+  // each occurrence, the boundary covers the complete encoded scalar.
+  const doc = ["apiVersion: v1", "kind: Secret", "data:", `  a: ${PADDED}`, `  b: ${PADDED}`].join("\n");
+  const spans = findSensitiveSpans(doc, FLAGS_PAT);
+  assert.equal(spans.length, 2, "both occurrences are claimed");
+  for (const span of spans) {
     assert.equal(
-      Buffer.from(emitted, "base64").toString("base64"), emitted,
-      `${label}: the replacement must be canonical base64, not a truncated encode -> ${JSON.stringify(emitted)}`
+      doc.slice(span.start, span.end), PADDED,
+      `each boundary must cover the whole encoded scalar, got ${JSON.stringify(doc.slice(span.start, span.end))}`
     );
   }
 });
 
-test("R2-REP-001: the residue is present in every occurrence of the value [RED]", async () => {
-  // The same defect through the K8s path that surfaced it. Two occurrences of one plaintext produce
-  // two spans -- `gitleaks` matches the padded form and `entropy` the unpadded one -- which overlap
-  // without containment, so the merge keeps both and the padding is left on the second.
-  const doc = ["apiVersion: v1", "kind: Secret", "data:", `  a: ${B64}`, `  b: ${B64}`].join("\n");
-  const spans = findSensitiveSpans(doc, FLAGS_PAT);
-  const covered = spans.map((sp) => doc.slice(sp.start, sp.end));
-  assert.deepEqual(
-    covered, [B64, B64.slice(0, -2)],
-    "the two spans differ by the padding: gitleaks takes the padded form, entropy the unpadded one"
-  );
-
+test("R2-REP-001: a K8s value is a ledger-owned canonical surrogate [RED]", async () => {
+  // Stated as the real contract rather than "it round-trips through base64": the emitted value must
+  // be CANONICAL base64, must BE in the ledger, and must RESOLVE to an owned token.
+  const doc = ["apiVersion: v1", "kind: Secret", "data:", `  a: ${PADDED}`, `  b: ${PADDED}`].join("\n");
   const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
   const out = await ctx.redactText(doc, FLAGS_PAT);
 
-  // Both emitted values must be canonical replacements. The second one is a base64 encode of a
-  // SECOND token with the original padding appended, so decoding it does not yield a token.
-  for (const key of ["a", "b"]) {
-    const emitted = (out.match(new RegExp(`${key}: (\\S+)`)) || [])[1];
-    assert.ok(emitted, `${key}: a replacement must be produced`);
-    assert.equal(
-      isRedactedText(emitted) || Buffer.from(emitted, "base64").toString("base64") === emitted,
-      true,
-      `${key}: the replacement must be a token or canonical base64 -> ${JSON.stringify(emitted)}`
-    );
+  const a = rhsOf(`\n${out}`, "a");
+  const b = rhsOf(`\n${out}`, "b");
+  for (const [key, emitted] of [["a", a], ["b", b]]) {
+    assert.ok(emitted, `${key}: a value must be emitted`);
+    assert.equal(Buffer.from(emitted, "base64").toString("base64"), emitted, `${key}: must be canonical base64`);
+    const entry = ctx.ledger.lookup(emitted);
+    assert.ok(entry, `${key}: the emitted value must be a registered surrogate`);
+    assert.equal(classifyOwnership(emitted, ctx).ownership, "OWN", `${key}: and must resolve to an owned token`);
+    assert.match(resolveSurrogate(emitted, ctx), TOKEN_FULL, `${key}: the resolution must be a token`);
   }
+
+  // And the same semantic raw no longer splits into two identities.
+  assert.equal(a, b, "one plaintext keeps one identity");
+  assert.equal(ctx.restoreText(out), doc, "round trip exact");
+});
+
+test("R2-REP-001: the classification input stays the detector core [GREEN NOW]", async () => {
+  // Boundary widening must not change what the detector is asked to classify -- the same rule the
+  // reference envelope follows.
+  const doc = `A=${PADDED}`;
+  const [span] = findSensitiveSpans(doc, FLAGS_PAT);
+  assert.equal(doc.slice(span.start, span.end), PADDED, "the box covers the scalar");
+  assert.equal(span.classifiedText, PADDED.slice(0, -2), "the verdict input is still the core");
+  assert.deepEqual(span.base64Envelope, { coreEnd: span.start + PADDED.length - 2, paddingEnd: span.start + PADDED.length });
+  assert.ok(span.evidence.includes("base64_padding_envelope"), "and the envelope is recorded as evidence");
+});
+
+test("R2-REP-001: the fix holds across scalars, flags and repetitions [RED]", async () => {
+  const scalars = [
+    ["env", (v) => `A=${v}`],
+    ["yaml", (v) => `a: ${v}`],
+    ["k8s data", (v) => ["apiVersion: v1", "kind: Secret", "data:", `  a: ${v}`].join("\n")],
+  ];
+  const flagSets = [
+    ["H only", { highEntropy: true }],
+    ["G only", { gitleaks: true }],
+    ["H + G", { gitleaks: true, highEntropy: true }],
+  ];
+  for (const [sname, wrap] of scalars) {
+    for (const [fname, flags] of flagSets) {
+      const doc = wrap(PADDED);
+      const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
+      const out = await ctx.redactText(doc, flags);
+      // "No padding survives" only applies once something was actually redacted. Measured: with
+      // `G only` the gitleaks rule does NOT fire on this blob, because that rule gates on its own
+      // entropy check, so nothing is rewritten and the input comes back untouched. Asserting
+      // otherwise demanded a redaction the flag set does not produce.
+      const redacted = out !== doc;
+      if (redacted) {
+        assert.equal(out.includes("=="), false, `${sname}/${fname}: no padding may survive -> ${JSON.stringify(out)}`);
+      }
+      assert.equal(ctx.restoreText(out), doc, `${sname}/${fname}: round trip exact whatever was decided`);
+    }
+  }
+});
+
+test("R2-REP-001: repeated occurrences in one document keep one identity [RED]", async () => {
+  const doc = ["apiVersion: v1", "kind: Secret", "data:", `  a: ${PADDED}`, `  b: ${PADDED}`, `  c: ${PADDED}`].join("\n");
+  const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
+  const out = await ctx.redactText(doc, FLAGS_PAT);
+  const emitted = ["a", "b", "c"].map((k) => rhsOf(`\n${out}`, k));
+  assert.equal(new Set(emitted).size, 1, `three occurrences must share one identity, got ${JSON.stringify(emitted)}`);
+  assert.equal(ctx.ledger.size, 1, "and one ledger entry");
+  assert.equal(ctx.restoreText(out), doc, "round trip exact");
+});
+
+// =====================================================================================
+// NEGATIVE CONTROLS -- proving the fix is a base64 representation boundary and not
+// "eat two characters whenever a high-entropy run is followed by ="
+// =====================================================================================
+
+test("R2-REP-001 NC1: an `==` operator after a high-entropy run is not swallowed [GREEN NOW]", async () => {
+  const cases = [
+    ["operator", "x = aB3kL9mN2pQ7rS4tU6vW8xY0 == 1"],
+    ["inside code", "if (aB3kL9mN2pQ7rS4tU6vW8xY0 == other) {}"],
+    ["comparison chain", "aB3kL9mN2pQ7rS4tU6vW8xY0 == bC4lM8nP3qR8sT5uV7wX9yZ1 == 2"],
+  ];
+  for (const [label, doc] of cases) {
+    const [span] = findSensitiveSpans(doc, FLAGS_PAT);
+    assert.ok(span, `${label}: the high-entropy run is still claimed`);
+    assert.equal(span.base64Envelope, undefined, `${label}: no padding envelope may apply`);
+    const ctx = new RedactionContext({ salt: "r25", requestId: "AAAAAA" });
+    const out = await ctx.redactText(doc, FLAGS_PAT);
+    assert.ok(out.includes("=="), `${label}: the operator must survive -> ${JSON.stringify(out)}`);
+  }
+});
+
+test("R2-REP-001 NC2: a non-canonical or mis-positioned candidate is not widened [GREEN NOW]", async () => {
+  const cases = [
+    ["length not a multiple of four", `A=${PADDED.slice(0, -3)}==`],
+    ["padding followed by more alphabet", `A=${PADDED}extra`],
+    ["padding followed by more padding", `A=${PADDED}=`],
+    ["span does not start the scalar", `xx${PADDED}`],
+    ["no padding at all", `A=${PADDED.slice(0, -2)}`],
+  ];
+  for (const [label, doc] of cases) {
+    const spans = findSensitiveSpans(doc, FLAGS_PAT);
+    for (const span of spans) {
+      assert.equal(span.base64Envelope, undefined, `${label}: must not be widened -> ${JSON.stringify(doc.slice(span.start, span.end))}`);
+    }
+  }
+});
+
+test("R2-REP-001 NC3: a canonical scalar IS widened, so the control is not vacuous [GREEN NOW]", async () => {
+  // Without this, NC1 and NC2 would also pass if the envelope never applied to anything.
+  const doc = `A=${PADDED}`;
+  const [span] = findSensitiveSpans(doc, FLAGS_PAT);
+  assert.ok(span.base64Envelope, "the canonical case must be widened");
+  assert.equal(doc.slice(span.start, span.end), PADDED);
 });
 
 test("R2.5: the representation corpus is deterministic [GREEN NOW]", () => {
