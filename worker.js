@@ -152,10 +152,26 @@ export class ForeignTokenRegistry {
   constructor(namespaces = []) {
     this.namespaces = namespaces.map((entry) => (
       typeof entry === "string"
-        ? { name: entry, matcher: normalizeForeignNamespace(entry) }
-        : { name: entry.name || String(entry.pattern), matcher: normalizeForeignNamespace(entry.pattern) }
+        ? { name: entry, matcher: normalizeForeignNamespace(entry), streamPrefix: null }
+        : {
+            name: entry.name || String(entry.pattern),
+            matcher: normalizeForeignNamespace(entry.pattern),
+            // An explicit prefix used ONLY for streaming holdback. Deriving a possible
+            // prefix from an arbitrary regex is not reliable, and a partial matcher is not
+            // worth writing; the issuer states the prefix instead. Ownership is still
+            // decided by the full matcher.
+            streamPrefix: typeof entry.streamPrefix === "string" && entry.streamPrefix.length > 0
+              ? entry.streamPrefix
+              : null,
+          }
     ));
     this.tokens = new Set();
+  }
+  /** Prefixes a streaming channel must hold back so a token cannot be split across chunks. */
+  streamPrefixes() {
+    const out = [...this.tokens];
+    for (const ns of this.namespaces) if (ns.streamPrefix) out.push(ns.streamPrefix);
+    return out;
   }
   registerTokens(tokens) {
     for (const token of tokens) this.tokens.add(token);
@@ -2809,6 +2825,101 @@ function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.t
 // token, so the stream layer holds it back instead of emitting it. Handles both
 // the v2 prefix and the legacy prefix, since the latter is still recognised on
 // input during the transition.
+/**
+ * The prefixes a stream must hold back, from the AUTHORITIES that can vouch for them:
+ *
+ *   - this layer's own dialect (CRG / legacy), always;
+ *   - the surrogate LEDGER, which is the only source of surrogate eligibility -- a string
+ *     that merely *looks* base64 is not held back, because "looks like" is not ownership;
+ *   - the foreign REGISTRY, via exact registrations and the explicit `streamPrefix` of a
+ *     namespace. Deriving a prefix from an arbitrary regex is not reliable, and a partial
+ *     matcher is not worth writing.
+ */
+export function streamHoldbackPrefixes(ctx, registry = null, sinks = null) {
+  const prefixes = [TOKEN_PREFIX, LEGACY_TOKEN_PREFIX];
+  if (ctx && ctx.ledger) {
+    // Exact visible surrogates: ledger-driven, never shape-driven. Whether a surrogate is
+    // usable in this channel does not change whether it must be held back -- a split
+    // token is broken regardless of the policy applied to it later.
+    for (const entry of ctx.ledger.entries()) prefixes.push(entry.visible);
+  }
+  if (registry && typeof registry.streamPrefixes === "function") {
+    for (const prefix of registry.streamPrefixes()) if (prefix && prefix.length > 0) prefixes.push(prefix);
+  }
+  void sinks;
+  return prefixes;
+}
+
+/**
+ * Length of a trailing fragment that could still grow into one of `prefixes`.
+ * A pure prefix matcher, so it is exact rather than heuristic.
+ */
+export function partialPrefixLength(text, prefixes) {
+  let longest = 0;
+  for (const prefix of prefixes) {
+    if (!prefix) continue;
+    // Two ways a protected string can be mid-flight at the end of the buffer:
+    //
+    //   a) a proper prefix of it is the tail: `v Q1JH` for a base64 surrogate, or `v ACM`
+    //      for a declared `ACME_`. Hold exactly that tail.
+    //   b) the COMPLETE prefix (or exact token) has arrived and the value may continue:
+    //      `v ACME_` and `v ACME_AB` are both an unfinished token. Hold everything from
+    //      the last occurrence of the anchor to the end.
+    //
+    // Case (b) is why a pure prefix matcher is insufficient: after `ACME_` there is no
+    // partial prefix left, yet whether the token continues is unknowable until the next
+    // chunk arrives. A `streamPrefix` is declared precisely because that issuer's tokens
+    // do continue.
+    // (a) a proper prefix of the target is the tail.
+    const max = Math.min(prefix.length - 1, text.length);
+    for (let k = max; k > 0; k--) {
+      if (text.endsWith(prefix.slice(0, k))) { if (k > longest) longest = k; break; }
+    }
+    // (b) the anchor itself has arrived, so the token may be mid-flight after it. This is
+    // checked separately from (a): for `v ACME_AB` the longest proper prefix match is
+    // `ACME_AB` (7 characters), and looking only at that match misses the anchor
+    // entirely, which under-holds and lets the token be emitted in halves.
+    if (prefix.length > 1) {
+      const anchorAt = text.lastIndexOf(prefix);
+      if (anchorAt >= 0) {
+        const held = text.length - anchorAt;
+        if (held > longest) longest = held;
+      }
+    }
+  }
+  return longest;
+}
+
+/**
+ * The prefixes a stream must hold back, from the AUTHORITIES that can vouch for them:
+ *
+ *   - this layer's own dialect (CRG / legacy), always;
+ *   - the surrogate LEDGER, which is the only source of surrogate eligibility -- a string
+ *     that merely *looks* base64 is not held back, because "looks like" is not ownership;
+ *   - the foreign REGISTRY, via exact registrations and the explicit `streamPrefix` of a
+ *     namespace. Deriving a prefix from an arbitrary regex is not reliable, and a partial
+ *     matcher is not worth writing.
+ */
+
+/**
+ * True when the text ends with a COMPLETE registered token (or one matching a namespace
+ * matcher), meaning the ambiguous tail has resolved and can be released.
+ */
+function endsWithCompleteRegistration(text, registry) {
+  if (!registry) return null;
+  let best = null;
+  for (const token of registry.tokens) {
+    if (token && text.endsWith(token) && (!best || token.length > best.length)) best = token;
+  }
+  for (const ns of registry.namespaces) {
+    ns.matcher.lastIndex = 0;
+    for (const f of text.match(ns.matcher) || []) {
+      if (f && text.endsWith(f) && (!best || f.length > best.length)) best = f;
+    }
+  }
+  return best;
+}
+
 function possibleTokenSuffixLength(s) {
   for (const prefix of PROTECTED_TOKEN_PREFIXES) {
     const isLegacy = prefix === LEGACY_TOKEN_PREFIX;
@@ -2971,7 +3082,11 @@ function restoreCompleteStrings(value, ctx, excluded = new Set(), path = [], tru
 }
 
 class SseRestorer {
-  constructor(ctx, trusted = null, registry = null) { this.ctx=ctx; this.trusted=trusted; this.registry=registry; this.channels=new Map(); this.queue=[]; }
+  constructor(ctx, trusted = null, registry = null) {
+    this.ctx=ctx; this.trusted=trusted; this.registry=registry; this.channels=new Map(); this.queue=[];
+    // Built once per stream from the ledger and the registry.
+    this.holdback = streamHoldbackPrefixes(ctx, registry);
+  }
   ingest(raw) {
     const parsed=parseSseEvent(raw);
     const payload=parsed.dataText;
@@ -3000,14 +3115,58 @@ class SseRestorer {
     for (const key of affected) this.maybeFlushChannel(key,false);
     return this.drain();
   }
+  /**
+   * Whether the channel tail could still grow into a protected string.
+   *
+   * Three cases, in increasing subtlety:
+   *   1. the dialect shapes (CRG / legacy) may yet complete;
+   *   2. the tail is a PARTIAL prefix of a holdback string (`v Q1JH`);
+   *   3. the tail ENDS WITH a complete declared prefix or exact token (`v ACME_`).
+   *
+   * Case 3 is why a pure prefix matcher is not enough: `v ACME_` has no partial prefix,
+   * but whether the token continues is unknowable until the next chunk arrives. A
+   * `streamPrefix` is declared precisely because tokens of that issuer do continue.
+   */
+  mustHoldBack(text) {
+    if (possibleTokenSuffixLength(text) > 0) return true;
+    const ambiguous = partialPrefixLength(text, this.holdback);
+    if (ambiguous === 0) return false;
+    // The tail is ambiguous, so it is held. There is deliberately no "the matcher is
+    // satisfied, release it" shortcut.
+    //
+    // An earlier rule released as soon as a namespace matcher was satisfied, and that is a
+    // different statement from "the token has ended": `ACME_[A-Z0-9_]{4,}` accepts
+    // `ACME_ABCD`, so the first half of a split token was emitted and the client received
+    // the token in two pieces. Whether an arbitrary pattern can still be extended is not
+    // decidable in general, so a declared `streamPrefix` is read as "tokens of this issuer
+    // continue until they stop arriving".
+    //
+    // The cost is bounded and explicit: a channel whose final content ends in an ambiguous
+    // tail is released when the stream ends (SseRestorer.finish() forces the flush), never
+    // silently dropped.
+    return true;
+  }
+
   maybeFlushChannel(key,force) {
     const ch=this.channels.get(key); if (!ch || !ch.records.length) return;
-    if (!force && possibleTokenSuffixLength(ch.text)>0) return;
+
+    // Hold back while the tail could still become a protected string, so a surrogate or a
+    // registered foreign token split across deltas is reassembled rather than emitted in
+    // pieces. Both the dialect shapes and the ledger/registry prefixes are considered.
+    //
+    // The channel's records are left UNCONSUMED while holding, so the next delta joins the
+    // same accumulation and the whole run is emitted once, at the first event that
+    // completes it. Consuming them here would leave the queued events permanently unsafe,
+    // because each has already been queued and there is no second pass over the queue.
+    if (!force && this.mustHoldBack(ch.text)) return;
+
     // The CHANNEL's sink decides, so a fragmented tool argument is never resolved
     // part-way through.
     const restored=applySinkPolicy(ch.text,this.ctx,ch.sink,this.trusted,this.registry).text;
+    // The text lands on the FIRST record of the run and the rest are emptied, so
+    // reassembled content is emitted exactly once.
     for (const r of ch.records) r.parent[r.key]="";
-    const last=ch.records[ch.records.length-1]; last.parent[last.key]=restored;
+    const first=ch.records[0]; first.parent[first.key]=restored;
     for (const r of ch.records) { r.ev.pending--; if (r.ev.pending===0) r.ev.safe=true; }
     ch.text=""; ch.records=[];
   }

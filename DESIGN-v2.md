@@ -1084,6 +1084,61 @@ FOREIGN_REGISTERED + trusted broker                 → PRESERVE
 
 `test/g01-protocol-ownership.test.js` 共 8 条，全部穿 `handleRequest()`，覆盖三种 operand delta、三种 operand done、未识别 delta 事件、registered foreign 在正文/操作数/trusted 三种通道、以及**未登记的 token 形状值在操作数里必须被拒**。
 
+## 9.19 G1 Streaming Representation / Ownership Closure（已实现）
+
+`possibleTokenSuffixLength()` 此前只认本层方言（CRG + legacy），因此三种受保护形态**跨 delta 会被拆成碎片交付**：
+
+| 形态 | 状态 |
+|---|---|
+| OWN portable token | 已支持 |
+| legacy token | 已支持 |
+| OWN base64 surrogate | **断裂** |
+| FOREIGN exact token | **断裂** |
+| FOREIGN namespace token | **断裂** |
+
+### holdback 资格同样来自权威，不来自形状
+
+```
+OWN surrogate   → ledger（本请求铸造过的精确可见串）
+FOREIGN         → registry（精确登记，或 namespace 的 streamPrefix）
+dialect         → 本层 token 形状
+```
+
+**"看起来像 base64 就缓存"被明确拒绝**——"像"不是所有权，且会让每个 base64 块都产生停顿。测试断言：未登记的 base64 不产生任何 holdback。
+
+### 命名空间前缀是声明的，不是推导的
+
+从任意 regex 反推"当前后缀是否可能成长为匹配项"不可靠，也不值得写 partial matcher。因此 registry 增加显式 `streamPrefix`：
+
+```js
+{ name: "acme", pattern: /.../, streamPrefix: "ACME_" }
+```
+
+前缀只用于 holdback；**所有权仍由完整 matcher 决定**。
+
+### 三个实现陷阱（都会静默拆散 token）
+
+1. **`slice(0, k)` 的 k 上界**：`"ACME_".slice(0, 4)` 是 `"ACME"` 而非 `"ACME_"`，把上界设成 `length - 1` 时永远测不到声明的前缀本身。
+2. **锚点判定必须独立于循环**：`v ACME_AB` 的最长前缀匹配是 `ACME_AB`（7 字符），只看它就完全错过锚点 `ACME_`；两者必须分别判定并取较大值。
+3. **"matcher 认可" ≠ "token 已结束"**：`ACME_[A-Z0-9_]{4,}` 接受 `ACME_ABCD`，于是上半截被提前放行、客户端收到两段。任意 pattern 是否还能延续**不可判定**，因此 `streamPrefix` 的语义定为"**该 issuer 的 token 会延续，直到不再到达**"，最终由 `SseRestorer.finish()` 释放。
+
+代价有界且显式：以歧义尾结束的通道在**流结束时**强制释放，绝不静默丢弃。
+
+### 待定期间不得消费 records
+
+原实现即使"保持"，也已把 `ch.text` 追加掉、把事件排队——而 `safe` 标志不会再被设置，事件永久卡住。改为**待定期间不消费该 channel 的 records**，让后续 delta 汇入同一累积，在首个"完成"事件处一次性交付。重新组装的内容落在**该 run 的第一条记录**上、其余清空，因此只交付一次。
+
+### 实测
+
+```
+surrogate 全切分（19 个位置）      → ✅ 全部还原
+exact foreign 全切分（23 个位置）  → ✅ 全部保留
+namespace foreign 全切分（16 个位置）→ ✅ 全部保留
+assistant_text  → restore  ✅
+tool_argument   → preserve ✅
+trusted broker  → restore  ✅
+```
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
