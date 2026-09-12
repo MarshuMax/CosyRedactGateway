@@ -787,6 +787,7 @@ const STRONG_KEY_RE = new RegExp(
     "secret", "token", "credential(s)?", "api[_-]?key", "apikey",
     "access[_-]?key", "secret[_-]?key", "private[_-]?key", "client[_-]?secret",
     "auth[_-]?token", "session[_-]?key", "signing[_-]?key", "encryption[_-]?key",
+    "(?:master|client|consumer|app|root)[_-]?key", "sas[_-]?token",
   ].join("|"),
   "i"
 );
@@ -806,20 +807,86 @@ const NON_SECRET_KEY_RE = new RegExp(
 
 // A value that is a reference to another value is not a secret in itself:
 // substituting it would replace a template with a token and break the host file.
-const REFERENCE_VALUE_RE = /^(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]*?\s*\}\}|\{[A-Za-z_][A-Za-z0-9_.]*\}|%[A-Za-z_][A-Za-z0-9_]*%|<[A-Za-z_][A-Za-z0-9_]*>)$/;
+// Values that REFER to a secret rather than being one. Substituting a token here
+// replaces a template or a command substitution with a literal, which corrupts the
+// host file and, in the $( ) case, breaks the very indirection that keeps the
+// secret off disk.
+//
+//   ${VAR}                 shell expansion
+//   $VAR                   shell expansion
+//   ${{ secrets.X }}       GitHub Actions expression (matched greedily: the inner
+//                          `}` must not terminate it early, or `${{` is left behind
+//                          and treated as a literal secret)
+//   $(cmd)                 command substitution / expression
+//   {{ tpl }}              Go template, optionally spaced
+//   %VAR%                  Windows expansion
+//   <var>                  placeholder convention
+const REFERENCE_VALUE_RE = /^(?:\$\{\{.*\}\}|\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]*?\s*\}\}|\{[A-Za-z_][A-Za-z0-9_.]*\}|%[A-Za-z_][A-Za-z0-9_]*%|<[A-Za-z_][A-Za-z0-9_]*>)$/s;
 
 export function normalizeBindingKey(key) {
-  return String(key).trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return String(key)
+    .trim()
+    // Split camelCase and PascalCase boundaries BEFORE lowercasing, so that
+    // `secretName`, `secretKeyRef` and `passwordHash` normalise to
+    // `secret_name`, `secret_key_ref` and `password_hash`. Without this the
+    // metadata-suffix rule never fires on Kubernetes-style field names, which are
+    // overwhelmingly camelCase.
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+// Names that CONTAIN a secret word but denote metadata ABOUT a secret rather than
+// the secret itself. This matters most in Kubernetes, where secretName /
+// secretKeyRef are ordinary, high-frequency fields whose values are names and
+// references -- upgrading them on a substring match would redact identifiers and
+// break manifests.
+//
+// The check is SUFFIX-based on purpose: `password_hash` names a derived value, not
+// the password, and `secret_name`/`private_key_path` name a location. Prefix
+// occurrences (`password_field_value`) stay strong, because there the secret word
+// is the head noun.
+const METADATA_SUFFIXES = Object.freeze([
+  "name", "path", "file", "filename", "dir", "directory", "uri", "url", "ref",
+  "reference", "id", "type", "kind", "class", "label", "annotation", "key",
+  "keys", "hash", "digest", "checksum", "policy", "profile", "provider",
+  "store", "source", "field", "var", "varname", "env", "length", "len", "size",
+  "bytes", "format", "algorithm", "algo", "version", "expiry", "expires",
+  "ttl", "rotation", "manager", "backend", "engine", "managerclass",
+]);
+
+// Canonical credential names that END in a metadata-looking token but ARE the
+// secret itself. Checked before the metadata rule so `api_key` is not demoted by
+// its own `_key` suffix.
+const CANONICAL_SECRET_KEYS = Object.freeze(new Set([
+  // `public_key` is deliberately absent: a public key is not a secret, and it
+  // lives under the same naming family, so including it would only widen the
+  // false-positive surface.
+  "api_key", "apikey", "access_key", "secret_key", "private_key",
+  "signing_key", "encryption_key", "session_key", "client_key", "master_key",
+  "consumer_key", "app_key", "secret_access_key", "sas_token",
+  "api_token", "access_token", "auth_token", "bearer_token", "refresh_token",
+  "id_token", "client_secret", "app_secret", "api_secret", "consumer_secret",
+]));
+
+function hasMetadataSuffix(k) {
+  if (CANONICAL_SECRET_KEYS.has(k)) return false;
+  return METADATA_SUFFIXES.some((suffix) => k.endsWith("_" + suffix) || k.endsWith("." + suffix));
 }
 
 export function classifyKeyStrength(key) {
   const k = normalizeBindingKey(key);
   if (!k) return KEY_STRENGTH.NONE;
   if (NON_SECRET_KEY_RE.test(k)) return KEY_STRENGTH.WEAK;
-  if (STRONG_KEY_RE.test(k)) return KEY_STRENGTH.STRONG;
-  // A bare `key` is deliberately WEAK, so `cache_key`-style names never escalate.
-  if (k === "key" || k.endsWith("_key")) return KEY_STRENGTH.WEAK;
-  return KEY_STRENGTH.NONE;
+  if (!STRONG_KEY_RE.test(k)) {
+    // A bare `key` is deliberately WEAK, so `cache_key`-style names never escalate.
+    return (k === "key" || k.endsWith("_key")) ? KEY_STRENGTH.WEAK : KEY_STRENGTH.NONE;
+  }
+  // Strong word present, but the name denotes metadata about it.
+  if (hasMetadataSuffix(k)) return KEY_STRENGTH.WEAK;
+  return KEY_STRENGTH.STRONG;
 }
 
 function looksLikeReferenceValue(raw) {
@@ -868,14 +935,18 @@ export function parseBindings(text) {
           valueEnd = valueStart + quoted[2].length;
           raw = quoted[2];
         } else {
-          // Reference forms may contain spaces, so they are matched first;
-          // otherwise `{{ some_template }}` would be truncated to `{{` and the
-          // reference check below would never see the whole thing.
-          const bare = /^(\{\{[^}]*\}\}|\$\{[^}]*\}|[^\s#]+)/.exec(rest);
-          if (bare) {
-            valueStart = nameStart;
+          // A bare value runs to the end of the line, or to an unquoted `#`.
+          // Stopping at the first space truncated `correct horse battery staple` to
+          // `correct`, so the rest of the password stayed in the clear.
+          const bare = /^([^#]*?)\s*$/.exec(rest);
+          if (bare && bare[1].length > 0) {
+            // An unterminated quote (a truncated log line, or a stream delta cut
+            // mid-value) must not have the quote swallowed into the value: the
+            // delimiter belongs to the host syntax, not to the secret.
+            const offset = /^["']/.test(bare[1]) ? 1 : 0;
+            valueStart = nameStart + offset;
             valueEnd = nameStart + bare[1].length;
-            raw = bare[1];
+            raw = bare[1].slice(offset);
           }
         }
         if (valueStart >= 0 && raw.length > 0) {
@@ -972,9 +1043,70 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     if (isProtectedValue && isProtectedValue(text.slice(x.start, x.end))) return false;
     return true;
   });
-  candidates.sort((a,b) => b.priority-a.priority || (b.end-b.start)-(a.end-a.start) || a.start-b.start);
+
+  // Containment-aware merge.
+  //
+  // The previous priority-then-drop rule had a redaction-bounds hole:
+  //
+  //   DB_PASSWORD="prefix <PAT> suffix"
+  //                └──── binding span (the whole value) ────┘
+  //                        └── narrower provider hit ──┘
+  //
+  // Priority picked the narrow hit, and the enclosing binding span was then
+  // discarded for overlapping it. Only the PAT was masked and the rest of the
+  // password stayed in the clear.
+  //
+  // Now an enclosing span absorbs the hits inside it and inherits their evidence,
+  // so the redaction covers the full value while the provider/type attribution
+  // survives on the surviving span.
+  const byPriority = candidates.slice().sort((a, b) =>
+    b.priority - a.priority || (b.end - b.start) - (a.end - a.start) || a.start - b.start);
+  const absorbed = new Set();
+  const merged = [];
+  for (const span of byPriority) {
+    const inner = byPriority.filter((other) => other !== span
+      && !absorbed.has(other)
+      && other.start >= span.start && other.end <= span.end
+      && !(other.start === span.start && other.end === span.end));
+    if (!inner.length) { merged.push(span); continue; }
+
+    // Attribution belongs to the most specific hit inside the span, so a provider
+    // rule (`gitleaks`) keeps naming the secret even when a wider binding decides
+    // the redaction bounds. Ties break toward the higher priority, then the
+    // narrower span.
+    const ranked = inner.slice().sort((a, b) =>
+      b.priority - a.priority || (a.end - a.start) - (b.end - b.start));
+    const primaryInner = ranked[0];
+    const evidence = span.evidence ? span.evidence.slice() : [];
+    for (const extra of ranked) {
+      if (extra.type && extra.type !== span.type && !evidence.includes(extra.type)) evidence.push(extra.type);
+    }
+    merged.push({
+      ...span,
+      evidence,
+      // Only inner hits of a DIFFERENT type count as absorbed; an identical span
+      // from another detector is a duplicate, not an absorption, and recording it
+      // would make the metadata self-referential.
+      absorbed: ranked.map((x) => x.type).filter((t) => t && t !== span.type),
+      type: primaryInner.type || span.type,
+      providerType: span.type,
+      priority: Math.max(span.priority, primaryInner.priority ?? 0),
+    });
+    for (const x of inner) absorbed.add(x);
+  }
+
+  // A span that was absorbed as evidence must not also be emitted on its own: the
+  // merged entry inherits its type and priority, so both would carry the same
+  // priority and the narrow one could win the overlap race, restoring the very
+  // bounds bug this merge exists to fix.
+  const absorbedSpans = merged.filter((m) => (m.absorbed || []).length && m.providerType);
+  const isCoveredByMerged = (span) => absorbedSpans.some((m) => m !== span
+    && span.start >= m.start && span.end <= m.end
+    && !(span.start === m.start && span.end === m.end));
+  const emitted = merged.filter((m) => !isCoveredByMerged(m));
+
   const selected = [];
-  for (const s of candidates) if (!selected.some((x) => overlaps(s,x))) selected.push(s);
+  for (const s of emitted) if (!selected.some((x) => overlaps(s, x))) selected.push(s);
   return selected.sort((a,b) => a.start-b.start);
 }
 

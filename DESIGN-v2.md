@@ -455,6 +455,47 @@ D1 覆盖的绑定形式：`.env` 赋值、shell `export KEY=value`、带空格�
 
 每片自带 positive / negative / bounds / round-trip 断言。`entityClassFor` 的分类器不混进这些片，D 结束后单独一刀。
 
+## 9.6 D1.1 共享 evidence 层加固（已实现）
+
+三项都是 D2 及之后的 adapter 会直接复用的层，所以在开 D2 之前先钉住。
+
+### 9.6.1 key 语义边界
+
+`classifyKeyStrength` 原先是 pure substring match，进入 YAML 后误删面会放大。现在：
+
+- **归一化先切 camelCase**（`secretName` → `secret_name`、`secretKeyRef` → `secret_key_ref`、`passwordHash` → `password_hash`）。K8s 字段绝大多数是 camelCase，不切则元数据规则永不触发。
+- **元数据后缀降级**：`_name _path _file _dir _uri _url _ref _reference _id _type _kind _class _label _annotation _key _keys _hash _digest _checksum _policy _profile _provider _store _source _field _var _env _length _size _format _algorithm _version _expiry _ttl _rotation _manager _backend _engine` 结尾 ⇒ `WEAK`。
+- **判定是后缀式**：`password_hash` 指派生值、`secret_name` 指位置；而 `password_value`（强词在前）仍是强。
+- **canonical 白名单优先**：`api_key` / `access_key` / `secret_key` / `private_key` / `signing_key` / `encryption_key` / `session_key` / `master_key` / `client_key` / `access_token` / `client_secret` … 先于元数据规则判定，否则 `api_key` 会被自己的 `_key` 后缀降级。
+- **`public_key` 刻意不属于秘密**：公钥不是秘密，但同属 `*_key` 命名族，纳入只会扩大误删面。
+
+### 9.6.2 containment-aware merge（修正 redaction bounds 漏洞）
+
+原 merge 是「高优先级先占位、overlap 即丢弃」，存在**边界丢失**：
+
+```
+DB_PASSWORD="prefix <PAT> suffix"
+             └──── binding span（整个 value）────┘
+                   └── 更窄的 provider hit ──┘
+```
+
+窄 hit 因优先级胜出，包含它的 binding span 被作为 overlap 丢弃 ⇒ **只遮住 PAT，密码剩余部分继续明文暴露**。实测复现：输出 `DB_PASSWORD="prefix CRG_… suffix"`。
+
+修法：
+
+- 外层 span **吸收**内部更窄的 hit，**redaction bounds 由更宽的 strong binding 决定**，同时把内部 hit 的类型并入 `evidence`；
+- **归因归最具体的 hit**：内部 provider 规则（`gitleaks`）继续命名该秘密（`type` = `gitleaks`，`providerType` = `binding`），否则会有 `ruleId` 被丢；
+- **被吸收的 span 不得再单独 emit**：合并项继承了它的 type 与 priority，两者同时在场时窄的那个可能赢下 overlap 竞争，等于把 bug 又装回去；
+- 同类型同边界的重复项不记为 absorbed（否则元数据自指）。
+
+### 9.6.3 reference 形式
+
+`REFERENCE_VALUE_RE` 补齐 **GitHub Actions `${{ secrets.X }}`**（贪婪匹配，否则内层 `}` 会提前终止、把 `${{` 当字面秘密）与**命令替换 `$(cmd)`**。
+
+`$(...)` 明确按 **reference / expression** 处理，不作为字面秘密：`$(cat /run/secrets/pw)`、`$(vault kv get -field=password …)` 本身就是"不把秘密落盘"的正确做法，替换成 token 反而破坏这层间接。
+
+另外修了一个相关缺陷：**未闭合引号**（截断日志、流式 delta 被切断）会把开引号吞进 value span，导致替换后出现 `KEY=""ABCDEFG…`。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
