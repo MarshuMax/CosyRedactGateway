@@ -765,6 +765,164 @@ function collectRegexSpans(text, regex, type, priority, validator = null) {
 
 function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
 
+// ------------------------------------------------ structured context (D1) -------
+//
+// The binding parser is an EVIDENCE PRODUCER, not a redactor. It locates raw value
+// spans and reports the field name it found them under; the caller merges those
+// spans with every other detector and decides what to do. Nothing here unquotes,
+// decodes or normalises a value: rewriting the host syntax is exactly the failure
+// mode this layer is supposed to avoid, so the span covers the value only (inside
+// the quotes, when there are quotes) and the surrounding `KEY="` / `"` survives.
+
+export const KEY_STRENGTH = Object.freeze({
+  STRONG: "strong",
+  WEAK: "weak",
+  NONE: "none",
+});
+
+// Keys whose value is, by strong convention, an actual secret.
+const STRONG_KEY_RE = new RegExp(
+  [
+    "passw(or)?d", "passwd", "passphrase",
+    "secret", "token", "credential(s)?", "api[_-]?key", "apikey",
+    "access[_-]?key", "secret[_-]?key", "private[_-]?key", "client[_-]?secret",
+    "auth[_-]?token", "session[_-]?key", "signing[_-]?key", "encryption[_-]?key",
+  ].join("|"),
+  "i"
+);
+
+// Keys that merely contain a weak word such as `key` are NOT secrets by
+// convention. Listing the common non-secret shapes explicitly keeps `cache_key`,
+// `build_key`, `partition_key`, `sort_key` and friends out of the strong tier.
+const NON_SECRET_KEY_RE = new RegExp(
+  [
+    "cache[_-]?key", "partition[_-]?key", "sort[_-]?key", "map[_-]?key",
+    "primary[_-]?key", "foreign[_-]?key", "group[_-]?key", "shard[_-]?key",
+    "build[_-]?key", "routing[_-]?key", "dedup(e)?[_-]?key", "cache[_-]?token",
+    "sort[_-]?order", "key[_-]?name", "keyspace",
+  ].join("|"),
+  "i"
+);
+
+// A value that is a reference to another value is not a secret in itself:
+// substituting it would replace a template with a token and break the host file.
+const REFERENCE_VALUE_RE = /^(?:\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{\s*[^}]*?\s*\}\}|\{[A-Za-z_][A-Za-z0-9_.]*\}|%[A-Za-z_][A-Za-z0-9_]*%|<[A-Za-z_][A-Za-z0-9_]*>)$/;
+
+export function normalizeBindingKey(key) {
+  return String(key).trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+export function classifyKeyStrength(key) {
+  const k = normalizeBindingKey(key);
+  if (!k) return KEY_STRENGTH.NONE;
+  if (NON_SECRET_KEY_RE.test(k)) return KEY_STRENGTH.WEAK;
+  if (STRONG_KEY_RE.test(k)) return KEY_STRENGTH.STRONG;
+  // A bare `key` is deliberately WEAK, so `cache_key`-style names never escalate.
+  if (k === "key" || k.endsWith("_key")) return KEY_STRENGTH.WEAK;
+  return KEY_STRENGTH.NONE;
+}
+
+function looksLikeReferenceValue(raw) {
+  return REFERENCE_VALUE_RE.test(raw.trim());
+}
+
+/**
+ * Produce `binding` records: { kind, key, normalizedKey, valueStart, valueEnd,
+ * syntax, evidence }. Raw value span only -- quotes are excluded from the span but
+ * left in the text.
+ */
+export function parseBindings(text) {
+  const out = [];
+  if (typeof text !== "string" || !text) return out;
+  const lines = text.split("\n");
+
+  let lineStart = 0;
+  for (const line of lines) {
+    const add = (record) => out.push(record);
+
+    // Skip shell/YAML comment lines: `# PASSWORD=x` is documentation, not config.
+    if (!/^\s*#/.test(line)) {
+      // Shell keyword form: `export KEY=value`, with optional spaces around `=`.
+      const exportMatch = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*/.exec(line);
+      // Plain assignment. The name must be anchored at line start (after optional
+      // whitespace) so that `kubectl logs --x` or prose containing `=` is not a
+      // binding.
+      const plainMatch = exportMatch ? null : /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*/.exec(line);
+
+      const m = exportMatch || plainMatch;
+      if (m) {
+        const key = m[1];
+        const nameStart = lineStart + m.index + m[0].length;
+        const syntax = exportMatch ? "shell" : "env";
+        const rest = line.slice(m[0].length);
+
+        // Value span: quoted interior when quoted, otherwise the token run. This
+        // never includes surrounding whitespace, which would otherwise be
+        // swallowed by a replacement.
+        let valueStart = -1;
+        let valueEnd = -1;
+        let raw = "";
+        const quoted = /^(["'])((?:\\.|(?!\1).)*)\1/.exec(rest);
+        if (quoted) {
+          valueStart = nameStart + 1;
+          valueEnd = valueStart + quoted[2].length;
+          raw = quoted[2];
+        } else {
+          // Reference forms may contain spaces, so they are matched first;
+          // otherwise `{{ some_template }}` would be truncated to `{{` and the
+          // reference check below would never see the whole thing.
+          const bare = /^(\{\{[^}]*\}\}|\$\{[^}]*\}|[^\s#]+)/.exec(rest);
+          if (bare) {
+            valueStart = nameStart;
+            valueEnd = nameStart + bare[1].length;
+            raw = bare[1];
+          }
+        }
+        if (valueStart >= 0 && raw.length > 0) {
+          const strength = classifyKeyStrength(key);
+          const evidence = ["structured_binding"];
+          if (strength === KEY_STRENGTH.STRONG) evidence.push("strong_secret_key");
+          if (quoted) evidence.push("quoted_value");
+          if (looksLikeReferenceValue(raw)) evidence.push("reference_value");
+          add({
+            kind: "binding",
+            key,
+            normalizedKey: normalizeBindingKey(key),
+            valueStart,
+            valueEnd,
+            syntax,
+            evidence,
+            strength,
+            raw,
+          });
+        }
+      }
+    }
+    lineStart += line.length + 1;
+  }
+  return out;
+}
+
+/**
+ * Binding records that are safe to treat as secret evidence: strong key, and a
+ * value that is not a reference to another value.
+ */
+export function bindingSpansOf(text, kind = "binding") {
+  return parseBindings(text)
+    .filter((b) => b.strength === KEY_STRENGTH.STRONG)
+    .filter((b) => !b.evidence.includes("reference_value"))
+    .map((b) => ({
+      start: b.valueStart,
+      end: b.valueEnd,
+      type: kind,
+      priority: 60,
+      key: b.key,
+      normalizedKey: b.normalizedKey,
+      syntax: b.syntax,
+      evidence: b.evidence,
+    }));
+}
+
 export function findSensitiveSpans(text, flags, deps = {}) {
   // `flags` is detector policy (which detectors run). `deps` is injected runtime
   // state, currently the ownership predicate for already-redacted tokens. Keeping
@@ -803,6 +961,11 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   }
   if (flags.gitleaks) c.push(...collectGitleakSpans(text));
   if (flags.highEntropy) for (const b of tokenizeBlocks(text)) if (isHighEntropyBlock(b.value)) c.push({ start:b.start, end:b.end, type:"entropy", priority:10 });
+  // D1 structured context. This is an ADDITIVE detector: it contributes spans to
+  // the same merge as everything else and never suppresses G/H or returns early.
+  // A parse failure simply contributes nothing, leaving the other detectors to
+  // cover the text -- the parser is evidence, not a security boundary.
+  if (flags.structuredContext !== false) c.push(...bindingSpansOf(text));
 
   const candidates = c.filter((x) => {
     if (protectedSpans.some((p) => overlaps(x, p))) return false;

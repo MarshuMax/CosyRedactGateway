@@ -419,6 +419,42 @@ telemetry 三种：`restore_ok`（全部已登记）/ `restore_miss`（存在未
 1. **`isRedactedText` 是形状判定，不是"发生过敏删"的判定。** 对本身就长得像 token 的输入（如 `API_KEY=CRG_AAAAAAAA_0001`）它返回 `true`，即使一个字都没改。凡是想表达"是否被脱敏"的断言，必须比较输入与输出，不能只用这个谓词——否则会写出自指的假绿断言。
 2. **`assert.match(x, 全局正则)` 不可用**，理由见 9.1。
 
+## 9.5 Structured Context：D1 assignment family（已实现）
+
+**解析器是证据生产者，不是脱敏器。** 它只定位 raw value span 并把字段名报上来，最终的 span merge 仍由统一流程决定。**不 unquote、不 decode、不 normalize**：span 只覆盖引号**内部**，`KEY="` 与结尾的 `"` 原样保留。否则结构化提取层自己就开始改宿主语法了。
+
+D1 覆盖的绑定形式：`.env` 赋值、shell `export KEY=value`、带空格的 `KEY = value`。
+
+统一记录形状（后续 D2/D3 的 adapter 只负责产出同样的 evidence，不各自 redact）：
+
+```js
+{ kind: "binding", key, normalizedKey, valueStart, valueEnd,
+  syntax: "env" | "shell", evidence: [...], strength }
+```
+
+`evidence` 取值：`structured_binding`、`strong_secret_key`、`quoted_value`、`reference_value`。
+
+**key 强弱分档**（裸 `key` 刻意留弱）：
+
+| 档 | 例 |
+|---|---|
+| strong | `password` `passwd` `passphrase` `secret` `token` `credential` `api_key` `access_key` `secret_key` `private_key` `client_secret` `auth_token` `signing_key` `encryption_key` |
+| weak（inert） | 裸 `key`、`*_key`、`cache_key` `partition_key` `sort_key` `map_key` `primary_key` `foreign_key` `group_key` `shard_key` `build_key` `routing_key` `dedupe_key` |
+
+**reference value 不当作字面秘密**：`$VAR`、`${VAR}`、`{{ tpl }}`、`{var}`、`%VAR%`、`<var>` 会被标记 `reference_value` 并排除出 span —— 把模板替换成 token 会破坏宿主文件。
+
+**fail-open 的解析语义**：解析失败或不匹配只贡献 0 个 span，**不 suppress `G`/`H`/其它 detector、不提前返回**。已用开关对照测试固定归因：`structuredContext: false` 时旧漏报复现。
+
+分片计划：
+
+| 片 | 范围 | 状态 |
+|---|---|---|
+| D1 | assignment family（`.env` / `export` / 空格赋值） | 已实现 |
+| D2 | YAML scalar binding（`key: value`、`data:\n  key: value`） | 待做 |
+| D3 | `Authorization`/HTTP header + URL query（`?access_token=`） | 待做 |
+
+每片自带 positive / negative / bounds / round-trip 断言。`entityClassFor` 的分类器不混进这些片，D 结束后单独一刀。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

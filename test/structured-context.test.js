@@ -59,6 +59,7 @@ const BINDING_FORMS = [
   { name: "HTTP header", syntax: "http-header", key: "Authorization", line: `Authorization: Bearer ${SECRET}` },
   { name: "URL query", syntax: "url", key: "access_token", line: `https://api.example.com/v1?access_token=${SECRET}` },
   { name: "YAML base64 field", syntax: "yaml", key: "password", line: `data:\n  password: ${SECRET}` },
+  { name: "spaced assignment", syntax: "env", key: "API_SECRET", line: `API_SECRET = ${SECRET}` },
 ];
 
 // Values the current detector already catches, used as controls so a failure
@@ -75,57 +76,76 @@ function redact(line, flags = GITLEAKS) {
 
 // ------------------------------------------------- 1. the measured defect ---
 
-test("dotted password in an .env assignment is missed today [GREEN NOW]", async () => {
+test("a dotted password in an .env assignment is redacted (D1 fixed the miss) [GREEN NOW]", async () => {
+  // This used to pin the defect: the value class rejected `@`, so the secret was
+  // forwarded verbatim. D1 structured context now supplies the span from the
+  // binding itself, and the assertion is inverted to match.
   const line = `DB_PASSWORD=${SECRET}`;
-  assert.equal(await redact(line), line, "current behaviour: the value is forwarded verbatim");
+  const out = await redact(line);
+  assert.notEqual(out, line, "the value must no longer be forwarded verbatim");
+  assert.equal(out.includes(SECRET), false, "the secret must not survive in the output");
 });
 
-test("the keyword gate is already satisfied, the value class is what fails [GREEN NOW]", async () => {
+test("key-name evidence is what closes the value-class gap [GREEN NOW]", async () => {
   // Localises the defect: same key name, only the value's character set differs.
   for (const [label, value] of DETECTED_VALUES) {
     const line = `DB_PASSWORD=${value}`;
     const out = await redact(line);
     assert.equal(isRedactedText(out), true, `${label} must be detected, proving the key gate passes`);
   }
-  // Same key name, `@` in the value: missed.
+  // Same key name, `@` in the value: now covered, because the binding supplies the
+  // span instead of the value character class having to match.
   const dotted = `DB_PASSWORD=${SECRET}`;
-  assert.equal(isRedactedText(await redact(dotted)), false, "a symbol-bearing value is still missed");
-
-  // And the same holds without any surrounding syntax at all: the value class is
-  // the discriminator, so the binding form adds no protection either.
-  assert.notEqual((await redact(`DB_PASSWORD=${SECRET}`)).length, (await redact(`DB_PASSWORD=Pr0d-Passw0rdXy9Zk2mQ`)).length);
+  assert.equal((await redact(dotted)).includes(SECRET), false, "structured binding covers it");
 });
 
-test("every binding form misses a symbol-bearing password [GREEN NOW]", async () => {
+test("D1 closes the env/shell forms; YAML/header/URL are still open [GREEN NOW]", async () => {
+  // D1 covers the assignment family only. The remaining three forms are D2/D3 and
+  // are expected to still miss -- recorded here so D2/D3 have a baseline to flip.
   const missed = [];
   for (const form of BINDING_FORMS) {
     const out = await redact(form.line);
-    if (!isRedactedText(out)) missed.push(form.name);
+    if (!out.includes(SECRET)) continue; // covered
+    missed.push(form.name);
   }
-  assert.deepEqual(missed, BINDING_FORMS.map((f) => f.name), "all six forms currently miss");
+  assert.deepEqual(missed, ["YAML mapping", "HTTP header", "URL query", "YAML base64 field"]);
 });
 
-test("the miss is identical under the full flag set [GREEN NOW]", async () => {
-  // Rules out the possibility that some other detector (secret, entropy) is
-  // supposed to cover this and only the `G` flag was missing.
-  for (const form of BINDING_FORMS) {
-    const out = await redact(form.line, ALL);
-    assert.equal(out, form.line, `${form.name} is missed with every detector enabled`);
-  }
+test("the fix is attributable to structured context, not another detector [GREEN NOW]", async () => {
+  // Turning the structured detector off reproduces the old behaviour on the same
+  // fixture, which is what makes D1 the attributable cause rather than, say, a
+  // widened entropy threshold.
+  const line = `DB_PASSWORD=${SECRET}`;
+  const withStructured = await redact(line, { gitleaks: true, structuredContext: true });
+  const without = await redact(line, { gitleaks: true, structuredContext: false });
+  assert.equal(withStructured.includes(SECRET), false, "structured context covers it");
+  assert.equal(without, line, "without structured context the value class still misses it");
 });
 
 // --------------------------------------------------- 2. target behaviour -----
 
-test("a symbol-bearing password is redacted in every binding form [RED]", async () => {
-  for (const form of BINDING_FORMS) {
+const D1_FORMS = BINDING_FORMS.filter((f) => ["env", "shell"].includes(f.syntax) && !f.line.includes("\n"));
+const D2_D3_FORMS = BINDING_FORMS.filter((f) => !D1_FORMS.includes(f));
+
+test("D1: assignment-family bindings are redacted [GREEN NOW]", async () => {
+  for (const form of D1_FORMS) {
     const out = await redact(form.line);
-    assert.equal(isRedactedText(out), true, `${form.name} must be redacted`);
+    assert.equal(out.includes(SECRET), false, `${form.name} must not forward the secret verbatim`);
+  }
+  assert.equal(D1_FORMS.length, 3, "fixture must cover .env, shell export and spaced assignment");
+});
+
+test("D2/D3: YAML / header / URL bindings are not covered yet [RED]", async () => {
+  // Baseline for the next two slices. These assert the TARGET, and are expected to
+  // fail until D2 (YAML scalar) and D3 (header + URL query) land.
+  for (const form of D2_D3_FORMS) {
+    const out = await redact(form.line);
     assert.equal(out.includes(SECRET), false, `${form.name} must not forward the secret verbatim`);
   }
 });
 
-test("redaction covers exactly the value, not the binding syntax [RED]", async () => {
-  for (const form of BINDING_FORMS) {
+test("redaction covers exactly the value, not the binding syntax [GREEN NOW]", async () => {
+  for (const form of D1_FORMS) {
     const out = await redact(form.line);
     // Guard: without this the prefix/suffix assertions below pass vacuously
     // whenever the value was not redacted at all, which is the current state.
@@ -136,23 +156,26 @@ test("redaction covers exactly the value, not the binding syntax [RED]", async (
   }
 });
 
-test("round-trip is byte-identical once the value is redacted [RED]", async () => {
+test("round-trip is byte-identical once the value is redacted [GREEN NOW]", async () => {
   const ctx = new RedactionContext({ salt: "fixture" });
-  for (const form of BINDING_FORMS) {
+  for (const form of D1_FORMS) {
     const out = await ctx.redactText(form.line, GITLEAKS);
     assert.equal(isRedactedText(out), true, `${form.name}: value must be redacted before round-trip is meaningful`);
     assert.equal(ctx.restoreText(out), form.line, `${form.name}: round-trip must be byte-identical`);
   }
 });
 
-test("structured extraction exposes the key name as evidence [RED]", () => {
-  // The target interface: span detection should surface the enclosing field name
-  // so that a low-entropy value is still protected on key evidence alone.
-  for (const form of BINDING_FORMS) {
+test("structured extraction exposes the key name as evidence [GREEN NOW]", () => {
+  // The D1 interface: a binding span carries the enclosing field name and the
+  // evidence that produced it, so a low-entropy value is protected on key evidence
+  // alone. YAML/header/URL forms are D2/D3 and are excluded here.
+  for (const form of D1_FORMS) {
     const spans = findSensitiveSpans(form.line, GITLEAKS);
-    const hit = spans.find((s) => form.line.slice(s.start, s.end).includes(SECRET));
-    assert.ok(hit, `${form.name}: expected a span covering the value`);
-    assert.equal(hit.key, form.key, `${form.name}: span should carry the enclosing key name`);
+    const hit = spans.find((x) => x.type === "binding" && x.key);
+    assert.ok(hit, `${form.name}: expected a binding span`);
+    assert.equal(hit.key, form.key, `${form.name}: span must carry the enclosing key name`);
+    assert.equal(hit.syntax, form.syntax, `${form.name}: span must carry the syntax`);
+    assert.ok(hit.evidence.includes("strong_secret_key"), `${form.name}: strong key evidence`);
   }
 });
 
@@ -166,21 +189,24 @@ test("an unquoted low-entropy password is protected by key evidence [RED]", asyn
 
 // --------------------------------------------- 5. keyword gate coverage gaps ---
 
-test("the left-hand name has to carry a strong word, not just any key [GREEN NOW]", async () => {
-  // Measured. Two gates must pass: the name must reach the rule's keyword set and
-  // the value must match the value character class. For a plain alnum value the
-  // name gate is the discriminator: `DB_PASSWORD` is detected, a bare `API_KEY` is
-  // not, while a base64-shaped value is detected under either name.
-  //
-  // This corrects two earlier claims made in this file: that `API_KEY` fails the
-  // keyword gate (it is simply a weaker match than password/secret/token), and
-  // that value shape alone explains the miss.
+test("strong vs weak key tiers, measured after D1 [GREEN NOW]", async () => {
+  // What the tiers actually buy, asserted against the implementation:
+  //   - strong names (password / secret / token / api_key) protect any value shape
+  //   - weak names (bare `key`, `cache_key`) stay inert so identifiers are not eaten
+  //   - a reference value is never treated as a literal secret
   const changed = async (line) => (await redact(line)) !== line;
 
-  assert.equal(await changed("DB_PASSWORD=SuperSecret123"), true, "password-bearing name + plain value");
-  assert.equal(await changed("API_KEY=SuperSecret123"), false, "bare `key` name + plain value is missed");
-  assert.equal(await changed("API_KEY=cGFzc3dvcmQxMjM0NTY3OA=="), true, "base64 value rescues the bare key name");
-  assert.equal(await changed("API_KEY=CRG_AAAAAAAA_0001"), false, "underscore-bearing value is not a candidate");
+  assert.equal(await changed("DB_PASSWORD=SuperSecret123"), true, "password tier");
+  assert.equal(await changed("API_KEY=SuperSecret123"), true, "api_key is in the strong tier");
+  assert.equal(await changed("API_KEY=CRG_AAAAAAAA_0001"), true, "strong name protects a token-shaped value");
+  assert.equal(await changed("API_SECRET = valued"), true, "spaces around `=` are allowed");
+
+  assert.equal(await changed("cache_key=CRG_AAAAAAAA_0001"), false, "cache_key must stay inert");
+  assert.equal(await changed("partition_key=abcdefghijkl"), false, "partition_key must stay inert");
+  assert.equal(await changed("SORT_KEY=abcdefghijkl"), false, "bare key tier must stay inert");
+  assert.equal(await changed("PASSWORD=${PASSWORD}"), false, "a reference is not a literal secret");
+  assert.equal(await changed("PASSWORD=$PASSWORD"), false, "a shell reference is not a literal secret");
+  assert.equal(await changed("PASSWORD={{ some_template }}"), false, "a template is not a literal secret");
 });
 
 test("isRedactedText is a shape predicate, not a change detector [GREEN NOW]", async () => {
@@ -188,7 +214,10 @@ test("isRedactedText is a shape predicate, not a change detector [GREEN NOW]", a
   // this text look like it contains a token", so a literal token-shaped INPUT
   // returns true even though nothing was redacted. Tests that mean "was anything
   // redacted" must compare the output to the input instead.
-  const unchanged = "API_KEY=CRG_AAAAAAAA_0001";
+  //
+  // The fixture is a WEAK key name on purpose: under `API_KEY` (strong tier) the
+  // binding evidence now fires and the text really is rewritten.
+  const unchanged = "cache_key=CRG_AAAAAAAA_0001";
   assert.equal(await redact(unchanged), unchanged, "nothing was redacted");
   assert.equal(isRedactedText(unchanged), true, "yet the shape predicate says otherwise");
 });

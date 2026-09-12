@@ -64,14 +64,17 @@ test("current gateway re-wraps most foreign tokens [GREEN NOW]", async () => {
     const out = await ctx.redactText(line, ALL);
     if (out !== line) rewritten.push(label);
   }
+  // D1 structured context widened this set: every foreign token here sits under a
+  // credential-ish key name (`DB_PASSWORD`), so the binding span now covers it
+  // regardless of value shape. The bracketed form is caught too, for the same
+  // reason -- the old "it survives by accident of the value class" note is gone.
   assert.deepEqual(rewritten, [
     "client DLP token (proposed CRG format)",
     "Vault-style token",
     "masked prefix",
     "raw hex placeholder",
+    "bracketed token",
   ]);
-  // The bracketed form is the only one that survives, and only by accident of
-  // the value character class.
 });
 
 test("re-wrapping preserves the value through the full round trip [GREEN NOW]", async () => {
