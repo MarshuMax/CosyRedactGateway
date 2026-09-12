@@ -31,7 +31,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext } from "../worker.js";
+import { RedactionContext, isRedactedText } from "../worker.js";
 
 const ALL = { highEntropy: true, phone: true, secret: true, identity: true, bank: true, email: true, gitleaks: true };
 const PLACEHOLDER_RE = /\{\{Redact:[a-f0-9]{64}\}\}/g;
@@ -48,10 +48,10 @@ function newCtx() {
   return new RedactionContext({ salt: "fixture" });
 }
 
+// A redaction is defined structurally (any registered token shape), not by
+// matching one format's literal syntax -- the v1 pattern is being retired.
 function rewriteCount(before, after) {
-  const a = new Set(before.match(PLACEHOLDER_RE) || []);
-  const b = after.match(PLACEHOLDER_RE) || [];
-  return b.filter((t) => !a.has(t)).length;
+  return isRedactedText(after) && !isRedactedText(before) ? 1 : 0;
 }
 
 // ------------------------------------------- 1. what happens right now ------

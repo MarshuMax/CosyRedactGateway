@@ -14,14 +14,49 @@ const FLAG_NAMES = Object.freeze({
 
 export const REDACT_NOTICE =
   "Sensitive values are redacted before forwarding, including messages, tool inputs, and tool results. " +
-  "You may see {{Redact:sha256}} placeholders; treat them as opaque and preserve them exactly. " +
+  "You may see CRG_ tokens; treat them as opaque and preserve them exactly. " +
   "Sensitive values you read appear as placeholders, and placeholders you emit in text or tool calls are restored to the original secrets.";
 
-const TOKEN_PREFIX = "{{Redact:";
-const TOKEN_SUFFIX = "}}";
-const TOKEN_RE = /\{\{Redact:[a-f0-9]{64}\}\}/g;
-const TOKEN_FULL_RE = /^\{\{Redact:[a-f0-9]{64}\}\}$/;
-const TOKEN_LENGTH = TOKEN_PREFIX.length + 64 + TOKEN_SUFFIX.length;
+// v2 token format. Charset [A-Z0-9_] is a portable subset that needs no escaping
+// in .env, shell, YAML plain scalars, URL query values or HTTP header values.
+// There is deliberately no checksum component: anything derived from the
+// plaintext would be an offline verification oracle for low-entropy secrets.
+export const TOKEN_PREFIX = "CRG_";
+export const TOKEN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ23456789"; // no 0/1/I/O
+export const TOKEN_RE = /(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])/g;
+export const TOKEN_FULL_RE = /^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$/;
+export const TOKEN_REQUEST_ID_WIDTH = 6;
+export const TOKEN_ENTITY_ID_WIDTH = 4;
+// Derived, never hardcoded: a stale literal here makes streaming tests fail in a
+// confusing way (the assertion throws inside the upstream fetch callback and the
+// request degrades to a 502 with an empty stream).
+export const TOKEN_LENGTH = TOKEN_PREFIX.length + TOKEN_REQUEST_ID_WIDTH + 1 + TOKEN_ENTITY_ID_WIDTH;
+
+// Legacy v1 placeholder, recognised on input only during the transition.
+// Generation must never emit this format again. Removed once every test and
+// main-path consumer has migrated; see test/legacy-token-compat.test.js.
+export const LEGACY_TOKEN_PREFIX = "{{Redact:";
+export const LEGACY_TOKEN_RE = /\{\{Redact:[a-f0-9]{64}\}\}/g;
+export const LEGACY_TOKEN_LENGTH = LEGACY_TOKEN_PREFIX.length + 64 + 2;
+
+// Prefixes that may appear in an already-redacted payload. Protected-span
+// eligibility is NOT "matches a CRG-shaped regex" -- see RedactionContext.
+const PROTECTED_TOKEN_PREFIXES = [TOKEN_PREFIX, LEGACY_TOKEN_PREFIX];
+
+// Format-agnostic helpers for callers and tests, so that neither has to hardcode
+// a token shape. REDACTED_TOKEN is global; REDACTED_TOKEN_ONE is not.
+export const REDACTED_TOKEN = /(?<![A-Za-z0-9_])(?:CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}|\{\{Redact:[a-f0-9]{64}\}\})(?![A-Za-z0-9_])/g;
+export const REDACTED_TOKEN_ONE = /(?:(?<![A-Za-z0-9_])CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}(?![A-Za-z0-9_])|\{\{Redact:[a-f0-9]{64}\}\})/;
+export function isRedactedText(value) {
+  if (typeof value !== "string") return false;
+  REDACTED_TOKEN_ONE.lastIndex = 0;
+  return REDACTED_TOKEN_ONE.test(value);
+}
+
+// Test/diagnostic helper for the legacy format. Generation never emits it.
+export function legacyRedactToken(hex) {
+  return LEGACY_TOKEN_PREFIX + hex + "}}";
+}
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_REDACTIONS = 16384;
 const textEncoder = new TextEncoder();
@@ -462,7 +497,24 @@ function collectRegexSpans(text, regex, type, priority, validator = null) {
 function overlaps(a, b) { return a.start < b.end && a.end > b.start; }
 
 export function findSensitiveSpans(text, flags) {
-  const protectedSpans = collectRegexSpans(text, /\{\{Redact:[a-f0-9]{64}\}\}/g, "existing", 1000);
+  // Protected-span eligibility comes ONLY from an explicit registry supplied by
+  // the caller (RedactionContext.protectedTokenPatterns: the tokens this request
+  // minted, plus any explicitly registered foreign namespace). There is
+  // deliberately no shape-based fallback: treating anything that merely looks
+  // like a token as protected would let anyone smuggle a secret past detection by
+  // wrapping it in a CRG-looking label. A caller that passes no registry
+  // therefore protects nothing.
+  const protectedSpans = [];
+  for (const re of flags.protectedTokenPatterns || []) {
+    protectedSpans.push(...collectRegexSpans(text, re, "existing", 1000));
+  }
+  // Predicate form: eligibility can also be answered per candidate, which is what
+  // the request-local mapping actually provides. This matters when a token is
+  // minted *during* the current pass (a legacy token re-minted to v2): a static
+  // registry snapshot would not know about it yet, and the fresh token would be
+  // re-detected and nested.
+  const isProtectedValue = typeof flags.isProtectedToken === "function" ? flags.isProtectedToken : null;
+
   const c = [];
   if (flags.secret) c.push(...collectRegexSpans(text, /\bsk-[A-Za-z0-9]{60,}\b/g, "secret", 110));
   if (flags.email) c.push(...collectRegexSpans(text, /[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/g, "email", 90));
@@ -479,7 +531,11 @@ export function findSensitiveSpans(text, flags) {
   if (flags.gitleaks) c.push(...collectGitleakSpans(text));
   if (flags.highEntropy) for (const b of tokenizeBlocks(text)) if (isHighEntropyBlock(b.value)) c.push({ start:b.start, end:b.end, type:"entropy", priority:10 });
 
-  const candidates = c.filter((x) => !protectedSpans.some((p) => overlaps(x, p)));
+  const candidates = c.filter((x) => {
+    if (protectedSpans.some((p) => overlaps(x, p))) return false;
+    if (isProtectedValue && isProtectedValue(text.slice(x.start, x.end))) return false;
+    return true;
+  });
   candidates.sort((a,b) => b.priority-a.priority || (b.end-b.start)-(a.end-a.start) || a.start-b.start);
   const selected = [];
   for (const s of candidates) if (!selected.some((x) => overlaps(s,x))) selected.push(s);
@@ -488,26 +544,67 @@ export function findSensitiveSpans(text, flags) {
 
 export class RedactionLimitError extends Error {}
 
+function randomTokenChars(n) {
+  const bytes = new Uint8Array(n);
+  crypto.getRandomValues(bytes);
+  let out = "";
+  for (const b of bytes) out += TOKEN_ALPHABET[b % TOKEN_ALPHABET.length];
+  return out;
+}
+
+// One request id per RedactionContext, i.e. per request. Entity ids are a local
+// allocation counter, NOT a function of the plaintext: deriving any token
+// component from the secret would hand an attacker an offline oracle for
+// low-entropy values (PINs, card numbers, short passwords).
+export function createRequestId() { return randomTokenChars(TOKEN_REQUEST_ID_WIDTH); }
+
 export class RedactionContext {
-  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS } = {}) {
+  constructor({ salt = RUNTIME_SALT, maxRedactions = DEFAULT_MAX_REDACTIONS, requestId = null } = {}) {
     this.salt = salt;
     this.maxRedactions = maxRedactions;
+    this.requestId = requestId || createRequestId();
+    this.nextToken = 0;
     this.rawToToken = new Map();
     this.tokenToRaw = new Map();
+    // Eligibility for protected spans: a token is protected only if this request
+    // minted or registered it (including re-minted legacy tokens). Shape alone is
+    // never sufficient, otherwise a CRG-looking label would smuggle a secret past
+    // detection.
+    this.protectedTokenPatterns = [
+      // Legacy: shape-based, because v1 tokens carry no request-local namespace.
+      LEGACY_TOKEN_RE,
+    ];
+    this.isProtectedToken = (value) => this.tokenToRaw.has(value);
+  }
+  nextTokenId() {
+    this.nextToken += 1;
+    return this.nextToken.toString(36).toUpperCase().padStart(TOKEN_ENTITY_ID_WIDTH, "0");
   }
   async tokenFor(raw) {
     if (this.rawToToken.has(raw)) return this.rawToToken.get(raw);
     if (this.rawToToken.size >= this.maxRedactions) throw new RedactionLimitError(`Redaction limit exceeded (${this.maxRedactions})`);
-    const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(raw + this.salt));
-    const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2,"0")).join("");
-    const token = TOKEN_PREFIX + hex + TOKEN_SUFFIX;
+    const token = `${TOKEN_PREFIX}${this.requestId}_${this.nextTokenId()}`;
     const collision = this.tokenToRaw.get(token);
-    if (collision !== undefined && collision !== raw) throw new Error("SHA-256 redaction token collision");
+    if (collision !== undefined && collision !== raw) throw new Error("Redaction token collision");
     this.rawToToken.set(raw, token); this.tokenToRaw.set(token, raw);
     return token;
   }
   async redactText(text, flags) {
-    const spans = findSensitiveSpans(text, flags);
+    // A legacy v1 token arriving in the payload (multi-turn history, or a client
+    // that cached a pre-migration response) is re-minted as a v2 token rather
+    // than forwarded as-is, so the transcript converges on one format.
+    const legacySeen = [...new Set(text.match(LEGACY_TOKEN_RE) || [])];
+    for (const legacy of legacySeen) {
+      const raw = this.tokenToRaw.get(legacy);
+      if (raw === undefined) continue;
+      const replacement = await this.tokenFor(raw);
+      if (replacement !== legacy) text = text.split(legacy).join(replacement);
+    }
+    const spans = findSensitiveSpans(text, {
+      ...flags,
+      protectedTokenPatterns: this.protectedTokenPatterns,
+      isProtectedToken: this.isProtectedToken,
+    });
     if (!spans.length) return text;
     let out = "", at = 0;
     for (const s of spans) {
@@ -518,7 +615,11 @@ export class RedactionContext {
     return out + text.slice(at);
   }
   restoreText(text) {
-    return text.replace(TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token);
+    // Both formats are restored during the transition. Mapping lookup is the only
+    // authority: an unknown token of either shape is left untouched.
+    return text
+      .replace(TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token)
+      .replace(LEGACY_TOKEN_RE, (token) => this.tokenToRaw.get(token) ?? token);
   }
 }
 
@@ -643,17 +744,26 @@ function jsonError(status, message) { return new Response(JSON.stringify({ error
 function isJsonContentType(ct) { return /(^|[+\/])json(?:$|[; ])/i.test(ct || "") || /application\/.*\+json/i.test(ct || ""); }
 function isTextualContentType(ct) { return isJsonContentType(ct) || /^text\//i.test(ct || "") || /javascript|xml/i.test(ct || ""); }
 
+// Returns the length of a trailing fragment that could still become a protected
+// token, so the stream layer holds it back instead of emitting it. Handles both
+// the v2 prefix and the legacy prefix, since the latter is still recognised on
+// input during the transition.
 function possibleTokenSuffixLength(s) {
-  const last = s.lastIndexOf(TOKEN_PREFIX);
-  if (last >= 0) {
-    const tail = s.slice(last);
-    if (tail.length < TOKEN_LENGTH) {
-      const rest = tail.slice(TOKEN_PREFIX.length);
-      if (tail.length <= TOKEN_PREFIX.length || /^[a-f0-9]{0,64}}?$/.test(rest)) return s.length - last;
+  for (const prefix of PROTECTED_TOKEN_PREFIXES) {
+    const isLegacy = prefix === LEGACY_TOKEN_PREFIX;
+    const full = isLegacy ? LEGACY_TOKEN_LENGTH : TOKEN_LENGTH;
+    const body = isLegacy ? /^[a-f0-9]{0,64}}?$/ : /^[A-Z0-9_]{0,11}$/;
+    const start = s.lastIndexOf(prefix);
+    if (start >= 0) {
+      const tail = s.slice(start);
+      if (tail.length < full) {
+        const rest = tail.slice(prefix.length);
+        if (tail.length <= prefix.length || body.test(rest)) return s.length - start;
+      }
     }
+    const max = Math.min(prefix.length - 1, s.length);
+    for (let k = max; k > 0; k--) if (s.endsWith(prefix.slice(0, k))) return k;
   }
-  const max = Math.min(TOKEN_PREFIX.length - 1, s.length);
-  for (let k=max;k>0;k--) if (s.endsWith(TOKEN_PREFIX.slice(0,k))) return k;
   return 0;
 }
 

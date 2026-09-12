@@ -27,7 +27,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext } from "../worker.js";
+import { RedactionContext, REDACTED_TOKEN, isRedactedText } from "../worker.js";
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -192,14 +192,14 @@ test("redacted output is syntactically valid in every host syntax [COUPLING]", a
   const detected = Buffer.from("correct-horse-battery-staple-42").toString("base64");
   const line = `DB_PASSWORD=${detected}`;
   const out = await ctx.redactText(line, { gitleaks: true });
-  const gotToken = (out.match(CURRENT_PLACEHOLDER_RE) || [])[0];
-  assert.ok(gotToken, "fixture must be detected; if this fails, detection (not token syntax) regressed");
+  assert.equal(isRedactedText(out), true, "fixture must be detected; if this fails, detection (not token syntax) regressed");
+  const gotToken = (out.match(REDACTED_TOKEN) || [])[0];
   assert.equal(ctx.restoreText(out), line, "round-trip must be byte-identical");
-  // The target token is a valid plain scalar. The current placeholder is a valid
-  // flow MAPPING instead of a string (it contains `{` and `:`), so it retypes the
-  // field rather than failing to parse -- see group 1 of this file.
-  assert.equal(yamlAssign("password", makeTargetTokenSource()("7K2M9Q")).ok, true);
-  assert.equal(gotToken.includes("{") && gotToken.includes(":"), true, "placeholder retypes the YAML field");
+  // The emitted token must itself be a valid YAML plain scalar. Before the v2
+  // migration this assertion had to be inverted: the v1 placeholder
+  // (`{{Redact:...}}`) is flow-mapping syntax and retyped the field to a mapping.
+  assert.match(gotToken, PORTABLE_TOKEN_RE, "the emitted token must use the portable format");
+  assert.equal(yamlAssign("password", gotToken).ok, true, "emitted token must be a valid YAML plain scalar");
 });
 
 test("portable token is usable as an .env key and as a URL/header value [RED]", () => {
@@ -234,7 +234,7 @@ test("redaction is idempotent and never nests placeholders [GREEN NOW]", async (
   const once = await ctx.redactText("DB_PASSWORD=cGFzc3dvcmQxMjM0NTY3OA==", { gitleaks: true });
   const twice = await ctx.redactText(once, { gitleaks: true });
   assert.equal(twice, once, "second pass must not re-wrap an already-redacted value");
-  assert.equal((twice.match(/\{\{Redact:/g) || []).length, 1);
+  assert.equal((twice.match(REDACTED_TOKEN) || []).length, 1, "exactly one token must remain, not a nested pair");
 });
 
 test("same plaintext within one request reuses one token [COUPLING]", async () => {
@@ -245,8 +245,8 @@ test("same plaintext within one request reuses one token [COUPLING]", async () =
   // a neutral key such as `A=` is not detected at all and would test nothing.
   const a = await ctx.redactText(`PASSWORD=${secret}`, { gitleaks: true });
   const b = await ctx.redactText(`PASSWORD=${secret}`, { gitleaks: true });
-  const tokenA = (a.match(CURRENT_PLACEHOLDER_RE) || [])[0];
-  const tokenB = (b.match(CURRENT_PLACEHOLDER_RE) || [])[0];
+  const tokenA = (a.match(REDACTED_TOKEN) || [])[0];
+  const tokenB = (b.match(REDACTED_TOKEN) || [])[0];
   assert.ok(tokenA && tokenB, "fixture must produce tokens");
   assert.equal(tokenA, tokenB, "the same plaintext in the same request must reuse one token");
   // Two occurrences inside ONE payload must share a token. Note the fixture must
@@ -254,7 +254,7 @@ test("same plaintext within one request reuses one token [COUPLING]", async () =
   // not meaningful, because this test runs both through the same context and a
   // fresh Context (a real request) would build its own mapping.
   const payload = `PASSWORD=${secret}\nDB_PASSWORD=${secret}`;
-  const tokens = (await ctx.redactText(payload, { gitleaks: true })).match(CURRENT_PLACEHOLDER_RE);
+  const tokens = (await ctx.redactText(payload, { gitleaks: true })).match(REDACTED_TOKEN);
   assert.equal(tokens.length, 2, "fixture must produce one token per occurrence");
   assert.equal(tokens[0], tokens[1], "two occurrences of one plaintext in one payload must share a token");
 });

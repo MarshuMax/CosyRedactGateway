@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { handleRequest } from "../worker.js";
+import { REDACTED_TOKEN_ONE } from "../worker.js";
 
 function listen(server){return new Promise(r=>server.listen(0,"127.0.0.1",()=>r(server.address().port)));}
 function close(server){return new Promise(r=>server.close(r));}
@@ -11,7 +12,7 @@ test("real local HTTP upstream receives redacted JSON and client gets restored J
   const upstream=http.createServer((req,res)=>{
     auth=req.headers.authorization; let data="";
     req.setEncoding("utf8"); req.on("data",c=>data+=c); req.on("end",()=>{
-      upstreamBody=JSON.parse(data); const token=upstreamBody.input.match(/\{\{Redact:[a-f0-9]{64}\}\}/)[0];
+      upstreamBody=JSON.parse(data); const token=upstreamBody.input.match(REDACTED_TOKEN_ONE)[0];
       res.setHeader("content-type","application/json"); res.end(JSON.stringify({output_text:`echo ${token}`}));
     });
   });

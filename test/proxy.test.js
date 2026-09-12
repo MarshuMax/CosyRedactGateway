@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { handleRequest, REDACT_NOTICE } from "../worker.js";
+import { REDACTED_TOKEN_ONE } from "../worker.js";
 
-const TOKEN = /\{\{Redact:[a-f0-9]{64}\}\}/;
+const TOKEN = REDACTED_TOKEN_ONE;
 
 function req(url, body, headers={}) {
   return new Request(url,{method:"POST",headers:{"content-type":"application/json",...headers},body:JSON.stringify(body)});

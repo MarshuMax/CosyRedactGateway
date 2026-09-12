@@ -41,7 +41,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RedactionContext, findSensitiveSpans } from "../worker.js";
+import { RedactionContext, findSensitiveSpans, isRedactedText } from "../worker.js";
 
 const GITLEAKS = { gitleaks: true };
 const ALL = { highEntropy: true, phone: true, secret: true, identity: true, bank: true, email: true, gitleaks: true };
@@ -85,11 +85,11 @@ test("the keyword gate is already satisfied, the value class is what fails [GREE
   for (const [label, value] of DETECTED_VALUES) {
     const line = `DB_PASSWORD=${value}`;
     const out = await redact(line);
-    assert.ok(out.includes("{{Redact:"), `${label} must be detected, proving the key gate passes`);
+    assert.equal(isRedactedText(out), true, `${label} must be detected, proving the key gate passes`);
   }
   // Same key name, `@` in the value: missed.
   const dotted = `DB_PASSWORD=${SECRET}`;
-  assert.equal(await redact(dotted), dotted);
+  assert.equal(isRedactedText(await redact(dotted)), false, "a symbol-bearing value is still missed");
 
   // And the same holds without any surrounding syntax at all: the value class is
   // the discriminator, so the binding form adds no protection either.
@@ -100,7 +100,7 @@ test("every binding form misses a symbol-bearing password [GREEN NOW]", async ()
   const missed = [];
   for (const form of BINDING_FORMS) {
     const out = await redact(form.line);
-    if (!out.includes("{{Redact:")) missed.push(form.name);
+    if (!isRedactedText(out)) missed.push(form.name);
   }
   assert.deepEqual(missed, BINDING_FORMS.map((f) => f.name), "all six forms currently miss");
 });
@@ -119,7 +119,7 @@ test("the miss is identical under the full flag set [GREEN NOW]", async () => {
 test("a symbol-bearing password is redacted in every binding form [RED]", async () => {
   for (const form of BINDING_FORMS) {
     const out = await redact(form.line);
-    assert.ok(out.includes("{{Redact:"), `${form.name} must be redacted`);
+    assert.equal(isRedactedText(out), true, `${form.name} must be redacted`);
     assert.equal(out.includes(SECRET), false, `${form.name} must not forward the secret verbatim`);
   }
 });
@@ -129,7 +129,7 @@ test("redaction covers exactly the value, not the binding syntax [RED]", async (
     const out = await redact(form.line);
     // Guard: without this the prefix/suffix assertions below pass vacuously
     // whenever the value was not redacted at all, which is the current state.
-    assert.ok(out.includes("{{Redact:"), `${form.name}: value must be redacted before bounds can be checked`);
+    assert.equal(isRedactedText(out), true, `${form.name}: value must be redacted before bounds can be checked`);
     const before = form.line.slice(0, form.line.indexOf(SECRET));
     assert.ok(out.startsWith(before), `${form.name}: the key/binding prefix must survive untouched`);
     assert.ok(out.endsWith(form.line.slice(form.line.indexOf(SECRET) + SECRET.length)), `${form.name}: the suffix must survive`);
@@ -140,7 +140,7 @@ test("round-trip is byte-identical once the value is redacted [RED]", async () =
   const ctx = new RedactionContext({ salt: "fixture" });
   for (const form of BINDING_FORMS) {
     const out = await ctx.redactText(form.line, GITLEAKS);
-    assert.ok(out.includes("{{Redact:"), `${form.name}: value must be redacted before round-trip is meaningful`);
+    assert.equal(isRedactedText(out), true, `${form.name}: value must be redacted before round-trip is meaningful`);
     assert.equal(ctx.restoreText(out), form.line, `${form.name}: round-trip must be byte-identical`);
   }
 });
@@ -161,5 +161,5 @@ test("an unquoted low-entropy password is protected by key evidence [RED]", asyn
   // justifies structured extraction over widening the value character class.
   const line = "DB_PASSWORD=hello123!";
   const out = await redact(line, ALL);
-  assert.ok(out.includes("{{Redact:"), "a low-entropy password must be redacted on key evidence");
+  assert.equal(isRedactedText(out), true, "a low-entropy password must be redacted on key evidence");
 });

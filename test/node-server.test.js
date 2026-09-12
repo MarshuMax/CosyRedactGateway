@@ -1,3 +1,4 @@
+import { REDACTED_TOKEN_ONE } from "../worker.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -14,7 +15,7 @@ test("node-server adapter proxies through a real HTTP socket", async (t)=>{
   const upstream=http.createServer((req,res)=>{
     let data=""; req.setEncoding("utf8"); req.on("data",c=>data+=c); req.on("end",()=>{
       upstreamBody=JSON.parse(data);
-      const token=upstreamBody.input.match(/\{\{Redact:[a-f0-9]{64}\}\}/)[0];
+      const token=upstreamBody.input.match(REDACTED_TOKEN_ONE)[0];
       res.setHeader("content-type","application/json");
       res.end(JSON.stringify({output_text:`echo:${token}`}));
     });

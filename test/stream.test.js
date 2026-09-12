@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { handleRequest } from "../worker.js";
+import { REDACTED_TOKEN_ONE, TOKEN_LENGTH } from "../worker.js";
 
-const TOKEN=/\{\{Redact:[a-f0-9]{64}\}\}/;
+const TOKEN=REDACTED_TOKEN_ONE;
 function request(url,body){return new Request(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});}
 function chunkedResponse(text, sizes=[1,2,3,5,8,13]){
   const enc=new TextEncoder(); let at=0,i=0;
@@ -76,10 +77,10 @@ test("SSE JSON stays valid when restored source contains a quote", async()=>{
 
 test("every possible placeholder split position is restored across Chat SSE events", async()=>{
   const raw="boundary@example.com";
-  for(let cut=1; cut<75; cut++){
+  for(let cut=1; cut<TOKEN_LENGTH; cut++){
     const fetchImpl=async(_u,init)=>{
       const b=JSON.parse(init.body), token=b.messages[0].content.match(TOKEN)[0];
-      assert.equal(token.length,75);
+      assert.equal(token.length,TOKEN_LENGTH,"token length must match the exported constant");
       const a={choices:[{index:0,delta:{content:token.slice(0,cut)}}]};
       const z={choices:[{index:0,delta:{content:token.slice(cut)}}]};
       return chunkedResponse(`data: ${JSON.stringify(a)}\n\ndata: ${JSON.stringify(z)}\n\n`,[1]);

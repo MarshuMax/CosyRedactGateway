@@ -219,7 +219,10 @@ untrusted upstream model
 CRG_<request-id>_<entity-id>
 ```
 
-- **严格两段**，语法 `^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$`。测试 `plaintext-derived checksum is an offline verification oracle [RED]` 断言 `token.split("_").slice(1).length === 2`，因此早期草案里的第三段随机后缀取消。字符集不含 `{ } " ' : @ ! = & ? / +`，`[A-Z0-9_]` 在 URL query（RFC 3986 unreserved）、shell、`.env` key、YAML plain scalar、HTTP header 中都不需要转义。
+- **严格两段**，语法 `^CRG_[A-Z0-9]{4,}_[A-Z0-9]{4,}$`，实现为 `CRG_<requestId:6>_<entityId:4>`（15 字符）。`TOKEN_LENGTH` **由宽度常量派生，不得硬编码**——硬编码会在流式测试里以极难排查的方式失败（断言在上游 fetch 回调内抛出，请求降级为 502 与空流）。
+- 边界断言用**否定字符类** `(?<![A-Za-z0-9_])…(?![A-Za-z0-9_])`，不能用 `\b`：`_` 是词字符，`\b` 在 `…_CRG_` 这类拼接处不成立，会漏配合法 token。
+- 字符集不含 `{ } " ' : @ ! = & ? / +`，`[A-Z0-9_]` 在 URL query（RFC 3986 unreserved）、shell、`.env` key、YAML plain scalar、HTTP header 中都不需要转义。
+- **受保护 span 的资格只能来自登记，不能来自形状**：`findSensitiveSpans` 不做任何形状 fallback，未传资格即保护为空；`RedactionContext` 以谓词 `isProtectedToken = (v) => tokenToRaw.has(v)` 提供资格。这既支持"铸号过程中产生的新 token"（legacy 重新铸号），也避免任何人用 `CRG_` 形状的标签把秘密夹带过检测。
 - `request-id` 每请求随机生成；`entity-id` 每实体随机生成，**禁止自增计数**，也禁止任何由明文派生的取值。
 - 同一请求内同一明文复用同一 token；跨请求必须重新随机。
 - **不带任何由原文派生的 checksum**：派生校验位会给低熵秘密（PIN、卡号、短密码）提供离线猜测验证器。该风险已量化为测试：对 `0000 / 1234 / 9999` 取 `djb2` 哈希，高 16 位几乎恒定（`7c53`–`7c58`），只有低位可分（低 2 位 hex 分别为 `05 / 41 / 45`）——"看起来很强"的高位截断 checksum 在它本该保护的候选空间上几乎是常量。
@@ -342,6 +345,23 @@ Sink      { kind, restore: bool, reason }
 `[GREEN NOW]` 用例是行为快照：迁移后其中一部分（如 `current placeholder is unusable in Kubernetes and other typed fields`、`current gateway re-wraps most foreign tokens`、`assistant prose and tool arguments are handled identically today`）应当**失败或改名**，改动必须显式提交，不允许顺手改断言。
 
 分组边界：`token-syntax` 只管 token 格式契约，`structured-context` 只管 detector 覆盖，两者不得互相耦合——否则任一侧的红绿都会给出错误信号。
+
+## 9.1 迁移状态（token 格式）
+
+双格式是过渡态，不是终态：
+
+| 方向 | 状态 |
+|---|---|
+| 生成 | **只产出 v2**（`CRG_…`）。由 `legacy-token-compat.test.js` 的 `generation never emits the legacy format` 固定。 |
+| 还原 | 短期同时识别两种格式，映射表查找是唯一权威：未登记的 token 一律原样保留（既不还原也不改写）。 |
+| 输入侧 legacy | 已登记在映射里的 v1 token 会被**重新铸号为 v2**，使同一段对话不出现两种方言；映射在重铸前后保持可用。 |
+| 既有测试 | 主链路（`core` / `proxy` / `stream` / `http-integration` / `node-server`）已全部改为格式无关断言（`REDACTED_TOKEN` / `isRedactedText`），不再匹配某一种 token 字面量。 |
+| legacy 收口 | 只有 `test/legacy-token-compat.test.js` 触碰 v1 格式（6 例）。待其余消费者迁完，把该文件压缩到最小集合，并删除 `restoreText` 的 legacy 分支与 `LEGACY_TOKEN_*` 常量。 |
+
+迁移期实测到的两个坑，已固化为回归：
+
+1. `assert.match(x, GLOBAL_RE)` **不可用**：带 `g` 的正则 `.test()` 有 `lastIndex` 语义，断言会随调用次数翻转。断言统一用 `isRedactedText()` 或非全局正则。
+2. 用 `out.includes("{{Redact:")` 之类**字面量判据**判断"是否被脱敏"，在格式迁移后会静默失真（新格式下恒为 false）。所有此类判据已改为 `isRedactedText()`。
 
 ## 10. 未解决问题 / 待验证
 

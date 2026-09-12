@@ -1,3 +1,4 @@
+import { REDACTED_TOKEN, REDACTED_TOKEN_ONE, isRedactedText } from "../worker.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -43,7 +44,7 @@ test("same plaintext reuses token and restore is exact", async () => {
   const ctx = new RedactionContext({salt:"unit-test"});
   const flags = parseFlags("E");
   const out = await ctx.redactText("a@example.com / a@example.com", flags);
-  const tokens = out.match(/\{\{Redact:[a-f0-9]{64}\}\}/g);
+  const tokens = out.match(REDACTED_TOKEN);
   assert.equal(tokens.length, 2);
   assert.equal(tokens[0], tokens[1]);
   assert.equal(ctx.restoreText(out), "a@example.com / a@example.com");
@@ -64,7 +65,7 @@ test("notice is injected after redaction for OpenAI Chat", async () => {
   const protocol = detectProtocol(redacted, new URL("https://api.example/v1/chat/completions"), new Headers());
   assert.equal(injectRedactNotice(redacted, protocol), true);
   assert.match(redacted.messages[0].content, /^Sensitive values are redacted before forwarding/);
-  assert.match(redacted.messages[0].content, /\{\{Redact:[a-f0-9]{64}\}\}/);
+  assert.equal(isRedactedText(redacted.messages[0].content), true);
   assert(!redacted.messages[0].content.includes("a@example.com"));
 });
 
@@ -98,7 +99,7 @@ test("tool results are redacted before they are forwarded to the model", async (
   const ctx = new RedactionContext({salt:"unit-test"});
   const redacted = await redactJson(body, ctx, parseFlags("E"));
   assert(!redacted.messages[1].content.includes("alice@example.com"));
-  assert.match(redacted.messages[1].content, /\{\{Redact:[a-f0-9]{64}\}\}/);
+  assert.equal(isRedactedText(redacted.messages[1].content), true);
 });
 
 test("tool-call arguments containing placeholders restore to the original secret", async () => {
