@@ -895,6 +895,40 @@ DB_PASSWORD=Pr0d-P@ssw0rd-Xy9Zk2mQ  → 脱敏（hard-secret）
 
 round-trip 逐字节一致。preserve 不写 mapping（测试断言 `tokenToRaw.size === 0`），因此"保留"是**原样发出**而非"发 token 再还原"。
 
+## 9.15 F4.1 OCI shape-bypass 加固（已实现）
+
+原规则 `(?:sha256:)?${HEX64}` 标为 `hard: true`，于是**裸 64hex 也被算作 hard OCI digest 并获得 preserve 资格**——与"裸 16hex → SPAN_ID"同类的 shape bypass。后果是 `token=<64hex secret>` 会被原样发出。
+
+**拆成两个 hard 变体，没有第三个：**
+
+| 变体 | 条件 | 强度 |
+|---|---|---|
+| A | span 自身携带 `sha256:` 前缀 | hard，preserve |
+| B | span 是裸 hex，但**紧邻其前**的文本以 `sha256:` 结尾（entropy span 只圈住 hex、前缀在 span 外） | hard，preserve |
+| C | 两者都不满足 | **soft**：仍分类为 `OCI_DIGEST`，但继续 redact |
+
+**锚点必须紧邻 span**，因此引入 `contextBefore`（锚定到前缀末尾，`/sha256:\s*$/i`）而非"前缀里某处出现过"。否则：
+
+```
+previous digest sha256:<hex>  token=<64hex secret>
+```
+
+会让前一个 digest 为 token 作保。测试固定这条：相隔另一个值的 `sha256:` **不**使裸 hex 变成 hard。
+
+**分类与豁免分离**：变体 C 的 `disposition` 仍是配置的 `PRESERVE`，但 `decideSpanAction` 要求 **hard 且 allowlisted** 才给豁免，所以 disposition 单独不足以放行。修的是豁免，不是分类——分类仍对 telemetry 和未来 profile 有用。
+
+实测（你要求的七条）：
+
+```
+sha256:<64hex>                     → preserve
+context endsWith "sha256:" + bare  → preserve
+bare 64hex                         → redact
+token=<bare64>                     → redact
+secret=<bare64>                    → redact
+无关前缀含 sha256: 但不相邻           → redact
+hard provider detector + OCI 形状   → redact
+```
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

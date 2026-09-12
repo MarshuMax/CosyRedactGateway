@@ -294,3 +294,79 @@ test("the recogniser is not vulnerable to catastrophic backtracking [GREEN NOW]"
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 1000, `classification must stay fast, took ${elapsed}ms`);
 });
+
+// ------------------------------------------- F4.1 OCI shape-bypass hardening -----
+
+test("F4.1: only a prefixed or immediately-anchored digest is preserve-eligible [GREEN NOW]", () => {
+  // The rule used to be `(?:sha256:)?<64hex>` marked hard, so a BARE 64-hex run became a
+  // hard OCI digest and qualified for preservation -- a licence for anything 64 hex
+  // characters long. `token=<64hex secret>` would have been emitted intact.
+  const H = OCI_HEX;
+  const eligible = [
+    [`sha256:${H}`, null],
+    [H, "image@sha256:"],
+    [H, "digest sha256: "],
+  ];
+  for (const [value, context] of eligible) {
+    const result = recogniseInfra(value, context);
+    assert.equal(result.infraType, INFRA_TYPE.OCI_DIGEST);
+    assert.equal(result.hard, true, `${value} with ${JSON.stringify(context)} must be hard`);
+    assert.equal(decideSpanAction({ detector: "entropy", infra: result }).action, "preserve");
+  }
+
+  const ineligible = [
+    [H, null, "bare 64-hex"],
+    [H, "token=", "token assignment"],
+    [H, "secret=", "secret assignment"],
+    [H, "value=", "generic assignment"],
+  ];
+  for (const [value, context, label] of ineligible) {
+    const result = recogniseInfra(value, context);
+    assert.equal(decideSpanAction({ detector: "entropy", infra: result }).action, "redact", `${label} must be redacted`);
+  }
+});
+
+test("F4.1: the anchor is adjacent, not merely present in the prefix [GREEN NOW]", () => {
+  // Searching the whole prefix lets an unrelated earlier digest vouch for the value under
+  // inspection: `previous digest sha256:<hex> token=<64hex secret>` must not make the
+  // token preserve-eligible.
+  const H = OCI_HEX;
+  const decoy = `previous digest sha256:${"a".repeat(64)} token=`;
+  const result = recogniseInfra(H, decoy);
+  assert.equal(result.hard, false, "the decoy digest must not vouch for the token");
+  assert.equal(decideSpanAction({ detector: "entropy", infra: result }).action, "redact");
+
+  // The anchored form still works, so the check is strict rather than broken. Note the
+  // context here is the text immediately before THIS span, and it ends with the prefix
+  // that belongs to this span's value.
+  assert.equal(recogniseInfra(H, "image@sha256:").hard, true, "an immediately preceding prefix qualifies");
+  assert.equal(recogniseInfra(H, "  sha256:").hard, true, "whitespace around the prefix is tolerated");
+  // But a prefix that belongs to a DIFFERENT, earlier value does not, even though the
+  // bare hex here is likewise 64 characters.
+  assert.equal(recogniseInfra(H, `previous digest sha256:${"a".repeat(64)} `).hard, false,
+    "a prefix separated by another value must not qualify");
+});
+
+test("F4.1: hard provider evidence beats an OCI-shaped span [GREEN NOW]", () => {
+  for (const meta of [
+    { detector: "gitleaks", ruleId: "suspicious-64hex", infra: recogniseInfra(OCI_DIGEST) },
+    { detector: "gitleaks", ruleId: "suspicious-64hex", infra: recogniseInfra(OCI_HEX, "image@sha256:") },
+    { detector: "secret", infra: recogniseInfra(OCI_DIGEST) },
+    { detector: "binding", infra: recogniseInfra(OCI_DIGEST) },
+  ]) {
+    const decision = decideSpanAction(meta);
+    assert.equal(decision.action, "redact");
+    assert.equal(decision.hardSecret, true);
+  }
+});
+
+test("F4.1: a bare digest is classified but has no preserve path [GREEN NOW]", () => {
+  // Classification is still useful (telemetry, profiles later); what it must not have is
+  // an exemption. Removing the exemption, not the classification, is the fix.
+  const result = recogniseInfra(OCI_HEX);
+  assert.equal(result.infraType, INFRA_TYPE.OCI_DIGEST, "still classified");
+  assert.equal(result.hard, false, "but soft");
+  assert.equal(result.disposition, INFRA_DISPOSITION.PRESERVE, "the configured disposition is unchanged");
+  assert.equal(decideSpanAction({ detector: "entropy", infra: result }).action, "redact",
+    "the disposition alone is not enough: the finding must also be hard");
+});

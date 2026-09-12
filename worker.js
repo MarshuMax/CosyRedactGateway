@@ -1033,9 +1033,20 @@ const RB = "(?![A-Za-z0-9_])";
 // bare git sha. Each entry declares its own `hard` flag -- `hard` means the SHAPE is
 // unambiguous rather than that the finding is dangerous.
 const rawInfraRules = [
-  // The whole span is captured, including an optional `sha256:` prefix, because the
-  // rule has to explain every byte it claims.
-  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}((?:sha256:)?${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.97 },
+  // TWO variants, both hard, and no third one.
+  //
+  // `(?:sha256:)?<64hex>` looked harmless but made a BARE 64-hex run a hard OCI digest,
+  // which is a preserve licence for anything 64 hex characters long -- the same shape
+  // bypass as the bare-16-hex span id. `token=<64hex secret>` would have been preserved.
+  //
+  //   variant A  the span carries its own `sha256:` prefix
+  //   variant B  the span is the bare hex, but the immediately preceding text ends with
+  //              `sha256:` because the entropy detector only circled the hex
+  //
+  // A bare 64-hex run with neither is SOFT: classified, never preserved.
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(sha256:${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.99 },
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, hard: true, confidence: 0.95, contextBefore: /sha256:\s*$/i },
+  { type: INFRA_TYPE.OCI_DIGEST, re: new RegExp(`${LB}(${HEX64})${RB}`, "g"), group: 1, hard: false, confidence: 0.5 },
   { type: INFRA_TYPE.AWS_ARN, re: /(?<![A-Za-z0-9_])arn:aws[a-z-]*:[A-Za-z0-9-]+:[A-Za-z0-9-]*:\d{0,12}:[^\s"',)]+/g, group: 0, hard: false, confidence: 0.9 },
   { type: INFRA_TYPE.EC2_RESOURCE_ID, re: new RegExp(`${LB}(?:i|ami|vol|snap|subnet|sg|vpc|eni|rtb|acl)-[0-9a-f]{8,17}${RB}`, "g"), group: 0, hard: false, confidence: 0.85 },
   // `hard` here means the SHAPE is unambiguous, not that the finding is dangerous: a fixed
@@ -1073,6 +1084,7 @@ const rawInfraRules = [
 const INFRA_RULES = rawInfraRules.map((rule) => ({
   ...rule,
   anchorRe: rule.anchor ? new RegExp(rule.anchor.source, rule.anchor.flags.replace("g", "")) : null,
+  contextBeforeRe: rule.contextBefore ? new RegExp(rule.contextBefore.source, rule.contextBefore.flags.replace("g", "")) : null,
 }));
 
 /**
@@ -1086,6 +1098,16 @@ const INFRA_RULES = rawInfraRules.map((rule) => ({
  * random token, so those need an anchor rather than a guess.
  */
 function hasAnchor(rule, context) {
+  // contextBefore is ANCHORED to the end of the preceding text, so `sha256:` has to sit
+  // immediately before the span. Searching the whole prefix would let an unrelated
+  // earlier digest vouch for the value under inspection:
+  //   previous digest sha256:<hex>  token=<64hex secret>
+  // must not turn the token into a preserved digest.
+  if (rule.contextBeforeRe) {
+    if (!context) return false;
+    rule.contextBeforeRe.lastIndex = 0;
+    return rule.contextBeforeRe.test(context);
+  }
   if (!rule.anchor) return true;
   if (!context) return false;
   rule.anchorRe.lastIndex = 0;
@@ -1112,7 +1134,7 @@ export function recogniseInfra(value, context = null) {
       entityClass: ENTITY_CLASS.INFRA,
       infraType: rule.type,
       evidence: ["infra_shape", `infra_rule:${rule.type.toLowerCase()}`]
-        .concat(rule.hard && rule.anchor ? ["infra_anchored"] : []),
+        .concat(rule.hard && (rule.anchor || rule.contextBefore) ? ["infra_anchored"] : []),
       confidence: rule.confidence,
       hard: Boolean(rule.hard),
       disposition: INFRA_POLICY[rule.type] || INFRA_DISPOSITION.REDACT,
