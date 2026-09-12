@@ -417,7 +417,21 @@
         },
         "remaining_terms_at_m8000": "selectedOverlap 465.7ms and refInfra 442.4ms now dominate; consolidate 131.5ms is linear."
       },
-      "correction_of_my_inference": "CORRECTED: I previously wrote that the 22% in `refInfra` must be infra recognition because the corpus has zero reference constructs. That inference was wrong to make from the corpus alone -- the infra widening stage also ends with a final remerge, `for (const span of widened...) if (!remerged.some((x) => overlaps(span, x)))`, which is itself O(m^2) at worker.js:3000. It was not listed separately in my stage table, so its cost was folded into refInfra. The next round must split refInfra into reference lookup / resolveInfraEnvelope / final remerge / applyObjectSchema before concluding anything about infra recognition."
+      "correction_of_my_inference": "CORRECTED: I previously wrote that the 22% in `refInfra` must be infra recognition because the corpus has zero reference constructs. That inference was wrong to make from the corpus alone -- the infra widening stage also ends with a final remerge, `for (const span of widened...) if (!remerged.some((x) => overlaps(span, x)))`, which is itself O(m^2) at worker.js:3000. It was not listed separately in my stage table, so its cost was folded into refInfra. The next round must split refInfra into reference lookup / resolveInfraEnvelope / final remerge / applyObjectSchema before concluding anything about infra recognition.",
+      "refinfra_split": {
+        "corpus": "m unique entropy spans, 0 reference constructs, fresh process per point",
+        "measured_ms": {
+          "referenceDiscovery": "8.5 / 12.2 / 17.3 / 29.5 / 53.4   T(2m)/T(m) tail 1.81  LINEAR (refs=0 at every size, so this is the one full-text scan)",
+          "envelopeLookup": "0.3 / 0.4 / 0.5 / 0.8 / 1.5        tail 1.88  LINEAR, effectively zero with 0 refs",
+          "resolveInfraEnvelope": "2.4 / 4.3 / 6.6 / 9.9 / 15.4       tail 1.56  LINEAR",
+          "finalRemerge": "7.6 / 28.8 / 110.8 / 427.6 / 1697.0   tail 3.79 / 3.86 / 3.97  QUADRATIC",
+          "applyObjectSchema": "3.3 / 5.8 / 10.8 / 17.6 / 22.1     LINEAR"
+        },
+        "bounds_change_counts": "changed=0 and unchanged=1000/2000/4000/8000/16000 at every size, and remergeIn == remergeOut at every size. So resolveInfraEnvelope does not move a single bound on this corpus, `widened` remains 8000 pairwise-disjoint spans, and the final remerge reproduces its own input after O(m^2) work -- exactly the shape containmentMerge had.",
+        "primary_term": "finalRemerge at worker.js:3000 (`if (!remerged.some((x) => overlaps(span, x)))`), 427.6ms of a 1054.6ms total at m=8000, about 41%.",
+        "confirmed_correction": "This CONFIRMS the correction made last round. My stage table had no line for the final remerge, so its cost was folded into `refInfra`, and I had attributed that 22% to infra recognition. resolveInfraEnvelope is 9.9ms at m=8000 while the final remerge after it is 427.6ms -- the widening is linear and cheap, the dedup pass after it is the cost.",
+        "pipeline_shape_now": "The picture is now three independent quadratic dedup/overlap passes over the same span list, not one unknown performance problem: containmentMerge (FIXED, 1002.9ms -> 2.1ms at m=8000), selectedOverlap 464.6ms, finalRemerge 427.6ms. Everything else measured is linear."
+      }
     }
   ],
   "r3_3_baselines": {

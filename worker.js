@@ -2950,9 +2950,11 @@ export function findSensitiveSpans(text, flags, deps = {}) {
   // silently start returning an arbitrary one of several candidates instead of failing. The
   // invariant test is the tripwire: do not delete it and do not relax the disjointness assertion.
   //
-  // Replaces an O(spans x references) scan. Measured at 16000 constructs with 16000 surviving
-  // spans, that scan took 8.8 seconds with per-span cost rising sevenfold across the range
-  // (R3-BODY-004).
+  // Replaces an O(spans x references) scan with an O(log references) lookup. This is an INDEPENDENT
+  // asymptotic improvement, and it is NOT the fix for R3-BODY-004: ablation later showed the lookup
+  // was never that finding's dominant term (16000 constructs x 16000 spans went 8785.8ms to
+  // 8042.4ms, about 8%), and the real cost was in the span-pipeline passes downstream. An earlier
+  // version of this comment attributed the 8.8 seconds to the lookup, which measurement disproved.
   // ---------------------------------------------------------------------------------------------
   // Both candidate rules, because envelopes may be ADJACENT with a shared boundary: `${a}${b}`
   // yields [0,4] and [4,8]. The old rule picked the NARROWEST strict container, and when a span
