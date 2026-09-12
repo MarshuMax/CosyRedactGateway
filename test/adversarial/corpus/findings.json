@@ -252,7 +252,34 @@
       "correction": "WITHDRAWN AS A COMPLEXITY FINDING. My ratios were computed correctly but INTERPRETED against the wrong doubling base: the size sequence is 64K -> 256K -> 1M -> 4M -> 16M, i.e. x4 per step, so a LINEAR algorithm is expected to show T(4n)/T(n) ~ 4. The measured tail 3.84 / 4.04 / 4.10 gives p = log(ratio)/log(4) ~ 0.97 / 1.01 / 1.02, which is linear. Genuine O(n^2) on this sequence would approach 16. This is the sixth time in this session that an unverified inference of mine was written down as a conclusion; the specific failure here is applying x2 reasoning to a x4 series.",
       "restated": "The real question is throughput, not complexity: a legal 16 MiB body costs about 3.9s of CPU, i.e. ~4.1 MiB/s for a clean request. Whether that is acceptable is a product question about constant factors, and the implementation is linear either way.",
       "phase_attribution_required_before_any_optimisation": "Measure, fresh process per point, on the same 4 MiB and 16 MiB clean corpus: G off, structured parsers off, H off, reference envelopes isolated, and the full pipeline. Then compute phase_time/total_time. Only a phase with a significant share is worth touching.",
-      "note_on_gitleaks": "The keyword pre-filter `for (rule of rules) rule.keywords.some(k => lower.includes(k))` is O(ruleCount x n), which is LINEAR in n for a fixed rule set, with a possibly large constant. It must NOT be described as this round's quadratic term. It is only worth rewriting if instrumentation shows it dominates -- and a multi-pattern scan such as Aho-Corasick would then need a differential against the current function comparing start/end/ruleId/ORDER over overlapping keywords, prefix keywords, punctuation keywords, case folding, keyword-less rules and repeated keywords. Not before it is proven dominant, and not as a giant regex."
+      "note_on_gitleaks": "The keyword pre-filter `for (rule of rules) rule.keywords.some(k => lower.includes(k))` is O(ruleCount x n), which is LINEAR in n for a fixed rule set, with a possibly large constant. It must NOT be described as this round's quadratic term. It is only worth rewriting if instrumentation shows it dominates -- and a multi-pattern scan such as Aho-Corasick would then need a differential against the current function comparing start/end/ruleId/ORDER over overlapping keywords, prefix keywords, punctuation keywords, case folding, keyword-less rules and repeated keywords. Not before it is proven dominant, and not as a giant regex.",
+      "phase_attribution": {
+        "method": "Fresh process per point. Each candidate disabled in turn on the SAME clean corpus, then phase_time/total_time.",
+        "at_4MiB": {
+          "referenceEnvelopes isolated": "270.4ms (28.3%)",
+          "G only": "761.4ms (79.6%)",
+          "H only": "435.9ms (45.6%)",
+          "structured only": "275.7ms (28.8%)",
+          "full detectors": "925.9ms (96.8%)",
+          "jsonParse": "4.1ms (0.4%)",
+          "redactJson total": "956.7ms",
+          "ms/MiB": 239.2,
+          "MiB/s": 4.18
+        },
+        "at_16MiB": {
+          "referenceEnvelopes isolated": "1061.3ms (27.2%)",
+          "G only": "3132.2ms (80.1%)",
+          "H only": "1771.0ms (45.3%)",
+          "structured only": "1133.2ms (29.0%)",
+          "full detectors": "3883.0ms (99.3%)",
+          "jsonParse": "15.5ms (0.4%)",
+          "redactJson total": "3908.7ms",
+          "ms/MiB": 244.3,
+          "MiB/s": 4.09
+        },
+        "conclusion": "ms/MiB is essentially flat (239 -> 244) and every phase keeps the same share across a 4x size increase, so the scaling is healthy and the issue is a constant factor. Detectors are 99.3% of the work; JSON.parse is 0.4%. The single largest contributor is the gitleaks family at ~80%, within which the keyword pre-filter is the dominant term: ~1200 rules each running `lower.includes(keyword)` over the whole body. At 16 MiB that is ~6 GB/s of memory traffic, which is bandwidth-bound rather than algorithmically expensive -- hence linear with a large constant. referenceEnvelopes is a consistent 27-28% and is the known open R3-REDOS-002 family.",
+        "next_step": "Optimising is now justified by measurement rather than by inspection, and the target is the gitleaks keyword pre-filter: one multi-pattern pass computing the set of keywords PRESENT, instead of one full-text scan per rule. Any such rewrite must be differential against the current collectGitleakSpans comparing start/end/ruleId AND ORDER, over overlapping keywords, prefix keywords, punctuation keywords, case folding, keyword-less rules and repeated keywords. NOT started in this round, and explicitly not as a giant regex."
+      }
     }
   ]
 }
