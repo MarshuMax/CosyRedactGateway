@@ -2766,7 +2766,37 @@ export function findSensitiveSpans(text, flags, deps = {}) {
     (b.end - b.start) - (a.end - a.start) || b.priority - a.priority || a.start - b.start);
   const absorbed = new Set();
   const merged = [];
-  for (const span of byPriority) {
+
+  // FAST PATH: pairwise-disjoint input.
+  //
+  // For spans that do not overlap, `inner` is empty for every span by construction -- `inner` requires
+  // another span to sit inside this one, and containment requires overlap. So `absorbed` stays empty,
+  // no attribution or structural inheritance happens, and `merged` is exactly `byPriority`. The loop
+  // below would therefore spend O(n^2) to produce its own input.
+  //
+  // That is not a hypothetical shape: a document with one secret per line produces exactly this, and
+  // it is where the cost showed up (1002.9ms of a 1978.1ms call at 8000 spans, scaling 4.22x per
+  // doubling -- R3-BODY-004).
+  //
+  // The check is O(n log n) and the fallback below is the ORIGINAL algorithm, untouched. This
+  // deliberately does not attempt a general containment reduction: for overlapping input the old
+  // semantics, including every attribution and inheritance rule, still decide the result.
+  const disjoint = (() => {
+    if (consolidated.length < 2) return true;
+    const byStart = consolidated.slice().sort((a, b) => a.start - b.start);
+    for (let i = 1; i < byStart.length; i++) {
+      if (byStart[i].start < byStart[i - 1].end) return false;
+    }
+    return true;
+  })();
+  if (disjoint) {
+    // `merged` is byPriority, and `emitted` is `merged` with the absorbed-coverage filter applied --
+    // which is also vacuous here, since nothing was absorbed. Both are returned through the SAME
+    // downstream code rather than short-circuiting the whole function, so nothing else changes.
+    merged.push(...byPriority);
+  }
+
+  for (const span of disjoint ? [] : byPriority) {
     const inner = byPriority.filter((other) => other !== span
       && !absorbed.has(other)
       && other.start >= span.start && other.end <= span.end

@@ -406,7 +406,18 @@
         "coverageStatusForSpan_excluded": "worker.js:3018. It does `spans.coverage?.attempts` and returns null when there is no attempts array, so the `attempts.find(...)` per span never executes unless coverage was collected. It is a genuine O(spans x attempts) candidate the moment coverage IS enabled, and is recorded as such, but it is not this finding's term.",
         "referenceAndInfra_needs_its_own_split": "It is the SECOND largest term at 22% and it is superlinear (3.68x), yet this corpus contains ZERO reference constructs -- so the cost here is not reference lookup. The reference half can contribute at most the empty-list binary search. That leaves infra recognition, and it has not been split out yet."
       },
-      "next_step": "Fix the primary term (containmentMerge) with a minimal semantics-preserving reduction, accepted by an exact-array differential, then re-measure the same curve. Then split referenceAndInfra."
+      "next_step": "Split refInfra into reference lookup, resolveInfraEnvelope, final remerge and applyObjectSchema; then decide the next cut. selectedOverlap is already a confirmed quadratic candidate.",
+      "containment_merge_fix": {
+        "change": "Pairwise-disjoint FAST PATH plus the ORIGINAL algorithm as fallback. For disjoint spans `inner` is empty by construction (containment requires overlap), so `absorbed` stays empty and `merged` is exactly `byPriority` -- the loop was spending O(n^2) to produce its own input. The disjointness check sorts by start and tests `next.start >= prev.end`, O(n log n). Overlapping or nested input falls through to the untouched original, so every attribution, inheritance and tie-break rule is unchanged.",
+        "differential": "The OLD implementation was kept as an oracle and both were instrumented to expose `byPriority`, `merged`, `emitted` and `absorbed.size`. Compared as EXACT ARRAYS over start/end/type/priority/providerType/absorbed/evidence/pathSegments/pathConfidence/indent/key/syntax/schemaEncoding AND ORDER. 10 targeted shapes (disjoint-many, nested, crossing overlap, same bounds, provider-inside-binding, entropy-inside-gitleaks, mixed priorities, adjacent-touching, single, empty) plus 30000 seeded random documents: 30010 checked, 0 differences.",
+        "measured": {
+          "m8000_containmentMerge": "1002.9ms -> 2.1ms",
+          "m8000_total": "1978.1ms -> 1061.8ms (-46%)",
+          "m16000_total": "8042.4ms -> 3800.2ms"
+        },
+        "remaining_terms_at_m8000": "selectedOverlap 465.7ms and refInfra 442.4ms now dominate; consolidate 131.5ms is linear."
+      },
+      "correction_of_my_inference": "CORRECTED: I previously wrote that the 22% in `refInfra` must be infra recognition because the corpus has zero reference constructs. That inference was wrong to make from the corpus alone -- the infra widening stage also ends with a final remerge, `for (const span of widened...) if (!remerged.some((x) => overlaps(span, x)))`, which is itself O(m^2) at worker.js:3000. It was not listed separately in my stage table, so its cost was folded into refInfra. The next round must split refInfra into reference lookup / resolveInfraEnvelope / final remerge / applyObjectSchema before concluding anything about infra recognition."
     }
   ],
   "r3_3_baselines": {
