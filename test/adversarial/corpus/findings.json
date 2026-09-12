@@ -100,10 +100,44 @@
       "regression": "scripts/perf-redos.mjs families C-reference-unclosed, C-reference-depth and C-reference-siblings, all reporting amplifying adversarial/control ratios. No bounded reproducer is in the ordinary suite yet, because the fix is not in.",
       "found_via": "The sweep's per-family summary. Note that three OTHER families that appeared as TIMEOUT in the pre-fix sweep (A-assignment-quote, A-assignment-separators, B-provider-wrong-tail) were NOT regex problems at all: their adversarial/control ratio was 1.00-1.07, i.e. both sides were equally slow because of the email detector. After the email fix they measure 24ms, 19ms and 37ms at 131072 bytes with linear exponents. That is exactly why a same-length control is required -- without it, a shared quadratic term reads as a regex finding.",
       "algorithm_search": {
-        "attempt_1": "Predicate on prefix reachability per position with a per-family `owed` at each index. Rejected by reasoning before testing: `BAL[i][L]` needs the closure relation, so computing it re-derives the same recursive scan.",
-        "attempt_2": "Predecessor-chain jump tables per family plus a failure memo. Implemented and tested EXHAUSTIVELY against the reference over every string of length 0..5 on a 10-character alphabet: 111111 strings, 1180 differences. Minimal counterexample `${}` -- the reference emits a span and the prototype emitted none. Rejected rather than shipped. The naive memo is unsound for two reasons: a position reached with a DIFFERENT `owed` is not interchangeable, and mark-all-visited-failed is wrong because the walk also includes positions that were merely skipped.",
-        "attempt_3": "Monotonicity of closure positions within a family, which would allow a two-pointer sweep. Tested over 1411 groups and FALSIFIED: `\"{{{}}}\"` has starts [0,1] with ends [6,5], i.e. the later start closes EARLIER. Same for `\"${${}}\"` and `\"$($())\"`. No two-pointer sweep is available for this grammar.",
-        "conclusion": "The balanced scan's fallback semantics are genuinely intricate, and three plausible reformulations have now been ruled out with evidence. The fix needs a design that keeps per-position state exactly -- most likely an explicit stack machine emitting constructs as they close, validated against the exhaustive oracle already built. It is NOT a quick substitution."
+        "status": "NOT RESOLVED. Five formulations attempted; none reached equivalence, and none was shipped. The finding stays open.",
+        "oracle": "The current referenceEnvelopes() is used as an oracle and compared by EXACT ARRAY (start, end, opener, order), never by count. Exhaustive over every string of length 0..5 on the 10-character alphabet { } $ ( ) % < > x _ = 111111 strings, plus targeted counterexamples.",
+        "attempts": [
+          {
+            "n": 1,
+            "idea": "Predicate on prefix reachability per position with a per-family owed.",
+            "diffs": "n/a",
+            "outcome": "rejected by reasoning: computing the predicate needs the closure relation itself"
+          },
+          {
+            "n": 2,
+            "idea": "Predecessor-chain jump tables plus a failure memo.",
+            "diffs": 1180,
+            "outcome": "REJECTED. Minimal counterexample `${}` -- the reference emits a span, the prototype emitted none. The memo is unsound twice: a position reached with a different owed is not interchangeable, and marking every visited position failed is wrong because the walk also includes positions that were merely skipped."
+          },
+          {
+            "n": 3,
+            "idea": "Per-family event tables built in the reference's exact stepping order, closure by scanning the closer list.",
+            "diffs": 9,
+            "outcome": "REJECTED. Closest of the five; the residual errors were in the closer-consumption rule, e.g. `{{{}}}` where the reference closes at 6 and this closed at 5."
+          },
+          {
+            "n": 4,
+            "idea": "Same event tables with a baseline taken as the cumulative owed before the first event at or after the scan start.",
+            "diffs": 39,
+            "outcome": "REJECTED. Off-by-one in the baseline: the cumulative owed BEFORE an event is not the owed AFTER the previous one, because the scan start is not event-aligned."
+          },
+          {
+            "n": 5,
+            "idea": "Binary search over the cumulative owed sequence at closer events.",
+            "diffs": 1105,
+            "outcome": "REJECTED. Binary searching a quantity that is not the search key. Two index corrections were tried (cum[mid] versus cum[mid+1]) and neither reached equivalence, which is the signal that the formulation is wrong rather than the arithmetic."
+          }
+        ],
+        "structural_finding": "The reason these formulations fail is now quantified: the peak of `owed` during a scan grows LINEARLY with the input -- 1026 at n=1024 and 4098 at n=4096 for `'{'.repeat(n)`, 2050 at n=4096 for `'${{ '.repeat(n/4)`. So a state table indexed by (position, owed) is O(n^2) in memory and is not available, and any approach that hopes a single derived key (a threshold, a monotone scan position) captures the state is collapsing a two-dimensional state space into one dimension. That is also why the monotonicity conjecture in attempt 3-of-the-earlier-round was falsified: several owed values coexist at one position.",
+        "what_remains": "The two-dimensional state is irreducible as stated, so the fix has to change WHAT is computed rather than how it is looked up: either (a) an explicit stack machine that emits constructs as they close while keeping failed outer attempts from consuming inner candidates -- which is the design the task asked for and is a real piece of work, or (b) a documented parser resource limit, which is a mitigation and must NOT be reported as this finding fixed.",
+        "interim_mitigation": "R3-REDOS-003 (trailing-trim) was found in the same sweep and IS fixed; it was an independent cubic term. The unclosed-opener family remains the dominant remaining cost at 32 KiB.",
+        "recommendation": "Do not attempt a sixth formulation under time pressure. Attempt 3 reached 9 differences out of 111111 and is the best starting point for a stack machine: its event-table construction in the reference's stepping order is correct, and only the closure search needs to be replaced by a stack that tracks the live owed values."
       },
       "term_quantification": "Two separate quadratic terms were measured so the fix targets the right one. (a) The balanced scan dominates: unclosed openers cost 73/270/1196ms at 4096/8192/16384 with |out| = 0. (b) The final containment filter `out.filter((env) => !out.some(...))` is O(|out|^2) but is SECOND ORDER here: 3276 sibling envelopes cost 41.8ms total, so the filter accounts for roughly 0.3%. Optimising the filter would not address the reported finding."
     },
