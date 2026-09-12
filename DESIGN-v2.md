@@ -1428,6 +1428,40 @@ x: ${{ a: "}" }}   →  envelope 覆盖 ${{ a: "}" }，一个 } 留在外面
 
 后果有界且安全：**envelope 偏短只会导致替换得更多（span 变宽），永不泄漏**。它可能破坏宿主语法——这正是该限制被记录而不是被默默容忍的原因。测试同时断言"在 contract 内的所有括号位置变体均完整覆盖"。
 
+## 9.24 R0.2 Spec / Test / Runtime Contract Sync
+
+做法：机械抽取三类来源（`DESIGN-v2.md`、`test/*`、`worker.js` 中表达 contract 的注释与 `REDACT_NOTICE`）中的可验证断言，逐条对照当前实现，而不是通读猜。
+
+### 机械检查结果
+
+| 检查 | 结果 |
+|---|---|
+| 导出符号总数 | 84 |
+| 文档引用的常量枚举 × 实现成员 | **一致**（无文档遗漏成员） |
+| 熵阈值文档数值 `length=9 → 5.4240`、`length=17 → 5.1502` | **精确匹配** |
+| infra 分类表（40/32/16-hex × bare/anchored × 两种 profile） | **11 条全部一致** |
+| 注释中的**悬空交叉引用** | **1 处：`INFRA_POLICY`** |
+| `worker.js` 注释中的 CJK 混入 | **1 处**：`much larger误伤面` |
+| 生产代码中 legacy 方言残留 | 0（见 9.22） |
+| 测试标签 | `[GREEN NOW]` 196 / `[RED]` 57 / `[COUPLING]` 4 / **未标注 42** |
+
+结论：**文档与实现没有行为性漂移**（所有可机械验证的行为断言都成立），漂移集中在**生产注释**与**标签完整性**。
+
+### 已修
+
+1. **悬空交叉引用**：`// Policy is a separate layer (see INFRA_POLICY below)` —— `INFRA_POLICY` 常量已不存在（策略现在是 `decideSpanAction` + profile）。改为指向真实符号。
+2. **CJK 混入英文注释**：`a much larger误伤面` → `a much larger false-positive surface`。
+
+### 记录（未修，属规范性而非正确性）
+
+3. **`REDACT_NOTICE` 正文未进设计文档**。它是**运行时对模型的承诺**，且已被 `proxy.test.js` 断言，但文档从未写出它的正文。补录如下：
+
+   > Sensitive values are redacted before forwarding, including messages, tool inputs, and tool results. You may see CRG_ tokens; treat them as opaque and preserve them exactly. Sensitive values you read appear as placeholders, and placeholders you emit in text or tool calls are restored to the original secrets.
+
+   它的三句分别对应三条契约：**注入范围**（messages / tool inputs / tool results）、**token 不透明性**（模型不得改写）、**双向还原**（正文与 tool calls 都还原）。任何一句失效都是行为变更，却不会有测试失败——这是当前**最薄的一处 contract 覆盖**。
+
+4. **42 条测试无标签**。标签约定是 `[GREEN NOW]`（现状）/ `[RED]`（目标）/ `[COUPLING]`（耦合约束）；未标注集中在 `core` / `entropy` / `gitleaks` / `proxy` / `stream` / `node-server` / `http-integration` 这些较早的文件。这不是缺陷，但意味着"这条测试在固定现状还是规格"无法从名字判断。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。

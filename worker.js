@@ -1126,13 +1126,15 @@ function looksLikeReferenceValue(raw) {
 // shape, so a base64-encoded token is invisible to it. The ledger is what makes the
 // round trip work -- the visible surrogate is registered explicitly, and a lookup is
 // attempted only for strings the ledger actually minted. Decoding arbitrary
-// base64-looking text would be a much larger误伤面 and is deliberately not done.
+// base64-looking text would be a much larger false-positive surface and is deliberately
+// not done.
 
 // ----------------------------------------------------------- infra recogniser ---
 //
 // The recogniser CLASSIFIES. It never returns an action, never suppresses anything, and
-// never decides to preserve. Policy is a separate layer (see INFRA_POLICY below), which
-// keeps "what is this" and "what do we do with it" from becoming one entangled guess.
+// never decides to preserve. Policy is a separate layer (decideSpanAction, driven by a
+// profile), which keeps "what is this" and "what do we do with it" from becoming one
+// entangled guess.
 //
 // Monotonic risk is the governing rule, and it has two halves:
 //
