@@ -1958,6 +1958,61 @@ canonical(fragmented logical events) === canonical(single logical event)
 
 第 4 条尤其值得记：我当时一度怀疑是 **gateway 丢前缀**。用 `restoreSseStream` 隔离后证明 SSE 层**保留前缀**、合并完全正确，问题在我的 harness。
 
+## 9.31 R2.3 Parser Collision / Grammar Ambiguity（已实现，**无新 finding**）
+
+### 核心问题不是"哪个 parser 正确"
+
+多个 parser 合理地读同一段字节、得到不同边界：YAML 看到 `password: |` 与块体、shell parser 看到 `KEY=value`、URL parser 看到 `?q=...`、header parser 看到 `Authorization: Bearer ...`、reference scanner 看到 `{{ ... }}`、provider detector 则在任何位置看到凭据。
+
+**oracle 不要求某一方胜出**，只要求**组合**仍守四条契约：
+
+```
+1. hard secret 不泄漏
+2. mutation boundary 外字节不移动
+3. parser 失败不得禁用独立 detector
+4. 同一输入重复执行结果稳定（形状）
+```
+
+满足四条的组合**就不是缺陷**，无论边界多么反直觉。
+
+### 覆盖
+
+`test/adversarial/parser-collision.test.js`
+
+- **20 个碰撞模板 × 3 个 secret**（`op://` / `http://` / `image:tag` / `key=${REF}` / `key=$(ref)` / `Bearer` / 未闭合引号 / 块标量 / 序列项 / 流式映射 / 多文档 `---` …）
+- **21 个歧义宿主片段 × 3 个 secret × 4 种摆放**（>200 例）
+- **seeded 组合 400 例**
+- 定向：URL query 逐字节保留、未解析行中的 secret 仍被 claim、引号不被吞、**同行两个不同 secret 都被脱敏**、同明文复用同一 token、**任何 span 都不得跨行**、collision corpus 可复现
+
+### 结论
+
+**无新 finding。** 四条契约在全部组合下成立。
+
+### 本轮修正的两处**测试**错误（第 4、第 7 条）
+
+**① 契约 4 断言成了字节稳定。** 重复执行时 token 必然不同（request-id 每请求随机，其唯一性有自己的不变量测试）。改为断言**形状**：`normalize(out)` 后比较——即"哪个位置出现 token、周围字节是什么"稳定。这与 R2.2 同一类错误。
+
+**② 我误判了一次"注释被吞"。** 定位到只有 **YAML 路径 + `#` 前无空白** 时 `# note` 被纳入 span：
+
+```
+password: <PAT># note   → span 含 "# note"   ❌ 我当时判定为缺陷
+password: <PAT> # note  → span 只含凭据      ✅
+DB_PASSWORD=<PAT># note → span 只含凭据      ✅
+```
+
+**用 PyYAML 6.0.1 校准后推翻了我的判断**：
+
+```
+password: abc# note   → {'password': 'abc# note'}    # 属于纯量值
+password: abc # note  → {'password': 'abc'}          # 才是注释
+```
+
+YAML 规范要求 `#` 前必须有**空白**才起注释。所以紧跟在凭据后的 `#` **确实属于值**，claim 整段是**正确**的——**gateway 与 PyYAML 一致**。若按我最初的断言"修"，反而会让实现偏离语法。
+
+已改为 OBSERVATION 并附带对照（有空白时注释保留）。
+
+> 这是本 session **第 5 次**"我把未验证的推断当成结论"。前四次：AWS `[A-Z2-7]`、`op://` 的 INTERNAL_HOSTNAME 归因、R0.2 的"无漂移"结论、P7 的 DEFAULT profile 期望。规律一致：**推断一旦写进测试或文档就会变成后续推理的前提**。这次的正确做法是**先用 PyYAML 取基准再判定**。
+
 ## 10. 未解决问题 / 待验证
 
 1. **【P2 · 待验证】GLiNER 类 NER 组件**：本机 4 核无 GPU，长文本实测推理在几十秒量级，直接整段送模型不可接受；可行方向是只对候选 span 截取 ±100~300 字符窗口送模型。待验证项：窗口大小与 p50 / p95 延迟曲线、窗口截断对召回的影响、模型体积在 Workers 运行时的可行性（CPU / WASM 限制）。
