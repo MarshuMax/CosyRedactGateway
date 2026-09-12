@@ -1013,11 +1013,18 @@ export function classifyKeyStrength(key) {
 // specific to any template language -- these are balanced-delimiter constructs found by a
 // scanner, not a list of special cases.
 const REFERENCE_CONSTRUCTS = Object.freeze([
-  { opener: "${{", closer: "}}" },
-  { opener: "{{", closer: "}}" },
-  { opener: "${", closer: "}" },
-  { opener: "$(", closer: ")" },
-  { opener: "%", closer: "%", simple: true },
+  // `delimiter` is the CLOSING DELIMITER length: the scan tracks how many closer characters
+  // are still owed, counting inner braces of the same kind on the way. `{{` therefore owes
+  // two and `{` owes one, so a lone `{` inside `${{` is visible to the scan.
+  { opener: "${{", closer: "}}", delimiter: 2 },
+  { opener: "{{", closer: "}}", delimiter: 2 },
+  { opener: "${", closer: "}", delimiter: 1 },
+  { opener: "$(", closer: ")", delimiter: 1 },
+  // Simple forms have no nesting and require a NAME-ONLY body. The namePattern is load
+  // bearing, not decoration: without it `50% CPU, <secret>, 60% memory` opened a region
+  // spanning the prose between two ordinary percent signs, and a detector hit inside would
+  // have replaced the whole thing.
+  { opener: "%", closer: "%", simple: true, namePattern: /^%[A-Za-z_][A-Za-z0-9_]*%$/ },
   { opener: "<", closer: ">", simple: true, namePattern: /^<[A-Za-z_][A-Za-z0-9_]*>$/ },
   { opener: "{", closer: "}", simple: true, namePattern: /^\{[A-Za-z_][A-Za-z0-9_.]*\}$/ },
 ]);
@@ -1050,16 +1057,23 @@ export function referenceEnvelopes(text) {
       continue;
     }
 
-    // Balanced scan, so nested braces inside the construct do not close it early.
-    let depth = 0;
-    let j = i;
+    // Balanced scan. `owed` counts the closer characters still needed, and an inner brace of
+    // the same kind adds to it -- that is what makes `${{ a: {b:1}}}` close at the END of the
+    // construct rather than at the first `}}`, which is the inner object's brace plus the
+    // first template brace.
+    //
+    // Only the same opener increments: a `{` that is not preceded by `$` or another `{` is a
+    // plain brace, and it is exactly what `owed` accounts for.
+    let owed = found.delimiter;
+    let j = i + found.opener.length;
     let end = -1;
     while (j < text.length) {
-      if (text.startsWith(found.opener, j)) { depth++; j += found.opener.length; continue; }
-      if (text.startsWith(found.closer, j)) {
-        depth--;
-        j += found.closer.length;
-        if (depth === 0) { end = j; break; }
+      if (text.startsWith(found.opener, j)) { owed += found.delimiter; j += found.opener.length; continue; }
+      if (text[j] === "{" && found.closer.includes("}")) { owed++; j++; continue; }
+      if (text[j] === found.closer[0]) {
+        owed--;
+        j++;
+        if (owed === 0) { end = j; break; }
         continue;
       }
       j++;

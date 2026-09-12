@@ -242,3 +242,120 @@ test("R0.1: referenceEnvelopes finds the construct, not the whole line [GREEN NO
   // Two references are two envelopes.
   assert.equal(referenceEnvelopes("a: ${A} and ${B}").length, 2);
 });
+
+// ================================================ R0.1.2 scanner hardening ==========
+
+test("R0.1.2: `%` needs a name-only body, so two prose percents do not form an envelope [RED]", async () => {
+  // The scanner table declared `{ opener: "%", closer: "%", simple: true }` with NO
+  // namePattern, and the simple branch only enforces `if (found.namePattern && ...)` -- so the
+  // "simple forms require a name-only body" rule documented for `%` was not in force at all.
+  // Two ordinary percent signs therefore opened a region spanning everything between them,
+  // and a hard detector hit inside would have replaced the whole prose span.
+  // The fixture must not itself contain a DIFFERENT valid construct, or it proves nothing
+  // about `%`: an earlier version wrapped the credential in `<...>`, which is a legitimate
+  // `<VAR>` reference and produced an envelope for that reason. The body between the two
+  // percent signs here is ordinary prose with a bare credential.
+  const prose = "50% CPU, token=ghp_16C7e42F292c6912E7710c838347Ae178B4a, 60% memory";
+  assert.deepEqual(referenceEnvelopes(prose), [], "prose percents are not a reference construct");
+
+  // Stated separately, because it is a real and benign consequence of `<VAR>` being a form:
+  // `<ghp_...>` IS an envelope, so a credential wrapped that way is replaced with its wrapper.
+  // The wrapper is harmless host syntax here, so the outcome is still correct.
+  const angle = `50% CPU, <ghp_16C7e42F292c6912E7710c838347Ae178B4a>, 60% memory`;
+  const angleEnv = referenceEnvelopes(angle);
+  assert.equal(angleEnv.length, 1, "the `<...>` form is recognised");
+  assert.equal(angle.slice(angleEnv[0].start, angleEnv[0].end), "<ghp_16C7e42F292c6912E7710c838347Ae178B4a>");
+
+  // The construct itself is still recognised.
+  assert.equal(referenceEnvelopes("%DB_PASSWORD%").length, 1, "a name-only body is a reference");
+
+  // And the prose is left alone end to end, rather than the whole span being replaced.
+  const { out } = await redact(prose);
+  assert.ok(out.includes("50% CPU"), "the leading prose survives");
+  assert.ok(out.includes("60% memory"), "and the trailing prose survives");
+  assert.equal(out.includes("ghp_16C7e42F292c6912E7710c838347Ae178B4a"), false, "the credential goes");
+});
+
+test("R0.1.2: `${{ ... }}` counts inner braces, so the construct closes at the right place [RED]", async () => {
+  // Only the SAME opener incremented depth, so a lone `{` inside `${{` was invisible and the
+  // scan ended at the first `}}` it saw -- which is the inner object's brace plus the first
+  // template brace. `${{ a: {b:1}}}` left an orphan `}` outside the envelope.
+  const cases = [
+    "${{ a: {b:1} }}",
+    "${{ a: {b:1}}}",
+    "${{a:{b:1}}}",
+    "${{a:{b:{c:1}}}}",
+  ];
+  for (const construct of cases) {
+    const line = `x: ${construct}`;
+    const envelopes = referenceEnvelopes(line);
+    assert.equal(envelopes.length, 1, `${construct}: exactly one envelope`);
+    assert.equal(
+      line.slice(envelopes[0].start, envelopes[0].end), construct,
+      `${construct}: the envelope must cover the whole construct`
+    );
+  }
+});
+
+test("R0.1.2: an orphan brace never survives a replacement [RED]", async () => {
+  // The end-to-end consequence of a short envelope: the host syntax is broken.
+  const line = "x: ${{ a: {b:1}}}  # note";
+  assert.equal(referenceEnvelopes(line)[0] && line.slice(referenceEnvelopes(line)[0].start, referenceEnvelopes(line)[0].end),
+    "${{ a: {b:1}}}", "the envelope covers the construct");
+  const { out } = await redact(line);
+  // No detector hit, so the line is returned unchanged -- which is the point: a correctly
+  // sized envelope means nothing is rewritten at all. The property to assert is BALANCE, not
+  // the absence of `}`: the construct legitimately contains braces.
+  assert.equal(out, line, "an untouched construct comes back byte-identical");
+  const opens = out.split("{").length - 1;
+  const closes = out.split("}").length - 1;
+  assert.equal(opens, closes, `braces must stay balanced: ${out}`);
+});
+
+test("R0.1.2: nested braces with a credential inside are replaced whole [RED]", async () => {
+  const line = `x: \${{ config: {token: "${"ghp_16C7e42F292c6912E7710c838347Ae178B4a"}"} }}`;
+  const { out } = await redact(line);
+  assert.equal(out.includes("ghp_16C7e42F292c6912E7710c838347Ae178B4a"), false, "the credential goes");
+  assert.equal(out.includes("}"), false, "and the whole construct with it");
+  assert.equal(out.includes("config:"), false, "no fragment of the construct survives");
+});
+
+test("R0.1.2: an unterminated construct is still not an envelope [GREEN NOW]", () => {
+  // The scanner is a scanner, not a template parser: a construct that never closes is
+  // ordinary text, and treating it as a boundary would widen a span over unrelated content.
+  assert.deepEqual(referenceEnvelopes("x: ${{ a: {b:1}"), [], "no closer, no envelope");
+  assert.deepEqual(referenceEnvelopes("x: ${a"), [], "no closer, no envelope");
+  assert.deepEqual(referenceEnvelopes("x: %NAME"), [], "no closer, no envelope");
+});
+
+test("R0.1.2: the scanner balances BRACES, not string literals -- a stated limit [GREEN NOW]", () => {
+  // Stated rather than papered over with a special case. The scan counts braces and delimiter
+  // characters; it does not lex quoted strings, so a brace INSIDE a string literal closes the
+  // construct early:
+  //
+  //   x: ${{ a: "}" }}   ->  envelope covers `${{ a: "}" }`, leaving one `}` outside
+  //
+  // Deciding this correctly needs a real lexical pass for whichever template language is in
+  // play, and this scanner deliberately is not one. The contract is therefore:
+  //
+  //   A reference envelope is a BALANCED-BRACE construct. Braces inside quotes are not
+  //   distinguished, so a construct containing an unbalanced brace in a string literal is
+  //   NOT reliably recognised.
+  //
+  // The consequence is bounded and safe: a short envelope can only ever REDACT MORE (it
+  // widens a span), never leak. What it can do is damage host syntax, which is why the limit
+  // is recorded here and not silently tolerated.
+  const line = 'x: ${{ a: "}" }}';
+  const env = referenceEnvelopes(line);
+  assert.equal(env.length, 1, "an envelope is still produced");
+  assert.equal(line.slice(env[0].start, env[0].end), '${{ a: "}" }', "but it closes at the brace in the string");
+  assert.notEqual(line.slice(env[0].start, env[0].end), line.slice(3), "which is one character short of the construct");
+
+  // The forms that ARE in contract: every brace-position variant without a quoted brace.
+  for (const construct of ["${{ a: {b:1} }}", "${{ a: {b:1}}}", "${{a:{b:1}}}", "${{a:{b:{c:1}}}}", "${{{{{a}}}}}"]) {
+    const sample = `x: ${construct}`;
+    const found = referenceEnvelopes(sample);
+    assert.equal(found.length, 1, `${construct}: one envelope`);
+    assert.equal(sample.slice(found[0].start, found[0].end), construct, `${construct}: covered exactly`);
+  }
+});
