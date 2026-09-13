@@ -426,3 +426,53 @@ function __storeSummary() {
   const store = __telemetryStore();
   return { recent: store ? store.recent.toArray()[0] : null };
 }
+
+// =====================================================================================
+// item 4a -- outcome describes what the GATEWAY did, not whether the status looked successful
+// =====================================================================================
+
+test("observability: any upstream HTTP status is forwarded, only a fetch throw is upstream_error [GREEN NOW]", async () => {
+  // The distinction: `finalizeNonStream` is reached only when fetchImpl() RETURNED a Response, i.e.
+  // the transport succeeded. A provider's 429 is a successfully forwarded upstream response, not a
+  // gateway fault -- deriving the outcome from `status >= 400` blamed this process for someone
+  // else's rate limit.
+  for (const status of [200, 401, 403, 429, 500, 503]) {
+    __resetTelemetryStore();
+    let fetches = 0;
+    const res = await call({
+      fetchImpl: async () => { fetches++; return new Response(JSON.stringify({ e: status }), { status, headers: { "content-type": "application/json" } }); },
+    });
+    const body = await res.text();
+    assert.equal(res.status, status, `client must see the upstream status ${status} unchanged`);
+    assert.equal(fetches, 1, "exactly one upstream fetch");
+    const rec = __storeSummary().recent;
+    assert.equal(rec.status, status, `telemetry status must be ${status}`);
+    assert.equal(rec.outcome, "forwarded", `a forwarded upstream ${status} is forwarded, not upstream_error`);
+    void body;
+  }
+});
+
+test("observability: a fetch that THROWS is upstream_error with a gateway-generated 502 [GREEN NOW]", async () => {
+  // The other side of the boundary, asserted in the same file so the two cannot drift: this 502 is
+  // produced by the gateway, and this is the ONLY path that reports upstream_error.
+  __resetTelemetryStore();
+  const res = await call({ fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
+  await res.text();
+  assert.equal(res.status, 502, "the gateway generates the 502");
+  const rec = __storeSummary().recent;
+  assert.equal(rec.status, 502);
+  assert.equal(rec.outcome, "upstream_error");
+});
+
+test("observability: a 302 with redirect:manual is forwarded, not an error [GREEN NOW]", async () => {
+  // The clearest case for the rule: the status is not 2xx and the gateway did nothing wrong.
+  __resetTelemetryStore();
+  const res = await call({
+    fetchImpl: async () => new Response(null, { status: 302, headers: { location: "https://elsewhere.example/x" } }),
+  });
+  await res.text();
+  assert.equal(res.status, 302);
+  const rec = __storeSummary().recent;
+  assert.equal(rec.status, 302);
+  assert.equal(rec.outcome, "forwarded");
+});

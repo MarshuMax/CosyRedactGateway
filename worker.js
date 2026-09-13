@@ -4868,7 +4868,19 @@ async function finalizeNonStream(responsePromise, ctx, telemetry) {
   // wrong status and a retained reference to live request state.
   if (telemetry) {
     telemetry.setStatus(response.status);
-    telemetry.setOutcome(response.status >= 400 ? "upstream_error" : "forwarded");
+    // outcome describes WHAT THE GATEWAY DID, not whether the status code looks successful.
+    // Reaching this line means fetchImpl() returned a Response, i.e. the upstream transport
+    // succeeded and we are forwarding an upstream HTTP response -- including 302, 401, 403, 429,
+    // 500 and 503. `upstream_error` is reserved for fetchImpl() THROWING (DNS / connection / TLS /
+    // timeout), where the gateway itself generates the 502.
+    //
+    // Deriving the outcome from the status code made a provider's 429 look like a gateway fault,
+    // which would blame this process for someone else's rate limit.
+    //
+    // KNOWN TRANSIENT, owned by item 8 and deliberately not fixed here: a gateway-GENERATED
+    // response-depth 502 also reaches this line, so it currently records `forwarded` too. Item 8
+    // gives it `upstream_depth`. Stating the boundary keeps each commit's proof scope exact.
+    telemetry.setOutcome("forwarded");
     telemetry.onSpanProjection(ctx.telemetryProjection());
     telemetry.finalizeExactlyOnce();
   }
