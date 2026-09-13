@@ -72,18 +72,37 @@ test("PR2.3: the dashboard carries admin hardening headers and no CORS [GREEN NO
   assert.equal(res.headers.get("access-control-allow-origin"), null, "no CORS on the admin page");
 });
 
-test("PR2.3: the CSP script hash matches the inline script actually served [GREEN NOW]", async () => {
-  // A stale hash would silently break the page in a browser while every other assertion here passed.
+test("PR2.3: the CSP script hash matches the FULL inline script textContent a browser hashes [GREEN NOW]", async () => {
+  // THIS TEST WAS VACUOUS AND THE PAGE WAS BROKEN IN A REAL BROWSER.
+  //
+  // Chrome computes a CSP hash over the script element's textContent -- the bytes BETWEEN <script>
+  // and </script>, INCLUDING any leading and trailing newlines. The previous version matched
+  // `/<script>\n([\s\S]*?)\n<\/script>/` and hashed the capture group, which excludes those two
+  // newlines. It therefore verified a byte sequence no browser ever hashes, and reported success
+  // while CSP refused to execute the dashboard's script.
+  //
+  // The hash now comes from the FULL textContent, and the template no longer has boundary newlines,
+  // so the test's input and the browser's input are byte-identical by construction.
   const { createHash } = await import("node:crypto");
   const res = await getAdmin(OBS, loopback);
   const html = await res.text();
   const csp = res.headers.get("content-security-policy") || "";
   const declared = /script-src 'sha256-([A-Za-z0-9+/=]+)'/.exec(csp);
   assert.ok(declared, "the CSP must pin a script hash");
-  const script = /<script>\n([\s\S]*?)\n<\/script>/.exec(html);
+  const script = /<script>([\s\S]*?)<\/script>/.exec(html);
   assert.ok(script, "the inline script must be found");
-  const actual = createHash("sha256").update(script[1], "utf8").digest("base64");
-  assert.equal(actual, declared[1], "the declared hash must match the served script");
+  const textContent = script[1];
+  // The property that makes the two computations comparable, asserted rather than assumed: no
+  // boundary whitespace, so a browser's textContent is exactly this string.
+  assert.equal(textContent.startsWith("\n") || textContent.startsWith("\r"), false,
+    "no leading newline inside <script>: a browser would hash it and the declared hash would not cover it");
+  assert.equal(/[\r\n]$/.test(textContent), false,
+    "no trailing newline inside <script>, for the same reason");
+  const actual = createHash("sha256").update(textContent, "utf8").digest("base64");
+  assert.equal(actual, declared[1], "the declared hash must match the FULL script textContent");
+  // And the script must actually be the dashboard, so a hashed-but-empty script cannot pass.
+  assert.ok(textContent.includes("/admin/api"), "the hashed script is the dashboard's fetch loop");
+  assert.ok(textContent.length > 1000, "and it is the real script, not a stub");
 });
 
 test("PR2.3: /admin is GET-only, admission first [GREEN NOW]", async () => {

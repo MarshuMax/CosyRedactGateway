@@ -5169,8 +5169,7 @@ const ADMIN_DASHBOARD_HTML = `<!doctype html>
 <div id="status"></div>
 <div id="err"></div>
 <div id="root"></div>
-<script>
-(function () {
+<script>(function () {
   "use strict";
   var REFRESH_MS = 5000;
   var RECENT_MAX = 100;
@@ -5270,8 +5269,7 @@ const ADMIN_DASHBOARD_HTML = `<!doctype html>
   }
   tick();
   setInterval(tick, REFRESH_MS);
-})();
-</script>
+})();</script>
 </body>
 </html>
 `;
