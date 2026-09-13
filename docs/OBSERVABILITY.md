@@ -273,8 +273,14 @@ filtering or selector arguments.
 
 **Authentication runs before the store is read.** `adminAdmission()` executes first, so an
 unauthorised caller cannot even cause the summary to be computed, and an unauthorised response
-contains nothing that reveals the shape of the data. Method and path are also checked after
-admission, so a caller who is not authorised learns nothing about which admin routes exist.
+contains nothing that reveals the shape of the data -- neither `requests_total` nor `by_detector` appears in it.
+
+What an unauthorised caller CAN learn is stated precisely, because an earlier version of this
+paragraph overstated it: the two admin pathnames are matched exactly and *before* admission, so with
+a token configured a request to `/admin` or `/admin/api` answers 401 while an unknown path answers
+404. A 401 therefore confirms that an admin route exists at that path. What is NOT revealed is method
+support, which is checked only after admission, or any part of the data. Hiding the pathname itself
+would require routing changes that are not worth making for this distinction.
 
 **The payload is the store's own output** -- `summary()` plus the already-sanitized
 `recent.toArray()`. Nothing is recalculated here and no schema is duplicated. The sanitizing happens

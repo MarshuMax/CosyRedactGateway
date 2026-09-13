@@ -140,3 +140,68 @@ test("PR2.2: the admin API route requires admission on every runtime [GREEN NOW]
   assert.equal((await apiGet(WITH_TOKEN, { runtime: { kind: "cloudflare" } }, { authorization: `Bearer ${TOKEN}` })).status, 200, "worker with a valid token");
   assert.equal((await apiGet(WITH_TOKEN, { runtime: { kind: "deno" } })).status, 401, "deno without a credential");
 });
+
+// =====================================================================================
+// PR2.2 revision -- the admin envelope is entered BEFORE the global CORS preflight
+// =====================================================================================
+
+/** No admin status may carry any CORS header, and all of them must be no-store. */
+function assertNoCorsAndNoStore(res, label) {
+  for (const h of ["access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-allow-credentials", "access-control-max-age"]) {
+    assert.equal(res.headers.get(h), null, `${label}: ${h} must be absent`);
+  }
+  assert.equal(res.headers.get("cache-control"), "no-store", `${label}: must be no-store`);
+}
+
+test("PR2.2: OPTIONS /admin/api with observability off is a no-store 404 with no CORS [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  const res = await handleRequest(new Request("https://proxy.example/admin/api", { method: "OPTIONS" }), {}, loopback);
+  assert.equal(res.status, 404, "a preflight must not bypass admission");
+  assertNoCorsAndNoStore(res, "OPTIONS obs off");
+});
+
+test("PR2.2: OPTIONS /admin/api on a public bind without a credential is a 401, not a 204 [GREEN NOW]", async () => {
+  // The specific defect: the global corsPreflight() used to answer 204 with CORS headers BEFORE
+  // adminAdmission() ran, which both bypassed authorisation and advertised a cross-origin surface
+  // the route does not have.
+  __resetTelemetryStore();
+  const res = await handleRequest(new Request("https://proxy.example/admin/api", { method: "OPTIONS" }), WITH_TOKEN, publicBind);
+  assert.equal(res.status, 401, "admission runs before any preflight handling");
+  assertNoCorsAndNoStore(res, "OPTIONS unauthenticated");
+});
+
+test("PR2.2: an authorised OPTIONS /admin/api is a 405 with Allow: GET and no CORS [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  const authed = await handleRequest(
+    new Request("https://proxy.example/admin/api", { method: "OPTIONS", headers: { authorization: `Bearer ${TOKEN}` } }),
+    WITH_TOKEN, publicBind);
+  assert.equal(authed.status, 405, "admitted, so the method is what fails");
+  assert.equal(authed.headers.get("allow"), "GET");
+  assertNoCorsAndNoStore(authed, "OPTIONS authorised");
+});
+
+test("PR2.2: every hidden GET /admin/api status is no-store with no CORS [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  const off = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), {}, loopback);
+  assert.equal(off.status, 404);
+  assertNoCorsAndNoStore(off, "GET obs off");
+
+  const publicNoToken = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), OBS, publicBind);
+  assert.equal(publicNoToken.status, 404);
+  assertNoCorsAndNoStore(publicNoToken, "GET public bind, no token");
+
+  const denied = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), WITH_TOKEN, publicBind);
+  assert.equal(denied.status, 401);
+  assertNoCorsAndNoStore(denied, "GET unauthenticated");
+
+  const ok = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), WITH_TOKEN, loopback);
+  assert.equal(ok.status, 200);
+  assertNoCorsAndNoStore(ok, "GET authorised");
+});
+
+test("PR2.2: the ordinary proxy preflight still works, with CORS [GREEN NOW]", async () => {
+  // The reordering must not have removed CORS preflight from the path that legitimately needs it.
+  const res = await handleRequest(new Request("https://proxy.example/H$https://api.example/v1/chat/completions", { method: "OPTIONS" }), { REDACT_CORS_ORIGIN: "*" }, {});
+  assert.equal(res.status, 204, "the proxy preflight is unchanged");
+  assert.equal(res.headers.get("access-control-allow-origin"), "*");
+});

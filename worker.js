@@ -5084,6 +5084,14 @@ async function adminAdmission(request, env, options) {
   return ok ? { allowed: true, status: 200 } : { allowed: false, status: 401 };
 }
 
+/** Admin-envelope error response: always no-store, never CORS. */
+function adminError(status, message) {
+  return new Response(JSON.stringify({ error: { message, type: "cosy_redact_gateway_error" } }), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
 /** Minimal, metadata-free acknowledgement. No summary, no ring, no HTML. */
 function adminAck() {
   return new Response("admin endpoint available\n", {
@@ -5112,11 +5120,12 @@ function adminAck() {
  * Read-only by construction: GET only, no parameters, and no mutation endpoint of any kind.
  */
 function adminApiResponse(env) {
+  // `getTelemetryStore()` lazily CREATES the store, so it is never null here and an empty store
+  // simply reports zeros. An earlier version carried a hand-written zero-schema fallback for the
+  // null case: it was unreachable, and writing out a second copy of the schema is exactly the
+  // duplication this route is supposed to avoid.
   const store = getTelemetryStore(env);
-  // An empty store is a legitimate state (nothing recorded yet, or a fresh process), not an error.
-  const body = store
-    ? { ...store.summary(), recent: store.recent.toArray() }
-    : { schema_version: TELEMETRY_SCHEMA_VERSION, scope: "process/isolate-local; resets on restart or isolate replacement", empty: true, counters: { requests_total: 0, requests_redacted: 0, requests_clean: 0, spans_redacted_total: 0, bytes_redacted_total: 0 }, recent: [] };
+  const body = { ...store.summary(), recent: store.recent.toArray() };
   return new Response(JSON.stringify(body, null, 2), {
     status: 200,
     headers: {
@@ -5130,26 +5139,32 @@ function adminApiResponse(env) {
 
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
-  if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
   const url=new URL(request.url);
-  if (url.pathname === "/" || url.pathname === "/healthz") {
-    return new Response(JSON.stringify({ok:true,service:"cosy-redact-gateway",route:"/<flags>$<upstream-url>",flags:ALL_FLAG_LETTERS,defaultAll:true}),{headers:withCors({"content-type":"application/json; charset=utf-8"},corsOrigin)});
-  }
   if (url.pathname === "/admin" || url.pathname === "/admin/api") {
     const admission = await adminAdmission(request, env, options);
     if (!admission.allowed) {
-      if (admission.status === 401) return new Response(JSON.stringify({ error: { message: "Unauthorized", type: "cosy_redact_gateway_error" } }), { status: 401, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
-      return jsonError(404, "Not found");
+      // Every admin status -- 200, 401, 404, 405 -- carries no-store and no CORS. The generic
+      // jsonError() is deliberately NOT used here: it serves the proxy path, and changing it would
+      // alter normal proxy responses for the sake of an admin route.
+      if (admission.status === 401) return adminError(401, "Unauthorized");
+      return adminError(404, "Not found");
     }
     // Method and path are checked AFTER admission, so an unauthorised caller learns nothing about
     // which admin routes exist.
     if (url.pathname === "/admin/api") {
+      // Only GET. OPTIONS lands here too, because the admin envelope is entered before the global
+      // CORS preflight: a preflight answering 204 with CORS headers would advertise a cross-origin
+      // surface the route does not have, and would bypass admission entirely.
       if (request.method !== "GET") {
         return new Response(JSON.stringify({ error: { message: "Method not allowed", type: "cosy_redact_gateway_error" } }), { status: 405, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", allow: "GET" } });
       }
       return adminApiResponse(env);
     }
     return adminAck();
+  }
+  if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
+  if (url.pathname === "/" || url.pathname === "/healthz") {
+    return new Response(JSON.stringify({ok:true,service:"cosy-redact-gateway",route:"/<flags>$<upstream-url>",flags:ALL_FLAG_LETTERS,defaultAll:true}),{headers:withCors({"content-type":"application/json; charset=utf-8"},corsOrigin)});
   }
   let target;
   try { target=parseProxyTarget(request.url); } catch(e) { return jsonError(400,e.message); }
