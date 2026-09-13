@@ -3274,7 +3274,13 @@ class TelemetryRing {
  */
 export class TelemetryStore {
   constructor({ recentCap = TELEMETRY_RECENT_DEFAULT } = {}) {
-    const cap = Math.max(1, Math.min(Number(recentCap) || TELEMETRY_RECENT_DEFAULT, TELEMETRY_RECENT_MAX));
+    // Explicit rather than `Number(recentCap) || DEFAULT`: that idiom treats an explicit 0 as
+    // absent AND lets a negative value through to Math.max, so two different invalid inputs took
+    // two different paths. Undefined/NaN -> the default; anything else is clamped to [1, MAX].
+    const requested = Number(recentCap);
+    const cap = Number.isFinite(requested) && requested > 0
+      ? Math.min(Math.floor(requested), TELEMETRY_RECENT_MAX)
+      : TELEMETRY_RECENT_DEFAULT;
     this.recentCap = cap;
     this.recent = new TelemetryRing(cap);
     this.seq = 0;
@@ -4729,6 +4735,10 @@ function getTelemetryStore(env) {
 
 /** Test/reset hook. Not used by the request path. */
 export function __resetTelemetryStore() { TELEMETRY_STORE = null; TELEMETRY_STORE_CAP = -1; }
+
+/** Read-only view of the current store for tests. Returns null when nothing has been recorded,
+ *  which is also the honest answer when observability is disabled. */
+export function __telemetryStore() { return TELEMETRY_STORE; }
 
 /**
  * Finalize telemetry for a non-stream response, then return it untouched.

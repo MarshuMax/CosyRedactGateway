@@ -31,3 +31,9 @@ The salt is generated once when a Worker/Deno isolate starts. Multiple concurren
    CPU.
 9. Note the asymmetry: the request body has a byte cap, the response body does not. Size
    memory accordingly, and treat the upstream as trusted for response size.
+
+10. Observability is **off by default** and records metadata only -- never plaintext, tokens,
+    bodies, URL paths or `ruleId`. If you enable it, treat the log stream as operational
+    metadata rather than as content, and note that counters are per-process (Node) or
+    per-isolate (Cloudflare) and reset on restart or isolate replacement. See
+    `docs/OBSERVABILITY.md`.

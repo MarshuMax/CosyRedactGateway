@@ -231,6 +231,8 @@ curl -N \
 | `REDACT_MAX_REDACTIONS` | 16384 | maximum number of unique plaintext identities minted in one request; bounds request-local mapping and output allocation, NOT detector candidate count or pre-mint CPU work |
 | `REDACT_MAX_JSON_DEPTH` | 512 | structural JSON nesting depth, applied at three boundaries: request body (413 before any forward), non-stream response (502), and SSE event (stream error, offending event withheld). One limit rather than one per walker |
 | `REDACT_REFERENCE_WORK_FACTOR` | 64 | deterministic work budget for the reference scanner, as a multiple of document length. Exceeding it refuses the request (413) rather than degrading the redaction |
+| `REDACT_OBSERVABILITY` | unset | metadata-only telemetry, **off unless exactly `1`**. No plaintext, no tokens, no bodies ever recorded. See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
+| `REDACT_OBSERVABILITY_BUFFER` | 500 | recent-request ring capacity; hard maximum 2000 |
 | `REDACT_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `HOST` | `127.0.0.1` | Node local adapter only |
 | `PORT` | `8787` | Node local adapter only |
