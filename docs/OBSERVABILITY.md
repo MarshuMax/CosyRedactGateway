@@ -264,3 +264,27 @@ cross-origin browser callers.
 
 No token is generated and none is printed. `REDACT_ADMIN_TOKEN` is read from the environment or the
 route stays hidden.
+
+## PR2.2 -- read-only JSON at /admin/api
+
+`GET /admin/api` returns the telemetry store as JSON. It is read-only by construction: GET only, no
+parameters, and no mutation endpoint of any kind -- no clear, no reset, no delete, no config, and no
+filtering or selector arguments.
+
+**Authentication runs before the store is read.** `adminAdmission()` executes first, so an
+unauthorised caller cannot even cause the summary to be computed, and an unauthorised response
+contains nothing that reveals the shape of the data. Method and path are also checked after
+admission, so a caller who is not authorised learns nothing about which admin routes exist.
+
+**The payload is the store's own output** -- `summary()` plus the already-sanitized
+`recent.toArray()`. Nothing is recalculated here and no schema is duplicated. The sanitizing happens
+in `TelemetryStore.sanitize()`, so this route cannot widen what telemetry records, and a field added
+to the store appears here automatically instead of drifting from a second definition.
+
+An empty store is a legitimate state, not an error: it returns a zero summary with an empty `recent`
+array. A fresh process and a process that has served nothing both look like this.
+
+`/admin/api` is a routing request inside the admin envelope, so it records **no proxy telemetry of
+its own** -- reading the dashboard must not change the dashboard. This is asserted, not assumed.
+
+Responses carry `cache-control: no-store` and no CORS headers.

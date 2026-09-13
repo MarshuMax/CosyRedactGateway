@@ -5097,6 +5097,37 @@ function adminAck() {
   });
 }
 
+
+/**
+ * PR2.2 -- read-only JSON view of the telemetry store.
+ *
+ * AUTHENTICATION FIRST, then read. `adminAdmission()` runs before the store is touched at all, so an
+ * unauthorised caller cannot even cause the summary to be computed.
+ *
+ * The payload is the STORE'S OWN output: `summary()` and the already-sanitized `recent.toArray()`.
+ * Nothing is recalculated and no schema is duplicated here -- the sanitizing happens in
+ * TelemetryStore.sanitize(), so this route cannot widen what telemetry records, and a field added to
+ * the store appears here automatically rather than drifting.
+ *
+ * Read-only by construction: GET only, no parameters, and no mutation endpoint of any kind.
+ */
+function adminApiResponse(env) {
+  const store = getTelemetryStore(env);
+  // An empty store is a legitimate state (nothing recorded yet, or a fresh process), not an error.
+  const body = store
+    ? { ...store.summary(), recent: store.recent.toArray() }
+    : { schema_version: TELEMETRY_SCHEMA_VERSION, scope: "process/isolate-local; resets on restart or isolate replacement", empty: true, counters: { requests_total: 0, requests_redacted: 0, requests_clean: 0, spans_redacted_total: 0, bytes_redacted_total: 0 }, recent: [] };
+  return new Response(JSON.stringify(body, null, 2), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      // Operational metadata must not be cached by anything in between.
+      "cache-control": "no-store",
+      // Deliberately NO CORS headers: this route is not for cross-origin browser callers.
+    },
+  });
+}
+
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
@@ -5104,13 +5135,19 @@ export async function handleRequest(request, env = {}, options = {}) {
   if (url.pathname === "/" || url.pathname === "/healthz") {
     return new Response(JSON.stringify({ok:true,service:"cosy-redact-gateway",route:"/<flags>$<upstream-url>",flags:ALL_FLAG_LETTERS,defaultAll:true}),{headers:withCors({"content-type":"application/json; charset=utf-8"},corsOrigin)});
   }
-  if (url.pathname === "/admin") {
+  if (url.pathname === "/admin" || url.pathname === "/admin/api") {
     const admission = await adminAdmission(request, env, options);
     if (!admission.allowed) {
-      // 404 hides the route; 401 reports a credential failure without echoing the token or
-      // revealing whether it was close.
       if (admission.status === 401) return new Response(JSON.stringify({ error: { message: "Unauthorized", type: "cosy_redact_gateway_error" } }), { status: 401, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
       return jsonError(404, "Not found");
+    }
+    // Method and path are checked AFTER admission, so an unauthorised caller learns nothing about
+    // which admin routes exist.
+    if (url.pathname === "/admin/api") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ error: { message: "Method not allowed", type: "cosy_redact_gateway_error" } }), { status: 405, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", allow: "GET" } });
+      }
+      return adminApiResponse(env);
     }
     return adminAck();
   }

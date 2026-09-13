@@ -104,3 +104,63 @@ test("PR2.1 adapter: the proxy path still works end to end through the real serv
     assert.equal(health.status, 200, "and the server is still healthy afterwards");
   });
 });
+
+// =====================================================================================
+// PR2.2 -- the read-only API through the real server
+// =====================================================================================
+
+test("PR2.2 adapter: a real proxy request produces telemetry that the real /admin/api serves [GREEN NOW]", async () => {
+  const SECRET = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
+  const EMAIL = "pr22-e2e@example.com";
+  // A real upstream standing in for a provider, so the request completes normally.
+  const http = await import("node:http");
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }));
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  const upstreamPort = upstream.address().port;
+
+  try {
+    await withServer({ HOST: "127.0.0.1", REDACT_OBSERVABILITY: "1" }, async (base) => {
+      // 1. Drive a REAL request through the real server so the store holds something.
+      const proxied = await fetch(`${base}/H$http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "g", messages: [{ role: "user", content: `PW=${SECRET} mail ${EMAIL}` }] }),
+      });
+      assert.equal(proxied.status, 200, "the proxy request must complete");
+      const proxiedBody = await proxied.text();
+      assert.equal(proxiedBody.includes(SECRET), false, "and the secret must not come back to the client");
+
+      // 2. Read it back through the real /admin/api.
+      const api = await fetch(`${base}/admin/api`);
+      assert.equal(api.status, 200, "loopback bind, observability on");
+      assert.equal(api.headers.get("cache-control"), "no-store");
+      const data = await api.json();
+      assert.ok(data.counters.requests_total >= 1, `expected the request to be counted; got ${JSON.stringify(data.counters)}`);
+      assert.ok(data.counters.requests_redacted >= 1, "and counted as redacted");
+      assert.ok(data.recent.length >= 1, "the record is there");
+      assert.equal(data.recent[0].outcome, "forwarded");
+
+      // 3. The API body must not leak the sentinel that travelled through that request.
+      const raw = JSON.stringify(data);
+      for (const forbidden of [SECRET, EMAIL, "CRG_"]) {
+        assert.equal(raw.includes(forbidden), false, `/admin/api must not contain ${forbidden}`);
+      }
+    });
+  } finally {
+    upstream.close();
+  }
+});
+
+test("PR2.2 adapter: /admin/api needs the same admission as /admin on a public bind [GREEN NOW]", async () => {
+  await withServer({ HOST: "0.0.0.0", REDACT_OBSERVABILITY: "1", REDACT_ADMIN_TOKEN: "api-token" }, async (base) => {
+    assert.equal((await fetch(`${base}/admin/api`)).status, 401, "no credential");
+    assert.equal((await fetch(`${base}/admin/api?token=api-token`)).status, 401, "query credential is not accepted");
+    const ok = await fetch(`${base}/admin/api`, { headers: { authorization: "Bearer api-token" } });
+    assert.equal(ok.status, 200);
+    const data = await ok.json();
+    assert.ok(Array.isArray(data.recent), "and it serves JSON");
+  });
+});
