@@ -771,3 +771,97 @@ test("observability: onDepthLimit is optional [GREEN NOW]", async () => {
   const out = await new Response(guarded).text();
   assert.match(out, /gateway_depth_limit/, "calling without a callback must still refuse");
 });
+
+// =====================================================================================
+// item 8 -- the remaining admitted-request terminal paths
+// =====================================================================================
+
+test("observability: an admitted non-JSON request is rejected_content_type, with no invented limit [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  let fetches = 0;
+  const res = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1" }),
+    body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "x" }] }),
+    fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
+  });
+  await res.text();
+  // Re-run with a non-JSON content type, which is what triggers 415.
+  __resetTelemetryStore();
+  const enc = new TextEncoder();
+  const raw = await handleRequest(
+    new Request("https://proxy.example/H$https://api.example/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "text/plain" }, body: "not json",
+    }),
+    ENV({ REDACT_OBSERVABILITY: "1" }),
+    { salt: "obs", fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); } }
+  );
+  await raw.text();
+  void enc;
+  const store = __telemetryStore();
+  const rec = store.recent.toArray()[0];
+  assert.equal(raw.status, 415);
+  assert.equal(rec.outcome, "rejected_content_type");
+  assert.equal(rec.limit_reason, null, "415 is a content-type refusal, not a resource limit");
+  assert.equal(rec.status, 415);
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0);
+  assert.equal(store.recent.length, 1);
+});
+
+test("observability: an admitted invalid-JSON body is rejected_json [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  const res = await call({ env: ENV({ REDACT_OBSERVABILITY: "1" }), body: "{not json" });
+  await res.text();
+  assert.equal(res.status, 400);
+  const store = __telemetryStore();
+  const rec = store.recent.toArray()[0];
+  assert.equal(rec.outcome, "rejected_json");
+  assert.equal(rec.limit_reason, null, "malformed JSON is not a resource limit");
+  assert.equal(rec.status, 400);
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0);
+  assert.equal(store.recent.length, 1);
+});
+
+test("observability: an over-deep UPSTREAM RESPONSE is upstream_depth, and a native 502 is not [GREEN NOW]", async () => {
+  // The control pair, and the reason the outcome is reported by the code that knows rather than
+  // inferred from `status === 502`. Both cases produce a 502 to the client.
+  const deepPayload = () => { let n = "leaf"; for (let i = 0; i < 700; i++) n = { c: n }; return n; };
+
+  // 3. upstream 200, genuinely over-deep JSON, real path: upstream Response -> JSON.parse ->
+  //    exceedsJsonDepth -> gateway 502.
+  __resetTelemetryStore();
+  let fetches = 0;
+  const deep = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1" }),
+    fetchImpl: async () => {
+      fetches++;
+      return new Response(JSON.stringify({ ok: true, nested: deepPayload() }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  await deep.text();
+  assert.equal(deep.status, 502, "the gateway generates the 502");
+  assert.equal(fetches, 1, "the upstream WAS called, so this is not a request-stage refusal");
+  let store = __telemetryStore();
+  let rec = store.recent.toArray()[0];
+  assert.equal(rec.outcome, "upstream_depth");
+  assert.equal(rec.limit_reason, "upstream_depth");
+  assert.equal(rec.status, 502);
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0);
+  assert.equal(store.recent.length, 1);
+
+  // 4. upstream natively returns a shallow 502: a SUCCESSFUL forward of an upstream error.
+  __resetTelemetryStore();
+  fetches = 0;
+  const native = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1" }),
+    fetchImpl: async () => { fetches++; return new Response('{"error":"upstream is down"}', { status: 502, headers: { "content-type": "application/json" } }); },
+  });
+  await native.text();
+  assert.equal(native.status, 502);
+  assert.equal(fetches, 1);
+  store = __telemetryStore();
+  rec = store.recent.toArray()[0];
+  assert.equal(rec.outcome, "forwarded", "a native upstream 502 is a forward, not a gateway depth refusal");
+  assert.equal(rec.limit_reason, null);
+  assert.equal(rec.status, 502);
+  assert.equal(store.recent.length, 1);
+});

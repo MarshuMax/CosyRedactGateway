@@ -4739,7 +4739,13 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null, tel
   });
 }
 
-async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trusted = null, registry = null, maxDepth = MAX_JSON_DEPTH) {
+/**
+ * `onDepthLimit` is a metadata-only callback: it reports THAT the structural depth limit fired, and
+ * carries no body, no text and no raw JSON. It exists so this function does not need to know about
+ * telemetry, and -- more importantly -- so the 502 caused by depth is not inferred later from the
+ * status code, which would have mislabelled a genuine upstream 502.
+ */
+async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trusted = null, registry = null, maxDepth = MAX_JSON_DEPTH, onDepthLimit = null) {
   const headers=withCors(upstreamResponse.headers,corsOrigin); headers.delete("content-encoding");
   if (!upstreamResponse.body || upstreamResponse.status===204 || upstreamResponse.status===304) return new Response(null,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
   const ct=headers.get("content-type") || "";
@@ -4765,6 +4771,8 @@ async function restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trust
       return new Response(out,{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers});
     }
     if (exceedsJsonDepth(data, maxDepth)) {
+      // Fire BEFORE returning, so the terminal metadata is set by the code that actually knows why.
+      try { if (typeof onDepthLimit === "function") onDepthLimit(); } catch { /* never break fail-closed */ }
       return jsonError(502, `Upstream response exceeds structural depth limit (${maxDepth})`);
     }
     // Not wrapped: a policy failure must propagate rather than quietly become inert text.
@@ -4895,7 +4903,7 @@ export function __telemetryStore() { return TELEMETRY_STORE; }
  * constructed. SSE uses a different pair of fields because its lifecycle is different -- one
  * number meaning two things would make the two incomparable.
  */
-async function finalizeNonStream(responsePromise, ctx, telemetry) {
+async function finalizeNonStream(responsePromise, ctx, telemetry, terminal = null) {
   const response = await responsePromise;
   // `response.status` undefined and pushed a Promise object into the telemetry store -- both a
   // wrong status and a retained reference to live request state.
@@ -4913,7 +4921,11 @@ async function finalizeNonStream(responsePromise, ctx, telemetry) {
     // KNOWN TRANSIENT, owned by item 8 and deliberately not fixed here: a gateway-GENERATED
     // response-depth 502 also reaches this line, so it currently records `forwarded` too. Item 8
     // gives it `upstream_depth`. Stating the boundary keeps each commit's proof scope exact.
-    telemetry.setOutcome("forwarded");
+    // The outcome comes from what actually happened, never from the status code. Inferring
+    // `status === 502 -> upstream_depth` here would mislabel a GENUINE upstream 502, which is a
+    // successful forward of an upstream error response.
+    telemetry.setOutcome(terminal?.outcome ?? "forwarded");
+    if (terminal?.limit) telemetry.setLimit(terminal.limit);
     // No second onSpanProjection()/onCoverage() here: the request-stage snapshot already ran, and
     // taking the same data at two lifecycle points would let them disagree without either being
     // obviously wrong.
@@ -5011,10 +5023,30 @@ export async function handleRequest(request, env = {}, options = {}) {
       return response;
     }
     const ct=request.headers.get("content-type") || "";
-    if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
+    if (bytes.byteLength && !isJsonContentType(ct)) {
+      // No limit_reason: this is a content-type refusal, not a resource limit. Inventing one would
+      // make the dashboard report a limit that was never reached.
+      const response = jsonError(415, "For safety, request bodies must be JSON so they can be redacted before forwarding");
+      if (telemetry) {
+        telemetry.setOutcome("rejected_content_type");
+        telemetry.setStatus(response.status);
+        telemetry.markResponseReady();
+        telemetry.finalizeExactlyOnce();
+      }
+      return response;
+    }
     if (bytes.byteLength) {
       let data;
-      try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
+      try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch {
+        const response = jsonError(400, "Invalid JSON request body");
+        if (telemetry) {
+          telemetry.setOutcome("rejected_json");
+          telemetry.setStatus(response.status);
+          telemetry.markResponseReady();
+          telemetry.finalizeExactlyOnce();
+        }
+        return response;
+      }
       // A payload resource limit, checked before redactJson walks the structure. Refused as 413
       // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
       if (exceedsJsonDepth(data, maxDepth)) {
@@ -5144,7 +5176,15 @@ export async function handleRequest(request, env = {}, options = {}) {
     }
     return downstream;
   }
-  return finalizeNonStream(restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth), ctx, telemetry);
+  // Request-local terminal metadata. `restoreNonStreamResponse` reports the depth refusal through a
+  // callback and stays unaware of telemetry; this object is the only channel between them.
+  const responseTerminal = { outcome: null, limit: null };
+  return finalizeNonStream(
+    restoreNonStreamResponse(upstreamResponse, ctx, corsOrigin, trustedSinks, foreignRegistry, maxDepth, () => {
+      responseTerminal.outcome = "upstream_depth";
+      responseTerminal.limit = "upstream_depth";
+    }),
+    ctx, telemetry, responseTerminal);
 }
 
 export default { fetch(request, env, ctx) { return handleRequest(request,env); } };

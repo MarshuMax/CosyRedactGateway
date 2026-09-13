@@ -41,10 +41,30 @@ The record has a **closed schema**:
 | `sink_modes` | `{restore, preserve, block}` -- the **policy** |
 | `sink_outcomes` | `{restored, preserved, blocked}` -- what was actually **delivered** |
 | `coverage` | Per-parser `{attempted, parsed, partial, failed, bytes}` |
-| `limit_reason` | `body_bytes` / `json_depth` / `reference_work` / `redaction_limit`, else `null` |
+| `limit_reason` | `body_bytes` / `json_depth` / `reference_work` / `redaction_limit` / `upstream_depth`, else `null`. A refusal that is not a resource limit (415, malformed JSON 400) records `null` rather than inventing one. |
 
-`outcome` is one of: `forwarded`, `rejected_body`, `rejected_depth`,
-`rejected_redaction`, `rejected_work`, `upstream_error`, `stream_error`, `client_cancel`.
+`outcome` is one of:
+
+| outcome | meaning |
+|---|---|
+| `forwarded` | an upstream HTTP response was relayed, whatever its status -- including 4xx and 5xx |
+| `rejected_content_type` | 415; a non-JSON request body |
+| `rejected_json` | 400; an unparseable request body |
+| `rejected_body` | 413; the request byte cap |
+| `rejected_depth` | 413; request JSON nesting |
+| `rejected_redaction` | 413; the unique-entity cap |
+| `rejected_work` | 413; the reference-scan work budget |
+| `upstream_error` | the upstream fetch THREW; the gateway generated the 502 |
+| `upstream_depth` | 502; the upstream RESPONSE nested too deeply |
+| `stream_error` | an SSE terminal error, including the depth guard |
+| `client_cancel` | the client cancelled the SSE stream |
+
+`forwarded` versus `upstream_error` and `upstream_depth` is the distinction to keep straight: the
+gateway reports what IT did. A provider returning 429 or 500 is `forwarded`; only a transport
+failure or a gateway-generated refusal is an error outcome. In particular a native upstream 502 is
+`forwarded`, while a gateway-generated response-depth 502 is `upstream_depth` -- both reach the
+client as 502, so the status alone cannot tell them apart, which is why the outcome is reported by
+the code that knows rather than inferred from the status code.
 
 ## What is never recorded
 
