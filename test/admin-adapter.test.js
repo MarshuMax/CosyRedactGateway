@@ -49,8 +49,12 @@ test("PR2.1 adapter: a real node-server bound to 127.0.0.1 serves /admin without
   await withServer({ HOST: "127.0.0.1", REDACT_OBSERVABILITY: "1" }, async (base) => {
     const res = await fetch(`${base}/admin`);
     assert.equal(res.status, 200, "the REAL adapter must supply loopback metadata; a fabricated object proves nothing");
-    assert.equal(await res.text(), "admin endpoint available\n");
     assert.equal(res.headers.get("cache-control"), "no-store");
+    // PR2.3 changed /admin from a plaintext acknowledgement to the dashboard. The property this test
+    // was written for is unchanged -- the REAL adapter supplies the loopback metadata -- so only the
+    // body assertion is updated, not the point of the test.
+    assert.match(res.headers.get("content-type") || "", /^text\/html/);
+    assert.match(await res.text(), /^<!doctype html>/i);
   });
 });
 
@@ -163,4 +167,70 @@ test("PR2.2 adapter: /admin/api needs the same admission as /admin on a public b
     const data = await ok.json();
     assert.ok(Array.isArray(data.recent), "and it serves JSON");
   });
+});
+
+// =====================================================================================
+// PR2.3 -- the dashboard through a real server, browser-like
+// =====================================================================================
+
+test("PR2.3 adapter: loopback /admin serves a self-contained page, and /admin/api has real telemetry [GREEN NOW]", async () => {
+  const SECRET = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
+  const EMAIL = "pr23-e2e@example.com";
+  const http = await import("node:http");
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }));
+  });
+  await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+  const upstreamPort = upstream.address().port;
+
+  try {
+    await withServer({ HOST: "127.0.0.1", REDACT_OBSERVABILITY: "1" }, async (base) => {
+      // A real proxying request, so the dashboard has something to show.
+      const proxied = await fetch(`${base}/H$http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "g", messages: [{ role: "user", content: `PW=${SECRET} mail ${EMAIL}` }] }),
+      });
+      assert.equal(proxied.status, 200);
+      await proxied.text();
+
+      // What a browser would do first: GET the page.
+      const page = await fetch(`${base}/admin`);
+      assert.equal(page.status, 200, "loopback bind serves the dashboard without a token");
+      assert.match(page.headers.get("content-type") || "", /^text\/html/);
+      assert.equal(page.headers.get("cache-control"), "no-store");
+      const html = await page.text();
+      for (const pat of [/https?:\/\//i, /<link\b/i, /<img\b/i, /@import/i, /url\(/i, /<script[^>]+src=/i]) {
+        assert.equal(pat.test(html), false, `no external subresource: ${pat}`);
+      }
+
+      // Then what the page's own script does: GET the API.
+      const api = await fetch(`${base}/admin/api`, { headers: { accept: "application/json" } });
+      assert.equal(api.status, 200);
+      const data = await api.json();
+      assert.ok(data.counters.requests_total >= 1, `dashboard would show real data; got ${JSON.stringify(data.counters)}`);
+      assert.ok(data.counters.requests_redacted >= 1);
+      assert.ok(Array.isArray(data.recent) && data.recent.length >= 1);
+      assert.equal(data.recent[0].outcome, "forwarded");
+      // The upstream hostname is legitimately part of the record; it reaches the page at RUNTIME,
+      // never baked into the served markup.
+      assert.equal(data.recent[0].upstream, "127.0.0.1");
+      assert.equal(html.includes("127.0.0.1"), false, "the page is a static shell; values arrive from the API");
+
+      // No sentinel anywhere in either artefact.
+      const both = html + JSON.stringify(data);
+      for (const forbidden of [SECRET, EMAIL, "CRG_"]) {
+        assert.equal(both.includes(forbidden), false, `leaked ${forbidden}`);
+      }
+
+      // Reading the dashboard must not change the counters it displays.
+      const before = (await (await fetch(`${base}/admin/api`)).json()).counters.requests_total;
+      for (let i = 0; i < 4; i++) { await (await fetch(`${base}/admin`)).text(); await (await fetch(`${base}/admin/api`)).json(); }
+      const after = (await (await fetch(`${base}/admin/api`)).json()).counters.requests_total;
+      assert.equal(after, before, "dashboard polling must not enter proxy telemetry");
+    });
+  } finally {
+    upstream.close();
+  }
 });

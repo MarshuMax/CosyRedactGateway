@@ -5093,14 +5093,168 @@ function adminError(status, message) {
 }
 
 /** Minimal, metadata-free acknowledgement. No summary, no ring, no HTML. */
-function adminAck() {
-  return new Response("admin endpoint available\n", {
+/**
+ * PR2.3 -- the /admin dashboard: ONE self-contained HTML file.
+ *
+ * No npm front-end dependency, no CDN, no external JS/CSS, no fonts and no images. Everything is
+ * inline so the page has no network dependency beyond /admin/api itself, and so there is no supply
+ * chain to reason about for an admin surface.
+ *
+ * SAFETY: the static template below is written out literally, and every DYNAMIC value is inserted
+ * with `textContent` or `createElement`+`textContent`. No telemetry value is ever concatenated into
+ * markup, so an upstream hostname, an enum, or any record field cannot become script.
+ *
+ * The page reads ONLY /admin/api. It does not recompute the summary and does not introduce a second
+ * telemetry endpoint.
+ */
+const ADMIN_DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CosyRedactGateway admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+  h2 { font-size: .95rem; margin: 1.25rem 0 .35rem; border-bottom: 1px solid currentColor; padding-bottom: .2rem; }
+  .muted { opacity: .65; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .15rem .6rem .15rem 0; vertical-align: top; }
+  th { font-weight: 600; }
+  td.num { text-align: right; padding-right: 1.2rem; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: .1rem 1rem; }
+  #err { color: #b00; min-height: 1.2em; }
+  #status { opacity: .65; }
+</style>
+</head>
+<body>
+<h1>CosyRedactGateway admin</h1>
+<div class="muted">metadata only &mdash; no plaintext, tokens, bodies or routing detail are recorded</div>
+<div id="status"></div>
+<div id="err"></div>
+<div id="root"></div>
+<script>
+(function () {
+  "use strict";
+  var REFRESH_MS = 5000;
+  var RECENT_MAX = 100;
+
+  // All rendering goes through these helpers. There is no innerHTML anywhere in this file, so a
+  // telemetry value cannot be interpreted as markup.
+  function el(tag, text, cls) {
+    var n = document.createElement(tag);
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    if (cls) n.className = cls;
+    return n;
+  }
+  function kv(parent, label, value) {
+    parent.appendChild(el("div", label, "muted"));
+    parent.appendChild(el("div", value === undefined || value === null ? "-" : String(value)));
+  }
+  function section(title, value) {
+    var d = el("div");
+    d.appendChild(el("h2", title));
+    var box = el("div", undefined, "kv");
+    for (var k in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, k)) continue;
+      var v = value[k];
+      kv(box, k, (v && typeof v === "object") ? JSON.stringify(v) : v);
+    }
+    d.appendChild(box);
+    return d;
+  }
+  function table(title, columns, rows) {
+    var d = el("div");
+    d.appendChild(el("h2", title + " (" + rows.length + ")"));
+    if (!rows.length) { d.appendChild(el("div", "none", "muted")); return d; }
+    var t = el("table");
+    var thead = el("thead"), tr = el("tr");
+    columns.forEach(function (c) { tr.appendChild(el("th", c)); });
+    thead.appendChild(tr); t.appendChild(thead);
+    var tb = el("tbody");
+    rows.forEach(function (row) {
+      var r = el("tr");
+      row.forEach(function (cell, idx) {
+        r.appendChild(el("td", cell === undefined || cell === null ? "-" : cell, idx === 0 ? "" : "num"));
+      });
+      tb.appendChild(r);
+    });
+    t.appendChild(tb); d.appendChild(t);
+    return d;
+  }
+
+  function render(data) {
+    var root = document.getElementById("root");
+    root.textContent = "";
+    root.appendChild(section("scope", {
+      schema_version: data.schema_version,
+      scope: data.scope,
+    }));
+    root.appendChild(section("counters", data.counters || {}));
+    root.appendChild(section("latency", data.latency || {}));
+    root.appendChild(section("retention", data.retention || {}));
+    root.appendChild(table("by status", ["status", "count"], Object.keys(data.by_status || {}).map(function (k) { return [k, data.by_status[k]]; })));
+    root.appendChild(table("by outcome", ["outcome", "count"], Object.keys(data.by_outcome || {}).map(function (k) { return [k, data.by_outcome[k]]; })));
+    root.appendChild(table("by limit", ["limit", "count"], Object.keys(data.by_limit || {}).map(function (k) { return [k, data.by_limit[k]]; })));
+    root.appendChild(table("by detector", ["detector", "count"], Object.keys(data.by_detector || {}).map(function (k) { return [k, data.by_detector[k]]; })));
+    root.appendChild(table("by reason", ["reason", "count"], Object.keys(data.by_reason || {}).map(function (k) { return [k, data.by_reason[k]]; })));
+    root.appendChild(table("by infra type", ["infra type", "count"], Object.keys(data.by_infra_type || {}).map(function (k) { return [k, data.by_infra_type[k]]; })));
+    root.appendChild(table("by sink mode", ["mode", "count"], Object.keys(data.by_sink_mode || {}).map(function (k) { return [k, data.by_sink_mode[k]]; })));
+    root.appendChild(table("by sink outcome", ["outcome", "count"], Object.keys(data.by_sink_outcome || {}).map(function (k) { return [k, data.by_sink_outcome[k]]; })));
+    root.appendChild(table("by coverage parser", ["parser", "count"], Object.keys(data.by_coverage_parser || {}).map(function (k) { return [k, data.by_coverage_parser[k]]; })));
+
+    var recent = (data.recent || []).slice(0, RECENT_MAX);
+    root.appendChild(table("recent (newest first, max " + RECENT_MAX + ")", ["seq", "outcome", "status", "upstream", "redacted", "ready ms", "stream ms"],
+      recent.map(function (r) {
+        return [r.seq, r.outcome, r.status, r.upstream,
+                (r.spans && r.spans.redact) || 0, r.response_ready_ms, r.stream_duration_ms];
+      })));
+  }
+
+  function setStatus(text) {
+    document.getElementById("status").textContent = text;
+  }
+  // Failures show a FIXED status only. A raw error message is never written into the page, so a
+  // transport or parse failure cannot become an injection surface.
+  function setError(text) { document.getElementById("err").textContent = text; }
+
+  function tick() {
+    fetch("/admin/api", { headers: { "accept": "application/json" }, credentials: "omit" })
+      .then(function (res) {
+        if (!res.ok) { setError("admin api unavailable (status " + res.status + ")"); return null; }
+        return res.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+        setError("");
+        render(data);
+        setStatus("updated " + new Date().toLocaleTimeString());
+      })
+      .catch(function () { setError("admin api unavailable (network)"); });
+  }
+  tick();
+  setInterval(tick, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
+`;
+
+function adminDashboard() {
+  return new Response(ADMIN_DASHBOARD_HTML, {
     status: 200,
     headers: {
-      "content-type": "text/plain; charset=utf-8",
-      // An admin surface must not be cached by anything in between.
+      "content-type": "text/html; charset=utf-8",
+      // Operational metadata must not be cached by anything in between.
       "cache-control": "no-store",
-      // Deliberately NO CORS headers: this route is not for browser cross-origin callers.
+      // Lightweight hardening for an admin page. The CSP has no 'unsafe-inline' for scripts, so the
+      // inline block below is admitted by hash rather than by blanket permission; there are no
+      // external sources of any kind, hence default-src 'none'.
+      "content-security-policy": "default-src 'none'; script-src 'sha256-aER7CYjxY1AUwp6A8QI9oNnWaa7zc9y8L27wCbNbU7g='; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      // Deliberately NO CORS headers: this route is not for cross-origin browser callers.
     },
   });
 }
@@ -5149,8 +5303,11 @@ export async function handleRequest(request, env = {}, options = {}) {
       if (admission.status === 401) return adminError(401, "Unauthorized");
       return adminError(404, "Not found");
     }
-    // Method and path are checked AFTER admission, so an unauthorised caller learns nothing about
-    // which admin routes exist.
+    // Admission has already run. The METHOD is checked here, after it -- an unauthorised caller
+    // therefore learns nothing about method support. The PATHNAME, however, was matched exactly
+    // BEFORE admission: with a token configured, `/admin` and `/admin/api` answer 401 while an
+    // unknown path answers 404, so a 401 does confirm an admin route at that path. Corrected from an
+    // earlier comment that claimed more than the routing does.
     if (url.pathname === "/admin/api") {
       // Only GET. OPTIONS lands here too, because the admin envelope is entered before the global
       // CORS preflight: a preflight answering 204 with CORS headers would advertise a cross-origin
@@ -5160,7 +5317,12 @@ export async function handleRequest(request, env = {}, options = {}) {
       }
       return adminApiResponse(env);
     }
-    return adminAck();
+    // GET-only, same rule as the API and for the same reason: the admin envelope is entered before
+    // the global CORS preflight, so OPTIONS arrives here too and must not be answered with 204+CORS.
+    if (request.method !== "GET") {
+      return new Response(JSON.stringify({ error: { message: "Method not allowed", type: "cosy_redact_gateway_error" } }), { status: 405, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", allow: "GET" } });
+    }
+    return adminDashboard();
   }
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
   if (url.pathname === "/" || url.pathname === "/healthz") {

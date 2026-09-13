@@ -294,3 +294,49 @@ array. A fresh process and a process that has served nothing both look like this
 its own** -- reading the dashboard must not change the dashboard. This is asserted, not assumed.
 
 Responses carry `cache-control: no-store` and no CORS headers.
+
+## PR2.3 -- the /admin dashboard
+
+`GET /admin` serves ONE self-contained HTML document. No npm front-end dependency, no CDN, no
+external JS or CSS, no fonts and no images: everything is inline, so the page has no network
+dependency beyond `/admin/api` itself and no supply chain to reason about for an admin surface.
+
+Non-GET is refused with **405 + `allow: GET` + no-store + no CORS**, checked *after* admission, so an
+unauthorised caller learns nothing about method support.
+
+### What it reads
+
+Only the existing `GET /admin/api`. There is no second telemetry endpoint, and the page does not
+recompute the summary. It displays scope and schema version, counters, latency and retention, the
+status / outcome / limit / detector / reason / infra-type / sink-mode / sink-outcome / coverage
+breakdowns, and the newest 100 records.
+
+The API still returns its **complete bounded ring**; the 100-record cap is a client-side display limit
+and **no `?limit=` parameter was added**.
+
+### Safety properties
+
+Every dynamic value reaches the DOM through `textContent` or `createElement` + `textContent`. There is
+no `innerHTML`, `outerHTML`, `insertAdjacentHTML` or `document.write` in the served code, so an
+upstream hostname, an enum or any record field cannot be interpreted as markup. The static template is
+written literally; only values are dynamic.
+
+The page's polling failures show a **fixed, enumerated status** -- "admin api unavailable (status N)"
+or "(network)". A raw error message is never written into the page.
+
+A `Content-Security-Policy` of `default-src 'none'` pins the inline script **by SHA-256 hash**, with
+`connect-src 'self'` for the API call. A stale hash would silently break the page in a browser, so a
+regression recomputes the hash from the served script and compares it with the header.
+
+Responses carry `cache-control: no-store`, `x-content-type-options: nosniff`, `referrer-policy:
+no-referrer`, and no CORS headers.
+
+### Browser access on a public deployment
+
+The page is protected by the same admission as the API: **Bearer-only**. A normal browser address bar
+cannot attach a custom `Authorization` header, so **the dashboard is not usable from a browser against
+a public bind**. Node on loopback is the direct browser use case for this version.
+
+PR2.3 deliberately does **not** work around this. No query parameter, no cookie, no `localStorage`
+credential and no relaxed scheme is offered, because each of those would trade the property that makes
+the boundary meaningful -- that a credential only ever travels in a header the address bar cannot set.
