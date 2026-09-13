@@ -3,8 +3,9 @@
 Optional, **off by default**, metadata-only telemetry. It answers "did redaction actually
 happen, and what did the gateway decide?" without ever recording what it redacted.
 
-This is v2.1 PR1: the telemetry core and the structured log line. The `/admin` endpoint, its
-UI and its authentication are PR2 and do not exist yet.
+It covers the telemetry core and structured log line (PR1) and the admin surface built on top of
+them: the `/admin` security envelope, the read-only `/admin/api` JSON view and the self-contained
+`/admin` dashboard (PR2.1 through PR2.4).
 
 ## Enabling it
 
@@ -237,9 +238,15 @@ while authentication is still pending.
 ### The bind address comes from the adapter, never from the request
 
 `node-server.mjs` passes `{ runtime: { kind: "node", bindHost: host } }`, where `host` is the
-configured bind address. **Host, X-Forwarded-For, Forwarded, X-Real-IP and the request URL's own
-hostname are all attacker-controlled and are not consulted at all.** A public deployment must not be
-able to become "local" by sending a header.
+configured bind address, and it remains the **only positive authority**. `X-Forwarded-For`,
+`Forwarded`, `X-Real-IP` and the request URL's own hostname are attacker-controlled and are **not
+consulted for authorisation at all**.
+
+The `Host` header is a **rejection-only gate**: it can *cancel* the loopback exemption but can never
+create it. A request bound to loopback but addressed to a non-local name is treated as non-loopback,
+which closes the DNS-rebinding path described under PR2.4 below. A public deployment therefore cannot
+become "local" by sending a header, and a loopback deployment cannot be reached through an attacker's
+hostname.
 
 Only the two literal values `127.0.0.1` and `::1` count as loopback. `0.0.0.0`, `::`, `localhost` and
 any hostname are treated as **non-loopback and require a token** -- guessing what a bind address means

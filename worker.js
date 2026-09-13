@@ -5122,7 +5122,6 @@ function adminError(status, message) {
   });
 }
 
-/** Minimal, metadata-free acknowledgement. No summary, no ring, no HTML. */
 /**
  * PR2.3 -- the /admin dashboard: ONE self-contained HTML file.
  *
@@ -5160,7 +5159,7 @@ const ADMIN_DASHBOARD_HTML = `<!doctype html>
 </head>
 <body>
 <h1>CosyRedactGateway admin</h1>
-<div class="muted">metadata only &mdash; no plaintext, tokens, bodies or routing detail are recorded</div>
+<div class="muted">metadata only &mdash; no plaintext, tokens, bodies, URL paths or query strings are recorded. The upstream hostname is recorded, since it names the destination rather than the content.</div>
 <div id="status"></div>
 <div id="err"></div>
 <div id="root"></div>
