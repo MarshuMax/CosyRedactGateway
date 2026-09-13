@@ -476,3 +476,67 @@ test("observability: a 302 with redirect:manual is forwarded, not an error [GREE
   assert.equal(rec.status, 302);
   assert.equal(rec.outcome, "forwarded");
 });
+
+// =====================================================================================
+// item 4b -- limit classification comes from ONE decision, and both sides are reachable
+// =====================================================================================
+
+test("observability: a real reference-work refusal is rejected_work, not rejected_redaction [GREEN NOW]", async () => {
+  // NOT a hand-thrown exception. This drives the real path: a document with a genuine detector hit
+  // (so the Phase 3 empty-span fast path does not skip the scanner) plus a wall of unclosed `{{`,
+  // which is what actually exhausts the deterministic work budget.
+  __resetTelemetryStore();
+  let fetches = 0;
+  const payload = `cred=${SECRET}${NL}${"{{".repeat(20000)}`;
+  const res = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_BODY_BYTES: "1048576" }),
+    content: payload,
+    fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
+  });
+  const body = await res.text();
+  assert.equal(res.status, 413, "work budget refuses with 413");
+  assert.equal(fetches, 0, "and performs no upstream fetch");
+  assert.equal(body.includes(SECRET), false, "and forwards no plaintext in the refusal");
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "rejected_work");
+  assert.equal(rec.limit_reason, "reference_work");
+  assert.equal(rec.status, 413);
+});
+
+test("observability: a real redaction-count refusal is rejected_redaction [GREEN NOW]", async () => {
+  // The other side, also driven for real: several DISTINCT secrets with a tiny maxRedactions, so
+  // RedactionLimitError is raised by token minting rather than fabricated here.
+  __resetTelemetryStore();
+  let fetches = 0;
+  const distinct = Array.from({ length: 6 }, (_, i) => `k${i}=wJalrXUtnFEMI${String(i).padStart(8, "0")}`).join(NL);
+  const res = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_REDACTIONS: "1" }),
+    content: distinct,
+    fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
+  });
+  await res.text();
+  assert.equal(res.status, 413, "the entity cap refuses with 413");
+  assert.equal(fetches, 0, "and performs no upstream fetch");
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "rejected_redaction");
+  assert.equal(rec.limit_reason, "redaction_limit");
+  assert.equal(rec.status, 413);
+});
+
+test("observability: the two limit classes never report a contradictory pair [GREEN NOW]", async () => {
+  // The defect this closes: outcome and limit_reason were derived independently, so a work refusal
+  // reported limit_reason=reference_work next to outcome=rejected_redaction. Whatever the cause,
+  // the pair must agree.
+  const OK_PAIRS = new Set(["rejected_work/reference_work", "rejected_redaction/redaction_limit"]);
+  for (const [label, env, content] of [
+    ["work", ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_BODY_BYTES: "1048576" }), `cred=${SECRET}${NL}${"{{".repeat(20000)}`],
+    ["count", ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_REDACTIONS: "1" }), Array.from({ length: 6 }, (_, i) => `k${i}=wJalrXUtnFEMI${String(i).padStart(8, "0")}`).join(NL)],
+  ]) {
+    __resetTelemetryStore();
+    await (await call({ env, content })).text();
+    const rec = __storeSummary().recent;
+    assert.ok(rec, `${label}: a record must exist`);
+    assert.ok(OK_PAIRS.has(`${rec.outcome}/${rec.limit_reason}`),
+      `${label}: contradictory pair outcome=${rec.outcome} limit_reason=${rec.limit_reason}`);
+  }
+});

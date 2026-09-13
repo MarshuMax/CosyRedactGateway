@@ -4974,7 +4974,26 @@ export async function handleRequest(request, env = {}, options = {}) {
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
         injectRedactNotice(data,protocol);
-      } catch(e) { if (e instanceof RedactionLimitError) { if (telemetry) { telemetry.setOutcome("rejected_redaction"); telemetry.setLimit(e instanceof ReferenceWorkLimitError ? "reference_work" : "redaction_limit"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413,e.message); } throw e; }
+      } catch(e) {
+        if (e instanceof RedactionLimitError) {
+          // ONE decision, two fields. Deriving them independently made outcome and limit_reason
+          // contradict each other: a work-budget refusal reported limit_reason=reference_work
+          // alongside outcome=rejected_redaction.
+          //
+          // The type relationship is the source of truth, not the message: ReferenceWorkLimitError
+          // extends RedactionLimitError precisely so the work budget keeps sharing the same 413
+          // fail-closed path. A message check would be a string contract on an error text.
+          const workLimited = e instanceof ReferenceWorkLimitError;
+          if (telemetry) {
+            telemetry.setOutcome(workLimited ? "rejected_work" : "rejected_redaction");
+            telemetry.setLimit(workLimited ? "reference_work" : "redaction_limit");
+            telemetry.setStatus(413);
+            telemetry.finalizeExactlyOnce();
+          }
+          return jsonError(413, e.message);
+        }
+        throw e;
+      }
       body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
     } else body="";
   }
