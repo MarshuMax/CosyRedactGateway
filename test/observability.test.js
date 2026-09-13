@@ -867,46 +867,83 @@ test("observability: an over-deep UPSTREAM RESPONSE is upstream_depth, and a nat
 // item 9 -- a telemetry fault must not change a status, a body, or a security outcome
 // =====================================================================================
 
-/** Run the same scenario with telemetry OFF, then ON with a fault injected. */
-async function faultPair({ content = "hello", inject }) {
+/**
+ * Deterministic monkeypatch: apply, run, restore in a `finally`.
+ *
+ * An earlier version restored via `setTimeout(..., 0)`, which made the restoration depend on timer
+ * ordering, and the onSpanProjection/onCoverage patch was never restored at all. Left in place, a
+ * throwing prototype would have been inherited by any test declared AFTER these -- so a later
+ * leak-scan would have been running against a deliberately broken telemetry implementation and
+ * reporting on it.
+ */
+async function withPatched(obj, patches, fn) {
+  const saved = {};
+  for (const [k, v] of Object.entries(patches)) {
+    saved[k] = obj[k];
+    obj[k] = v;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) obj[k] = v;
+  }
+}
+
+/** Run the same scenario twice: telemetry OFF, then ON with `patches` applied. */
+async function faultPair({ content = "hello", patches }) {
   __resetTelemetryStore();
   const off = await call({ env: ENV(), content });
   const offBody = await off.text();
 
   __resetTelemetryStore();
-  inject();
-  const on = await call({ env: ENV({ REDACT_OBSERVABILITY: "1" }), content });
-  const onBody = await on.text();
-  return { off, on, offBody, onBody };
+  const on = await withPatched(patches.target, patches.apply, async () => {
+    const r = await call({ env: ENV({ REDACT_OBSERVABILITY: "1" }), content });
+    const body = await r.text();
+    return { status: r.status, body };
+  });
+  return { off, on, offBody };
 }
 
 test("item 9: a throwing TelemetryStore.record cannot change the response [GREEN NOW]", async () => {
-  const { off, on, offBody, onBody } = await faultPair({
+  const { off, on, offBody } = await faultPair({
     content: `PW=${SECRET}`,
-    inject: () => { const orig = TelemetryStore.prototype.record; TelemetryStore.prototype.record = function () { throw new Error("record exploded"); }; setTimeout(() => { TelemetryStore.prototype.record = orig; }, 0); },
+    patches: { target: TelemetryStore.prototype, apply: { record() { throw new Error("record exploded"); } } },
   });
   assert.equal(on.status, off.status);
-  assert.equal(onBody.length, offBody.length);
+  // FULL content equality, not just matching lengths: two different bodies can share a length, and
+  // the assertion is "the response is unchanged", not "the response is the same size".
+  assert.equal(on.body, offBody);
 });
 
 test("item 9: a throwing onSpanProjection / onCoverage cannot change the response [GREEN NOW]", async () => {
-  const { off, on, offBody, onBody } = await faultPair({
+  const { off, on, offBody } = await faultPair({
     content: `PW=${SECRET}`,
-    inject: () => {
-      TelemetryAccumulator.prototype.onSpanProjection = () => { throw new Error("projection exploded"); };
-      TelemetryAccumulator.prototype.onCoverage = () => { throw new Error("coverage exploded"); };
+    patches: {
+      target: TelemetryAccumulator.prototype,
+      apply: {
+        onSpanProjection() { throw new Error("projection exploded"); },
+        onCoverage() { throw new Error("coverage exploded"); },
+      },
     },
   });
   assert.equal(on.status, off.status);
-  assert.equal(onBody.length, offBody.length);
+  assert.equal(on.body, offBody);
+});
+
+test("item 9: a throwing console.error cannot change the response [GREEN NOW]", async () => {
+  const { off, on, offBody } = await faultPair({
+    content: `PW=${SECRET}`,
+    patches: { target: console, apply: { error() { throw new Error("stderr exploded"); } } },
+  });
+  assert.equal(on.status, off.status);
+  assert.equal(on.body, offBody);
 });
 
 test("item 9: a throwing onSinkEvent cannot change the sink policy outcome [GREEN NOW]", async () => {
-  // Real secret plus a sink policy scenario, not hello-world: the call sits immediately beside the
-  // BLOCK decision, so it is the one place where a telemetry fault could plausibly alter security.
-  // TelemetryAccumulator is replaced wholesale so EVERY telemetry method throws.
-  const boom = { onSinkEvent() { throw new Error("sink exploded"); }, onSpanProjection() { throw new Error("x"); }, onCoverage() { throw new Error("x"); }, setOutcome() { throw new Error("x"); }, setLimit() { throw new Error("x"); }, setStatus() { throw new Error("x"); }, markResponseReady() { throw new Error("x"); }, finalizeExactlyOnce() { throw new Error("x"); } };
-
+  // Real secret plus a sink policy scenario rather than hello-world: this call sits immediately
+  // beside the BLOCK decision, so it is the one place a telemetry fault could plausibly alter
+  // security. The token is request-local random, so byte equality is impossible here and the
+  // comparison is on the SECURITY SEMANTICS instead -- which is the property that matters.
   const mk = (env, fetchImpl) => handleRequest(
     new Request("https://proxy.example/H$https://api.example/v1/messages", {
       method: "POST", headers: { "content-type": "application/json" },
@@ -922,31 +959,22 @@ test("item 9: a throwing onSinkEvent cannot change the sink policy outcome [GREE
   __resetTelemetryStore();
   const off = await mk(ENV(), toolUpstream);
   const offBody = await off.text();
-  const offDecision = { leaked: offBody.includes(SECRET), keptToken: offBody.includes(token) };
+  const offDecision = { status: off.status, leaked: offBody.includes(SECRET), keptToken: offBody.includes(token) };
 
   __resetTelemetryStore();
-  const origClass = TelemetryAccumulator;
-  const proto = TelemetryAccumulator.prototype;
-  const saved = {};
-  for (const k of Object.keys(boom)) { saved[k] = proto[k]; proto[k] = boom[k]; }
-  const on = await mk(ENV({ REDACT_OBSERVABILITY: "1" }), toolUpstream);
-  const onBody = await on.text();
-  for (const k of Object.keys(boom)) proto[k] = saved[k];
-  void origClass;
-
-  assert.equal(on.status, off.status, "status unchanged under a telemetry fault");
-  assert.equal(onBody.length, offBody.length, "body bytes unchanged");
-  assert.deepEqual({ leaked: onBody.includes(SECRET), keptToken: onBody.includes(token) }, offDecision,
-    "the SECURITY result must be identical: no plaintext leak, operand token still preserved");
-});
-
-test("item 9: a throwing console.error cannot change the response [GREEN NOW]", async () => {
-  const orig = console.error;
-  const { off, on, offBody, onBody } = await faultPair({
-    content: `PW=${SECRET}`,
-    inject: () => { console.error = () => { throw new Error("stderr exploded"); }; setTimeout(() => { console.error = orig; }, 0); },
+  const boom = {};
+  for (const k of ["onSinkEvent", "onSpanProjection", "onCoverage", "setOutcome", "setLimit", "setStatus", "markResponseReady", "finalizeExactlyOnce"]) {
+    boom[k] = () => { throw new Error(`${k} exploded`); };
+  }
+  const on = await withPatched(TelemetryAccumulator.prototype, boom, async () => {
+    const r = await mk(ENV({ REDACT_OBSERVABILITY: "1" }), toolUpstream);
+    const body = await r.text();
+    return { status: r.status, body };
   });
-  console.error = orig;
-  assert.equal(on.status, off.status);
-  assert.equal(onBody.length, offBody.length);
+  assert.equal(on.status, offDecision.status, "status unchanged under a telemetry fault");
+  assert.deepEqual(
+    { leaked: on.body.includes(SECRET), keptToken: on.body.includes(token) },
+    { leaked: offDecision.leaked, keptToken: offDecision.keptToken },
+    "the SECURITY result must be identical: no plaintext leak, operand token still preserved"
+  );
 });
