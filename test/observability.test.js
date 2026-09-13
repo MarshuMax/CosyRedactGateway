@@ -103,6 +103,14 @@ test("observability: applySinkPolicy keeps its original public return shape [GRE
   shapes.push(applySinkPolicy("plain text", ctx, { kind: SINK_KIND.SHELL }));
   // RESTORE with nothing to resolve
   shapes.push(applySinkPolicy("plain text", ctx, { kind: SINK_KIND.ASSISTANT_TEXT }));
+  // RESTORE WITH a real substitution: the changed=true path, which the review pointed out was
+  // missing. Without it the test never exercised a restoration at all -- the OWN token minted
+  // above was created and then not used -- so a `changed` leak on only this path would have gone
+  // unnoticed.
+  const ownToken = await ctx.tokenFor(SECRET);
+  const restored = applySinkPolicy(`value=${ownToken}`, ctx, { kind: SINK_KIND.ASSISTANT_TEXT });
+  assert.equal(restored.text, `value=${SECRET}`, "the OWN token must actually be restored");
+  shapes.push(restored);
   for (const r of shapes) {
     assert.deepEqual(Object.keys(r).sort(), ["blocked", "mode", "text"],
       `applySinkPolicy must return exactly {text, mode, blocked}; got ${JSON.stringify(Object.keys(r))}`);
@@ -216,28 +224,41 @@ test("observability: a real block_scalar span is counted as a detector, not drop
   );
 });
 
-test("observability: the detector allowlist admits every value the real path emits [GREEN NOW]", async () => {
-  // Derives the domain from the production detector -> projection path and asserts each value is
-  // admitted, so a future detector shows up here rather than as a silent drop.
-  const seen = new Set();
-  const cases = [
-    ["gitleaks", 'token = "ghp_' + "A".repeat(36) + '"'],
-    ["entropy", 'secret = "wJalrXUtnFEMIK7MDENGbPxRfiCY"'],
-    ["binding", "DB_PASSWORD=wJalrXUtnFEMI12345678"],
-    ["block_scalar", "password: |" + NL + "  wJalrXUtnFEMIK7MDENGbPxRfiCY" + NL],
-    ["email", "contact a@b.com"],
-    ["phone", "call +8613800138000"],
-    ["identity", "id 110101199003078515"],
-    ["bank", "card 4111111111111111"],
-    ["secret", "key sk-" + "b".repeat(64)],
+test("observability: every detector in the real domain is emitted and admitted [GREEN NOW]", async () => {
+  // Hardened after review. The previous version destructured `for (const [, text] of cases)` and
+  // THREW THE EXPECTED NAME AWAY, so it only proved "each fixture produced SOME detector that is in
+  // the allowlist". A fixture that was supposed to yield `entropy` but had its attribution taken by
+  // a structured binding would still have passed. Each fixture now asserts its EXACT expected
+  // detector, under ISOLATED flags so the detectors cannot mask one another.
+  //
+  // The flags were not guessed: each was derived by running the fixture and reading what it
+  // actually emits with only that detector enabled.
+  const ALL = { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true, identity: true, bank: true, structuredContext: true };
+  const only = (...keep) => Object.fromEntries(Object.keys(ALL).map((k) => [k, keep.includes(k)]));
+  const DOMAIN = [
+    ["gitleaks", 'token = "ghp_' + "A".repeat(36) + '"', only("gitleaks")],
+    ["entropy", 'secret = "wJalrXUtnFEMIK7MDENGbPxRfiCY"', only("highEntropy")],
+    ["binding", "DB_PASSWORD=wJalrXUtnFEMI12345678", only("structuredContext")],
+    ["block_scalar", "password: |" + NL + "  wJalrXUtnFEMIK7MDENGbPxRfiCY" + NL, only("structuredContext")],
+    ["secret", "key sk-" + "b".repeat(64), only("secret")],
+    ["email", "contact a@b.com", only("email")],
+    ["phone", "call +8613800138000", only("phone")],
+    ["identity", "id 110101199003078515", only("identity")],
+    ["bank", "card 4111111111111111", only("bank")],
   ];
-  for (const [, text] of cases) {
+  const seen = [];
+  for (const [expected, text, flags] of DOMAIN) {
     const ctx = new RedactionContext({ salt: "det", maxRedactions: 1e9 });
-    await ctx.redactText(text, { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true, identity: true, bank: true, structuredContext: true });
-    for (const d of Object.keys(ctx.telemetryProjection().detectorCounts)) seen.add(d);
+    await ctx.redactText(text, flags);
+    const counts = ctx.telemetryProjection().detectorCounts;
+    assert.equal(counts[expected], 1, `${expected} fixture must emit exactly one ${expected}; got ${JSON.stringify(counts)}`);
+    assert.deepEqual(Object.keys(counts), [expected], `${expected} fixture must emit ONLY ${expected}; got ${JSON.stringify(counts)}`);
+    seen.push(expected);
   }
-  assert.ok(seen.size >= 5, `expected a broad detector domain, saw ${[...seen].join(",")}`);
-  __resetTelemetryStore();
+  // The domain is asserted EXACTLY, not with a loose `>= 5`, so removing a detector from the
+  // allowlist fails here rather than shrinking the covered set silently.
+  assert.deepEqual([...seen].sort(), ["bank", "binding", "block_scalar", "email", "gitleaks", "identity", "phone", "secret", "entropy"].sort());
+
   const store = new TelemetryStore();
   for (const d of seen) {
     store.record({ t: 0, upstream: "h", status: 200, outcome: "forwarded",
@@ -245,7 +266,7 @@ test("observability: the detector allowlist admits every value the real path emi
       detectors: { [d]: 1 }, coverage: null, sink_modes: {}, sink_outcomes: {}, limit_reason: null });
   }
   assert.equal(store.diagnostics.dropped_enum_values_total, 0,
-    `every emitted detector must be admitted, but these were dropped: ${[...seen].filter((d) => !(d in store.by_detector)).join(",")}`);
+    `every emitted detector must be admitted; dropped: ${seen.filter((d) => !(d in store.by_detector)).join(",")}`);
   assert.deepEqual(Object.keys(store.by_detector).sort(), [...seen].sort());
 });
 
