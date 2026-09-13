@@ -5029,11 +5029,17 @@ function requestHostName(request) {
 /**
  * Runtime metadata, supplied by the ADAPTER -- never inferred from the request.
  *
- * Host, X-Forwarded-For, Forwarded and the request URL's own hostname are all attacker-controlled
- * and are therefore NOT consulted. A deployment that binds a public interface must not be able to
- * become "local" by sending a header, and `0.0.0.0`, `::`, `localhost` and any hostname are all
- * treated as NON-loopback on purpose: guessing what a bind address means is how the distinction is
- * lost.
+ * The bind address is the ONLY POSITIVE authority. A deployment that binds a public interface must
+ * not be able to become "local" by sending a header, and `0.0.0.0`, `::`, `localhost` and any
+ * hostname are all treated as NON-loopback on purpose: guessing what a bind address means is how the
+ * distinction is lost.
+ *
+ * The `Host` header participates only as a REJECTION-ONLY gate (see adminAdmission): it can CANCEL the
+ * loopback exemption when the request is not actually addressed to a local name, which closes the
+ * DNS-rebinding path, but it can never CREATE an exemption.
+ *
+ * X-Forwarded-For, Forwarded, X-Real-IP and the request URL's own hostname are attacker-controlled and
+ * are not consulted for authorisation at all.
  *
  * Absent metadata means an unknown runtime, which is treated as non-loopback and requires a token.
  */

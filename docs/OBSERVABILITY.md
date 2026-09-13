@@ -218,7 +218,10 @@ None of these numbers is a pass/fail threshold; they depend on V8, GC timing and
 
 ## PR2.1 -- /admin security envelope
 
-The route exists and enforces its boundary, but exposes **no data**: no summary, no ring, no HTML.
+PR2.1 introduced only the security envelope; at that stage the route enforced its boundary but
+exposed **no data** -- no summary, no ring, no HTML. The read-only JSON view followed in PR2.2 and
+the dashboard in PR2.3, so the route described below is the historical starting point rather than
+the current state of `/admin`.
 Admission and authorisation landed together, so there is no state in which the route is reachable
 while authentication is still pending.
 

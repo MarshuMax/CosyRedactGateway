@@ -1,8 +1,9 @@
 // PR2.1 -- /admin security envelope: admission, runtime visibility, authentication.
 //
-// The route exposes NO data yet. What is tested here is the boundary: when the route exists, when it
-// is hidden, and when it demands a credential. Admission and authorisation are one commit precisely
-// so there is no intermediate state where the route is open and auth is still pending.
+// PR2.1 itself exposed no data: this file tests ONLY the admission and authorisation boundary -- when
+// the route exists, when it is hidden, and when it demands a credential. Admission and authorisation
+// shipped as one commit precisely so there is no intermediate state where the route is open while auth
+// is still pending. The data routes added later are covered by their own files.
 
 import test from "node:test";
 import assert from "node:assert/strict";
