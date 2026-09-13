@@ -19,33 +19,48 @@
 // Exit code is non-zero on any difference. It lives in tools/ rather than test/ because
 // `node --test` collects test/ and this needs a checked-out baseline plus a /tmp oracle.
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+// ORACLE is re-exported from the tag on EVERY run. Trusting an existing /tmp file would mean a
+// stale copy could silently stand in for the pinned tag, and re-exporting is nearly free.
 const ORACLE = '/tmp/rcdiff/rc-worker.mjs';
-if (!existsSync(ORACLE)) {
-  mkdirSync(dirname(ORACLE), { recursive: true });
-  try {
-    execFileSync('git', ['show', 'v2.0.0-rc.1:worker.js'], { stdio: ['ignore', 'pipe', 'inherit'] });
-    const out = execFileSync('git', ['show', 'v2.0.0-rc.1:worker.js']);
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(ORACLE, out);
-    console.error(`oracle exported from tag v2.0.0-rc.1 -> ${ORACLE}`);
-  } catch {
-    console.error('FATAL: oracle missing and could not be exported.');
-    console.error(`  generate it with:  git show v2.0.0-rc.1:worker.js > ${ORACLE}`);
-    process.exit(2);
+mkdirSync(dirname(ORACLE), { recursive: true });
+// The tag must come from THIS checkout. `git show` walks up from the cwd, so running the harness
+// from an unrelated directory inside some other repository would silently export that repository's
+// v2.0.0-rc.1 -- or fail confusingly. Pinning the repo first makes the oracle provably ours.
+const HARNESS_DIR = fileURLToPath(new URL('..', import.meta.url));
+try {
+  const toplevel = execFileSync('git', ['-C', HARNESS_DIR, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  if (resolve(toplevel) !== resolve(HARNESS_DIR)) {
+    throw new Error(`harness is not at the repository root: toplevel=${toplevel}`);
   }
+  writeFileSync(ORACLE, execFileSync('git', ['-C', HARNESS_DIR, 'show', 'v2.0.0-rc.1:worker.js']));
+} catch (e) {
+  console.error('FATAL: could not export the RC oracle from tag v2.0.0-rc.1.');
+  console.error(`  run this from inside the repository, or generate it manually:`);
+  console.error(`    git -C <repo> show v2.0.0-rc.1:worker.js > ${ORACLE}`);
+  console.error(`  (${e.message})`);
+  process.exit(2);
 }
+console.error(`oracle exported from tag v2.0.0-rc.1 -> ${ORACLE}`);
+
 const { handleRequest: RC } = await import(ORACLE);
-const { handleRequest: NOW } = await import('/home/ubuntu/repo/CosyRedactGateway/worker.js');
+// SUBJECT is located RELATIVE TO THIS FILE, so the harness runs from any clone directory. An
+// absolute path here would have made it unreproducible outside one machine.
+const { handleRequest: NOW } = await import(new URL('../worker.js', import.meta.url));
 
 const SECRET = 'wJalrXUtnFEMIK7MDENGbPxRfiCY';
 const NL = String.fromCharCode(10);
 const TOKEN_RE = /CRG_[A-Z0-9]{6}_[A-Z0-9]{4}/;
 const FIXED_FOREIGN = 'CRG_AAAAAA_0001';
-const URL = (path) => `https://proxy.example/H$https://api.example${path}`;
+// NOT named `URL`: a top-level `const URL = ...` shadows the global URL constructor, and this file
+// uses `new URL(..., import.meta.url)` to locate the subject. The shadowing produced
+// "Cannot access 'URL' before initialization" at the import line, which reads like a module error
+// rather than a name collision.
+const PROXY_URL = (path) => `https://proxy.example/H$https://api.example${path}`;
 const enc = new TextEncoder();
 
 // ---------------------------------------------------------------------------------------------
@@ -108,7 +123,7 @@ function requestFor(spec) {
       : JSON.stringify({ model: 'g', messages: [{ role: 'user', content: spec.body }], ...(spec.stream ? { stream: true } : {}) });
   const headers = { 'content-type': spec.ct || 'application/json' };
   const path = spec.path || '/v1/chat/completions';
-  return new Request(URL(path), { method: 'POST', headers, body });
+  return new Request(PROXY_URL(path), { method: 'POST', headers, body });
 }
 
 /** Canonical headers: the ones we emit, sorted, with volatile names excluded. */
