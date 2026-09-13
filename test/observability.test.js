@@ -707,10 +707,18 @@ test("observability: an over-deep SSE event is stream_error/json_depth, not forw
   // The wire behaviour is UNCHANGED: the client still receives the same gateway_depth_limit event.
   assert.match(out, /gateway_depth_limit/, "the existing error event must still be emitted");
   assert.equal(upstreamCancelled, true, "and the upstream reader must still be cancelled");
-  const rec = __storeSummary().recent;
+  const store = __telemetryStore();
+  const rec = store.recent.toArray()[0];
   assert.equal(rec.outcome, "stream_error");
   assert.equal(rec.limit_reason, "json_depth");
   assert.equal(rec.status, 200, "the SSE HTTP status is still 200, which is exactly why the outcome had to carry the refusal");
+  // The lifecycle contract, asserted on the record that has a refusal to report: the depth trip
+  // claims the CAUSE without finalizing, and the stream's own close still supplies the duration.
+  // A combined claim+finalize left stream_duration_ms null here.
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0, `rrm=${rec.response_ready_ms}`);
+  assert.ok(Number.isFinite(rec.stream_duration_ms) && rec.stream_duration_ms >= 0,
+    `a depth-refused stream must still carry a finite stream_duration_ms, got ${rec.stream_duration_ms}`);
+  assert.equal(store.recent.length, 1, "exactly one record, not one per terminal event");
 });
 
 test("observability: a normal SSE stream is forwarded with no limit reason [GREEN NOW]", async () => {

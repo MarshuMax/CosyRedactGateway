@@ -4672,9 +4672,9 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null, tel
   // Without a shared claim, a controlled depth refusal was reported as a success.
   const terminal = telemetryOpts?.terminal || null;
   const finalizeStream = (outcome, limit = null) => {
-    // The stream owns the start point, so it computes the duration and hands it to the claim. The
-    // first terminal cause keeps its own duration; a later cause is ignored entirely.
-    if (terminal) { terminal.claim(outcome, limit, Date.now() - streamStartedAt); return; }
+    // The stream owns the start point, so it computes the duration. `finish` finalizes exactly once
+    // and honours any cause a depth trip already claimed; it never overwrites that cause.
+    if (terminal) { terminal.finish(outcome, Date.now() - streamStartedAt); return; }
     if (!telemetry) return;
     telemetry.setOutcome(outcome);
     telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt);
@@ -5088,16 +5088,31 @@ export async function handleRequest(request, env = {}, options = {}) {
     const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
     // Shared terminal state for this stream. `claim` records the FIRST terminal cause and ignores
     // later ones, so a depth trip followed by a normal close cannot be reported as forwarded.
+    // TWO EVENTS, TWO METHODS. "Which terminal cause wins" and "the stream lifecycle is over" are
+    // different things, and doing both in one call broke the SSE latency contract: the depth guard
+    // fires while the stream is still closing, so a combined claim() finalized with a null duration
+    // and the later, real close was then refused as a duplicate cause -- leaving
+    // stream_duration_ms null on exactly the records that had a refusal to report.
+    //
+    //   claim(cause)   records the FIRST terminal cause, and never finalizes
+    //   finish(cause, durationMs)  finalizes EXACTLY ONCE, with the duration the stream computed
+    //
+    // A depth trip therefore claims `stream_error`, and the subsequent close still finalizes with a
+    // finite duration while keeping that cause.
     const sseTerminal = {
-      cause: null, limit: null,
-      // `durationMs` is supplied by the stream, which owns the start point; a depth trip has no
-      // duration of its own because the stream is still closing when it fires.
-      claim(cause, limit = null, durationMs = null) {
+      cause: null, limit: null, finished: false,
+      claim(cause, limit = null) {
         if (this.cause !== null) return false;
         this.cause = cause; this.limit = limit;
+        return true;
+      },
+      finish(defaultCause, durationMs) {
+        if (this.finished) return false;
+        this.finished = true;
+        if (this.cause === null) this.cause = defaultCause;
         if (telemetry) {
-          telemetry.setOutcome(cause);
-          if (limit) telemetry.setLimit(limit);
+          telemetry.setOutcome(this.cause);
+          if (this.limit) telemetry.setLimit(this.limit);
           telemetry.finalizeExactlyOnce(null, Number.isFinite(durationMs) ? durationMs : null);
         }
         return true;
