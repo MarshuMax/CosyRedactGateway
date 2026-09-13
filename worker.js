@@ -3193,17 +3193,6 @@ export const TELEMETRY_SCHEMA_VERSION = 1;
 export const TELEMETRY_RECENT_DEFAULT = 500;
 export const TELEMETRY_RECENT_MAX = 2000;
 
-/**
- * Enum allowlists. A value outside these sets is either dropped (statistical dimensions, which
- * must not let an unknown string widen the schema) or invalidates the whole record (the enums
- * that decide what the record MEANS -- a half-trustworthy record is worse than no record).
- */
-const TELEMETRY_STAT_ENUMS = Object.freeze({
-  detector: null,   // validated against the detector name set built below
-  reason: null,     // prefix-validated: reasons are templated (`profile-redact:X`)
-  infraType: null,  // validated against INFRA_TYPE
-  parser: null,     // validated against PARSER
-});
 /** Limit reasons this build can emit. `limit_reason` is statistical, so an unknown value is
  *  dropped and counted rather than rejecting the record. */
 const TELEMETRY_LIMIT_REASONS = new Set([
@@ -3233,10 +3222,36 @@ const TELEMETRY_CORE_ENUMS = Object.freeze({
 
 /** The detector names this build can emit. Seeded from the entity classes plus the detector
  *  tags the redaction path actually uses, so a NEW detector is dropped rather than admitted. */
+/**
+ * The detector values this build can actually EMIT, collected from the real
+ * detector -> telemetryProjection() path rather than written from the source by eye.
+ *
+ * An earlier version mixed three different kinds of name into one list:
+ *   `highEntropy`        is a FLAG; the detector it produces is `entropy`
+ *   `structuredContext`  is a capability; its detectors are `binding` / `block_scalar`
+ *   `infra`              is a CLASSIFICATION, not a detector
+ * and it omitted `block_scalar`, which bindingSpansOf() genuinely emits
+ * (`type: b.bodyCandidate ? "block_scalar" : kind`). A valid block_scalar span was therefore
+ * counted as a dropped enum instead of as a detector.
+ *
+ * Kept deliberately narrow: a new detector must be added here on purpose, and
+ * `detectorOfSpan()` passes an unrecognised type straight through, so the allowlist is what
+ * stops a future label from widening the schema unnoticed.
+ */
 const TELEMETRY_DETECTORS = new Set([
-  "gitleaks", "secret", "email", "phone", "identity", "bank", "entropy", "binding",
-  "highEntropy", "structuredContext", "reference", "infra",
+  "gitleaks", "entropy", "binding", "block_scalar",
+  "secret", "email", "phone", "identity", "bank",
 ]);
+
+/** Canonical parser values only. `coverageSummary()` emits the VALUE side of PARSER, so
+ *  accepting keys as well would admit `ENV`/`env` and `SHELL`/`shell` as distinct schemas for
+ *  the same thing. */
+const TELEMETRY_PARSERS = new Set(Object.values(PARSER));
+
+/** INFRA_TYPE by VALUE. Keys and values happen to coincide today, so validating against keys
+ *  would also pass -- but that is a coincidence, not a contract, and the emitted value is what
+ *  telemetry stores. */
+const TELEMETRY_INFRA_TYPES = new Set(Object.values(INFRA_TYPE));
 
 /** Reason strings are templated (`infra:SPAN_ID`, `profile-redact:X`). Validate the PREFIX and
  *  the tail against allowlists so a future free-text reason cannot smuggle content in. */
@@ -3387,8 +3402,8 @@ export class TelemetryStore {
     };
     const detectors = keep(s.detectors, (k) => TELEMETRY_DETECTORS.has(k));
     const reasons = keep(s.reasons, (k) => telemetryReasonKey(k) !== null);
-    const infraTypes = keep(s.infra_types, (k) => Object.prototype.hasOwnProperty.call(INFRA_TYPE, k));
-    const parserKey = (k) => Object.prototype.hasOwnProperty.call(PARSER, k) || Object.values(PARSER).includes(k);
+    const infraTypes = keep(s.infra_types, (k) => TELEMETRY_INFRA_TYPES.has(k));
+    const parserKey = (k) => TELEMETRY_PARSERS.has(k);
     const coverage = Object.keys(rec.coverage || {}).length
       ? Object.fromEntries(Object.entries(rec.coverage).filter(([k]) => {
           const ok = parserKey(k);
@@ -3463,19 +3478,6 @@ export class TelemetryStore {
 
   #bump(map, key, by = 1) { map[key] = (map[key] || 0) + by; }
 
-
-  /** Statistical dimension: unknown key -> drop the bucket and count it. The raw value is
-   *  never retained, so an unknown string cannot widen the schema. */
-  #statEnum(map, key, n, kind) {
-    if (!Number.isFinite(n) || n <= 0) return;
-    let ok;
-    if (kind === "detector") ok = TELEMETRY_DETECTORS.has(key);
-    else if (kind === "reason") ok = telemetryReasonKey(key) !== null;
-    else ok = false;
-    if (!ok) { this.diagnostics.dropped_enum_values_total++; return; }
-    const k2 = kind === "reason" ? telemetryReasonKey(key) : key;
-    map[k2] = (map[k2] || 0) + n;
-  }
 
   /** Retention self-report. During the R3.6 work an unbounded structure looked exactly like a
    *  cheap one until it was measured; this makes the bound visible instead. */
@@ -4834,15 +4836,14 @@ let TELEMETRY_STORE_CAP = -1;
 
 function getTelemetryStore(env) {
   const cap = telemetryBufferSize(env);
-  const logging = observabilityEnabled(env);
   if (!TELEMETRY_STORE || TELEMETRY_STORE_CAP !== cap) {
-    TELEMETRY_STORE = new TelemetryStore({ recentCap: cap, logging });
+    // `logging` is set at CREATION only. In PR1 "observability enabled" and "logging enabled" are
+    // the same condition, and a disabled request never reaches this function, so re-assigning the
+    // field on every request was dead work that also kept a shared object mutable from request
+    // scope. Leaving it out means PR2 can add an independent logging switch without reintroducing
+    // the concurrency problem the class static had.
+    TELEMETRY_STORE = new TelemetryStore({ recentCap: cap, logging: observabilityEnabled(env) });
     TELEMETRY_STORE_CAP = cap;
-  } else {
-    // Logging is an INSTANCE setting so it can be set here rather than by a request mutating
-    // process-global state. It is a scalar with no per-request meaning, so assigning it is safe;
-    // what was not safe was a class static that any request could flip for every other request.
-    TELEMETRY_STORE.logging = logging;
   }
   return TELEMETRY_STORE;
 }

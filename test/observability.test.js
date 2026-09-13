@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import {
   handleRequest,
   TelemetryStore,
+  RedactionContext,
   TelemetryAccumulator,
   formatTelemetryLine,
   observabilityEnabled,
@@ -165,6 +166,63 @@ test("observability: a 413 performs no upstream fetch [GREEN NOW]", async () => 
   let fetched = 0;
   await (await call({ body: JSON.stringify({ model: "g", deep: (() => { let n = "x"; for (let i = 0; i < 700; i++) n = { c: n }; return n; })() }), fetchImpl: async () => { fetched++; return new Response("{}", { headers: { "content-type": "application/json" } }); } })).text();
   assert.equal(fetched, 0);
+});
+
+test("observability: a real block_scalar span is counted as a detector, not dropped [GREEN NOW]", async () => {
+  // NOT a fabricated store.record({detectors:{block_scalar:1}}). This runs the real production
+  // path -- findSensitiveSpans -> redactText -> telemetryProjection -> store -- so it proves the
+  // allowlist admits what the binding parser actually emits.
+  //
+  // bindingSpansOf() sets `type: b.bodyCandidate ? "block_scalar" : kind`, and detectorOfSpan()
+  // excludes "block_scalar" from its `find` so it survives as candidates[0]. The earlier allowlist
+  // omitted it and also carried non-detectors (`highEntropy`, `structuredContext`, `infra`,
+  // `reference`), so a valid block_scalar span was counted as a dropped enum.
+  __resetTelemetryStore();
+  const BLOCK = "password: |" + NL + "  wJalrXUtnFEMIK7MDENGbPxRfiCY" + NL;
+  const res = await call({ content: BLOCK });
+  await res.text();
+  const store = __telemetryStore();
+  assert.ok(store, "observability is on");
+  assert.equal(store.diagnostics.dropped_enum_values_total, 0, "no enum was dropped");
+  const dets = store.by_detector;
+  assert.ok(Object.keys(dets).length >= 1, `expected at least one detector, got ${JSON.stringify(dets)}`);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(dets, "block_scalar"), true,
+    `block_scalar must be admitted; got ${JSON.stringify(dets)}`
+  );
+});
+
+test("observability: the detector allowlist admits every value the real path emits [GREEN NOW]", async () => {
+  // Derives the domain from the production detector -> projection path and asserts each value is
+  // admitted, so a future detector shows up here rather than as a silent drop.
+  const seen = new Set();
+  const cases = [
+    ["gitleaks", 'token = "ghp_' + "A".repeat(36) + '"'],
+    ["entropy", 'secret = "wJalrXUtnFEMIK7MDENGbPxRfiCY"'],
+    ["binding", "DB_PASSWORD=wJalrXUtnFEMI12345678"],
+    ["block_scalar", "password: |" + NL + "  wJalrXUtnFEMIK7MDENGbPxRfiCY" + NL],
+    ["email", "contact a@b.com"],
+    ["phone", "call +8613800138000"],
+    ["identity", "id 110101199003078515"],
+    ["bank", "card 4111111111111111"],
+    ["secret", "key sk-" + "b".repeat(64)],
+  ];
+  for (const [, text] of cases) {
+    const ctx = new RedactionContext({ salt: "det", maxRedactions: 1e9 });
+    await ctx.redactText(text, { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true, identity: true, bank: true, structuredContext: true });
+    for (const d of Object.keys(ctx.telemetryProjection().detectorCounts)) seen.add(d);
+  }
+  assert.ok(seen.size >= 5, `expected a broad detector domain, saw ${[...seen].join(",")}`);
+  __resetTelemetryStore();
+  const store = new TelemetryStore();
+  for (const d of seen) {
+    store.record({ t: 0, upstream: "h", status: 200, outcome: "forwarded",
+      spans: { decisions: 1, redact: 1, preserve: 0, bytes_redacted: 1, detectors: { [d]: 1 }, reasons: {}, infra_types: {} },
+      detectors: { [d]: 1 }, coverage: null, sink_modes: {}, sink_outcomes: {}, limit_reason: null });
+  }
+  assert.equal(store.diagnostics.dropped_enum_values_total, 0,
+    `every emitted detector must be admitted, but these were dropped: ${[...seen].filter((d) => !(d in store.by_detector)).join(",")}`);
+  assert.deepEqual(Object.keys(store.by_detector).sort(), [...seen].sort());
 });
 
 // =====================================================================================
