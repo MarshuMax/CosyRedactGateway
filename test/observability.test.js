@@ -779,27 +779,18 @@ test("observability: onDepthLimit is optional [GREEN NOW]", async () => {
 test("observability: an admitted non-JSON request is rejected_content_type, with no invented limit [GREEN NOW]", async () => {
   __resetTelemetryStore();
   let fetches = 0;
-  const res = await call({
-    env: ENV({ REDACT_OBSERVABILITY: "1" }),
-    body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "x" }] }),
-    fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
-  });
-  await res.text();
-  // Re-run with a non-JSON content type, which is what triggers 415.
-  __resetTelemetryStore();
-  const enc = new TextEncoder();
-  const raw = await handleRequest(
+  const res = await handleRequest(
     new Request("https://proxy.example/H$https://api.example/v1/chat/completions", {
       method: "POST", headers: { "content-type": "text/plain" }, body: "not json",
     }),
     ENV({ REDACT_OBSERVABILITY: "1" }),
     { salt: "obs", fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); } }
   );
-  await raw.text();
-  void enc;
+  await res.text();
+  assert.equal(res.status, 415);
+  assert.equal(fetches, 0, "a refused content type must not reach the upstream");
   const store = __telemetryStore();
   const rec = store.recent.toArray()[0];
-  assert.equal(raw.status, 415);
   assert.equal(rec.outcome, "rejected_content_type");
   assert.equal(rec.limit_reason, null, "415 is a content-type refusal, not a resource limit");
   assert.equal(rec.status, 415);
@@ -809,9 +800,15 @@ test("observability: an admitted non-JSON request is rejected_content_type, with
 
 test("observability: an admitted invalid-JSON body is rejected_json [GREEN NOW]", async () => {
   __resetTelemetryStore();
-  const res = await call({ env: ENV({ REDACT_OBSERVABILITY: "1" }), body: "{not json" });
+  let fetches = 0;
+  const res = await call({
+    env: ENV({ REDACT_OBSERVABILITY: "1" }),
+    body: "{not json",
+    fetchImpl: async () => { fetches++; return new Response("{}", { headers: { "content-type": "application/json" } }); },
+  });
   await res.text();
   assert.equal(res.status, 400);
+  assert.equal(fetches, 0, "an unparseable body must not reach the upstream");
   const store = __telemetryStore();
   const rec = store.recent.toArray()[0];
   assert.equal(rec.outcome, "rejected_json");
@@ -864,4 +861,92 @@ test("observability: an over-deep UPSTREAM RESPONSE is upstream_depth, and a nat
   assert.equal(rec.limit_reason, null);
   assert.equal(rec.status, 502);
   assert.equal(store.recent.length, 1);
+});
+
+// =====================================================================================
+// item 9 -- a telemetry fault must not change a status, a body, or a security outcome
+// =====================================================================================
+
+/** Run the same scenario with telemetry OFF, then ON with a fault injected. */
+async function faultPair({ content = "hello", inject }) {
+  __resetTelemetryStore();
+  const off = await call({ env: ENV(), content });
+  const offBody = await off.text();
+
+  __resetTelemetryStore();
+  inject();
+  const on = await call({ env: ENV({ REDACT_OBSERVABILITY: "1" }), content });
+  const onBody = await on.text();
+  return { off, on, offBody, onBody };
+}
+
+test("item 9: a throwing TelemetryStore.record cannot change the response [GREEN NOW]", async () => {
+  const { off, on, offBody, onBody } = await faultPair({
+    content: `PW=${SECRET}`,
+    inject: () => { const orig = TelemetryStore.prototype.record; TelemetryStore.prototype.record = function () { throw new Error("record exploded"); }; setTimeout(() => { TelemetryStore.prototype.record = orig; }, 0); },
+  });
+  assert.equal(on.status, off.status);
+  assert.equal(onBody.length, offBody.length);
+});
+
+test("item 9: a throwing onSpanProjection / onCoverage cannot change the response [GREEN NOW]", async () => {
+  const { off, on, offBody, onBody } = await faultPair({
+    content: `PW=${SECRET}`,
+    inject: () => {
+      TelemetryAccumulator.prototype.onSpanProjection = () => { throw new Error("projection exploded"); };
+      TelemetryAccumulator.prototype.onCoverage = () => { throw new Error("coverage exploded"); };
+    },
+  });
+  assert.equal(on.status, off.status);
+  assert.equal(onBody.length, offBody.length);
+});
+
+test("item 9: a throwing onSinkEvent cannot change the sink policy outcome [GREEN NOW]", async () => {
+  // Real secret plus a sink policy scenario, not hello-world: the call sits immediately beside the
+  // BLOCK decision, so it is the one place where a telemetry fault could plausibly alter security.
+  // TelemetryAccumulator is replaced wholesale so EVERY telemetry method throws.
+  const boom = { onSinkEvent() { throw new Error("sink exploded"); }, onSpanProjection() { throw new Error("x"); }, onCoverage() { throw new Error("x"); }, setOutcome() { throw new Error("x"); }, setLimit() { throw new Error("x"); }, setStatus() { throw new Error("x"); }, markResponseReady() { throw new Error("x"); }, finalizeExactlyOnce() { throw new Error("x"); } };
+
+  const mk = (env, fetchImpl) => handleRequest(
+    new Request("https://proxy.example/H$https://api.example/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "c", max_tokens: 20, messages: [{ role: "user", content: `PW=${SECRET}` }] }),
+    }), env, { salt: "fault", fetchImpl });
+
+  let token = null;
+  const toolUpstream = async (_u, init) => {
+    token = (String(init.body).match(/CRG_[A-Z0-9]{6}_[A-Z0-9]{4}/) || [])[0];
+    return new Response(JSON.stringify({ type: "message", role: "assistant", content: [{ type: "tool_use", id: "t", name: "untrusted", input: { pw: token } }] }), { headers: { "content-type": "application/json" } });
+  };
+
+  __resetTelemetryStore();
+  const off = await mk(ENV(), toolUpstream);
+  const offBody = await off.text();
+  const offDecision = { leaked: offBody.includes(SECRET), keptToken: offBody.includes(token) };
+
+  __resetTelemetryStore();
+  const origClass = TelemetryAccumulator;
+  const proto = TelemetryAccumulator.prototype;
+  const saved = {};
+  for (const k of Object.keys(boom)) { saved[k] = proto[k]; proto[k] = boom[k]; }
+  const on = await mk(ENV({ REDACT_OBSERVABILITY: "1" }), toolUpstream);
+  const onBody = await on.text();
+  for (const k of Object.keys(boom)) proto[k] = saved[k];
+  void origClass;
+
+  assert.equal(on.status, off.status, "status unchanged under a telemetry fault");
+  assert.equal(onBody.length, offBody.length, "body bytes unchanged");
+  assert.deepEqual({ leaked: onBody.includes(SECRET), keptToken: onBody.includes(token) }, offDecision,
+    "the SECURITY result must be identical: no plaintext leak, operand token still preserved");
+});
+
+test("item 9: a throwing console.error cannot change the response [GREEN NOW]", async () => {
+  const orig = console.error;
+  const { off, on, offBody, onBody } = await faultPair({
+    content: `PW=${SECRET}`,
+    inject: () => { console.error = () => { throw new Error("stderr exploded"); }; setTimeout(() => { console.error = orig; }, 0); },
+  });
+  console.error = orig;
+  assert.equal(on.status, off.status);
+  assert.equal(onBody.length, offBody.length);
 });

@@ -409,23 +409,27 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     // unclaimed one: the outer DLP is where the plaintext would appear, and this layer
     // cannot resolve it, so delivering it as an operand is not honest either.
     if (OPERAND_SINKS.includes(sink.kind) && hasUnknownProtectedToken(text, ctx, registry)) {
-      if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, true, false);
+      // Isolated: this call sits immediately beside the BLOCK decision, and a telemetry throw
+      // must not be able to alter what the sink policy returns.
+      telemetryTry(() => ctx?.telemetry?.onSinkEvent(mode, true, false));
       return { text: BLOCKED_OPERAND, mode, blocked: true };
     }
     // PRESERVE never substitutes, so the outcome is `preserved` whatever the mode says.
-    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
+    telemetryTry(() => ctx?.telemetry?.onSinkEvent(mode, false, false));
     return { text, mode, blocked: false };
   }
   if (mode === SINK_MODE.BLOCK) {
     // Sensitive sink: an unresolvable operand is refused rather than forwarded, because a
     // shell, an egress call, a database or an email would receive a token it cannot use.
     if (hasUnknownProtectedToken(text, ctx, registry)) {
-      if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, true, false);
+      // Isolated: this call sits immediately beside the BLOCK decision, and a telemetry throw
+      // must not be able to alter what the sink policy returns.
+      telemetryTry(() => ctx?.telemetry?.onSinkEvent(mode, true, false));
       return { text: BLOCKED_OPERAND, mode, blocked: true };
     }
     // A BLOCK channel with nothing to refuse delivered the text as-is: mode BLOCK, outcome
     // `preserved`. Conflating the two is exactly the confusion this split prevents.
-    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
+    telemetryTry(() => ctx?.telemetry?.onSinkEvent(mode, false, false));
     return { text, mode, blocked: false };
   }
   // RESTORE resolves only what this layer owns; restoreText leaves everything else
@@ -444,7 +448,7 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     // what the gateway did. classifyRestore() already draws this distinction from
     // `applied.text !== text`; this is the same rule, evaluated once, where both strings exist.
     const changed = out !== text;
-    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, changed);
+    telemetryTry(() => ctx?.telemetry?.onSinkEvent(mode, false, changed));
       return { text: out, mode, blocked: false };
 }
 
@@ -3183,6 +3187,24 @@ export class RedactionLimitError extends Error {}
 // only inputs are a safe projection of counts and an allowlisted enum set.
 // =====================================================================================
 
+/**
+ * NO-THROW BOUNDARY for every telemetry callback that runs on a request or stream path.
+ *
+ * Telemetry is an observer. A fault in it must never change a status, a body, a stream's lifecycle,
+ * or -- most importantly -- a sink policy decision. Each call is therefore isolated here rather than
+ * relying on the individual method being careful, which is a property that would erode silently as
+ * the code changes.
+ *
+ * Returns undefined on failure; callers must not depend on a return value.
+ */
+function telemetryTry(fn) {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Telemetry schema version. Deliberately NOT the application version: a record schema and a
  *  build identifier are different things, and hardcoding a release here would drift the moment
  *  the next release ships. */
@@ -3322,7 +3344,10 @@ export class TelemetryStore {
     this.seq = 0;
     this.counters = {
       requests_total: 0, requests_redacted: 0, requests_clean: 0,
-      entities_total: 0, bytes_redacted_total: 0,
+      // NOT `entities_total`: this counts redacted SPAN DECISIONS. One entity can produce several
+      // spans, and several spans can share one identity, so a name implying unique entities would be
+      // wrong the moment a document repeats a secret.
+      spans_redacted_total: 0, bytes_redacted_total: 0,
     };
     // Fixed-key maps. An unknown key is counted and DISCARDED, never inserted.
     this.by_detector = Object.create(null);
@@ -3458,7 +3483,7 @@ export class TelemetryStore {
   aggregate(safe) {
     this.counters.requests_total++;
     if (safe.spans.redact > 0) this.counters.requests_redacted++; else this.counters.requests_clean++;
-    this.counters.entities_total += safe.spans.redact;
+    this.counters.spans_redacted_total += safe.spans.redact;
     this.counters.bytes_redacted_total += safe.spans.bytes_redacted;
     this.#bump(this.by_status, String(safe.status));
     this.#bump(this.by_outcome, safe.outcome);
@@ -4676,8 +4701,7 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null, tel
     // and honours any cause a depth trip already claimed; it never overwrites that cause.
     if (terminal) { terminal.finish(outcome, Date.now() - streamStartedAt); return; }
     if (!telemetry) return;
-    telemetry.setOutcome(outcome);
-    telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt);
+    telemetryTry(() => { telemetry.setOutcome(outcome); telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt); });
   };
   const reader=body.getReader();
   const decoder=new TextDecoder();
@@ -4908,7 +4932,7 @@ async function finalizeNonStream(responsePromise, ctx, telemetry, terminal = nul
   // `response.status` undefined and pushed a Promise object into the telemetry store -- both a
   // wrong status and a retained reference to live request state.
   if (telemetry) {
-    telemetry.setStatus(response.status);
+    telemetryTry(() => telemetry.setStatus(response.status));
     // outcome describes WHAT THE GATEWAY DID, not whether the status code looks successful.
     // Reaching this line means fetchImpl() returned a Response, i.e. the upstream transport
     // succeeded and we are forwarding an upstream HTTP response -- including 302, 401, 403, 429,
@@ -4924,13 +4948,14 @@ async function finalizeNonStream(responsePromise, ctx, telemetry, terminal = nul
     // The outcome comes from what actually happened, never from the status code. Inferring
     // `status === 502 -> upstream_depth` here would mislabel a GENUINE upstream 502, which is a
     // successful forward of an upstream error response.
-    telemetry.setOutcome(terminal?.outcome ?? "forwarded");
-    if (terminal?.limit) telemetry.setLimit(terminal.limit);
+    telemetryTry(() => {
+      telemetry.setOutcome(terminal?.outcome ?? "forwarded");
+      if (terminal?.limit) telemetry.setLimit(terminal.limit);
+    });
     // No second onSpanProjection()/onCoverage() here: the request-stage snapshot already ran, and
     // taking the same data at two lifecycle points would let them disagree without either being
     // obviously wrong.
-    telemetry.markResponseReady();
-    telemetry.finalizeExactlyOnce();
+    telemetryTry(() => { telemetry.markResponseReady(); telemetry.finalizeExactlyOnce(); });
   }
   return response;
 }
@@ -5013,13 +5038,14 @@ export async function handleRequest(request, env = {}, options = {}) {
       // Construct FIRST, then mark: response_ready_ms means "the downstream Response is ready", so
       // marking before the Response exists would name a moment that had not happened yet.
       const response = jsonError(413, `Request body exceeds ${maxBody} bytes`);
-      if (telemetry) {
-        telemetry.setOutcome("rejected_body");
-        telemetry.setLimit("body_bytes");
-        telemetry.setStatus(response.status);
-        telemetry.markResponseReady();
-        telemetry.finalizeExactlyOnce();
-      }
+      telemetryTry(() => {
+        if (!telemetry) return;
+          telemetry.setOutcome("rejected_body");
+          telemetry.setLimit("body_bytes");
+          telemetry.setStatus(response.status);
+          telemetry.markResponseReady();
+          telemetry.finalizeExactlyOnce();
+      });
       return response;
     }
     const ct=request.headers.get("content-type") || "";
@@ -5027,37 +5053,40 @@ export async function handleRequest(request, env = {}, options = {}) {
       // No limit_reason: this is a content-type refusal, not a resource limit. Inventing one would
       // make the dashboard report a limit that was never reached.
       const response = jsonError(415, "For safety, request bodies must be JSON so they can be redacted before forwarding");
-      if (telemetry) {
-        telemetry.setOutcome("rejected_content_type");
-        telemetry.setStatus(response.status);
-        telemetry.markResponseReady();
-        telemetry.finalizeExactlyOnce();
-      }
+      telemetryTry(() => {
+        if (!telemetry) return;
+          telemetry.setOutcome("rejected_content_type");
+          telemetry.setStatus(response.status);
+          telemetry.markResponseReady();
+          telemetry.finalizeExactlyOnce();
+      });
       return response;
     }
     if (bytes.byteLength) {
       let data;
       try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch {
         const response = jsonError(400, "Invalid JSON request body");
-        if (telemetry) {
-          telemetry.setOutcome("rejected_json");
-          telemetry.setStatus(response.status);
-          telemetry.markResponseReady();
-          telemetry.finalizeExactlyOnce();
-        }
+        telemetryTry(() => {
+          if (!telemetry) return;
+            telemetry.setOutcome("rejected_json");
+            telemetry.setStatus(response.status);
+            telemetry.markResponseReady();
+            telemetry.finalizeExactlyOnce();
+        });
         return response;
       }
       // A payload resource limit, checked before redactJson walks the structure. Refused as 413
       // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
       if (exceedsJsonDepth(data, maxDepth)) {
         const response = jsonError(413, `JSON nesting exceeds ${maxDepth}`);
-        if (telemetry) {
-          telemetry.setOutcome("rejected_depth");
-          telemetry.setLimit("json_depth");
-          telemetry.setStatus(response.status);
-          telemetry.markResponseReady();
-          telemetry.finalizeExactlyOnce();
-        }
+        telemetryTry(() => {
+          if (!telemetry) return;
+            telemetry.setOutcome("rejected_depth");
+            telemetry.setLimit("json_depth");
+            telemetry.setStatus(response.status);
+            telemetry.markResponseReady();
+            telemetry.finalizeExactlyOnce();
+        });
         return response;
       }
       try {
@@ -5075,13 +5104,14 @@ export async function handleRequest(request, env = {}, options = {}) {
           // fail-closed path. A message check would be a string contract on an error text.
           const workLimited = e instanceof ReferenceWorkLimitError;
           const response = jsonError(413, e.message);
-          if (telemetry) {
-            telemetry.setOutcome(workLimited ? "rejected_work" : "rejected_redaction");
-            telemetry.setLimit(workLimited ? "reference_work" : "redaction_limit");
-            telemetry.setStatus(response.status);
-            telemetry.markResponseReady();
-            telemetry.finalizeExactlyOnce();
-          }
+          telemetryTry(() => {
+            if (!telemetry) return;
+              telemetry.setOutcome(workLimited ? "rejected_work" : "rejected_redaction");
+              telemetry.setLimit(workLimited ? "reference_work" : "redaction_limit");
+              telemetry.setStatus(response.status);
+              telemetry.markResponseReady();
+              telemetry.finalizeExactlyOnce();
+          });
           return response;
         }
         throw e;
@@ -5090,10 +5120,11 @@ export async function handleRequest(request, env = {}, options = {}) {
       // Taking it only at response completion meant a request whose upstream fetch THREW reported
       // redacted=0 / coverage=null -- telemetry asserting that no redaction had happened when one
       // had. The snapshot is what the request stage actually did, independent of how it ended.
-      if (telemetry) {
+      telemetryTry(() => {
+        if (!telemetry) return;
         telemetry.onSpanProjection(ctx.telemetryProjection());
         telemetry.onCoverage(ctx.coverageSummary().byParser);
-      }
+      });
       body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
     } else body="";
   }
@@ -5106,12 +5137,13 @@ export async function handleRequest(request, env = {}, options = {}) {
     // same rule the other terminal paths follow. Marking before the Response existed made this path
     // the one place where the documented semantics did not literally hold.
     const response = jsonError(502, `Upstream fetch failed: ${e?.message || e}`);
-    if (telemetry) {
-      telemetry.setOutcome("upstream_error");
-      telemetry.setStatus(response.status);
-      telemetry.markResponseReady();
-      telemetry.finalizeExactlyOnce();
-    }
+    telemetryTry(() => {
+      if (!telemetry) return;
+        telemetry.setOutcome("upstream_error");
+        telemetry.setStatus(response.status);
+        telemetry.markResponseReady();
+        telemetry.finalizeExactlyOnce();
+    });
     return response;
   }
 
@@ -5142,11 +5174,14 @@ export async function handleRequest(request, env = {}, options = {}) {
         if (this.finished) return false;
         this.finished = true;
         if (this.cause === null) this.cause = defaultCause;
-        if (telemetry) {
+        // Isolated: this runs inside the stream's own control flow, so a telemetry fault here
+        // could otherwise be caught by the stream's error handling and change how the stream ends.
+        telemetryTry(() => {
+          if (!telemetry) return;
           telemetry.setOutcome(this.cause);
           if (this.limit) telemetry.setLimit(this.limit);
           telemetry.finalizeExactlyOnce(null, Number.isFinite(durationMs) ? durationMs : null);
-        }
+        });
         return true;
       },
     };
@@ -5167,13 +5202,14 @@ export async function handleRequest(request, env = {}, options = {}) {
       restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0, terminal: sseTerminal }),
       { status: upstreamResponse.status, statusText: upstreamResponse.statusText, headers: rh }
     );
-    if (telemetry) {
+    telemetryTry(() => {
+      if (!telemetry) return;
       // The SSE path never recorded a status, so the accumulator's default 0 reached the record.
       // The real status comes from the Response actually being returned, which also keeps the mark
       // timepoint consistent with its definition.
       telemetry.setStatus(downstream.status);
       telemetry.markResponseReady();
-    }
+    });
     return downstream;
   }
   // Request-local terminal metadata. `restoreNonStreamResponse` reports the depth refusal through a
