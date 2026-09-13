@@ -233,6 +233,12 @@ test("observability: every detector in the real domain is emitted and admitted [
   //
   // The flags were not guessed: each was derived by running the fixture and reading what it
   // actually emits with only that detector enabled.
+  //
+  // `only()` sets EVERY flag explicitly, and that matters: `structuredContext` is OPT-OUT in this
+  // codebase (`flags.structuredContext !== false`), so simply omitting it leaves it ON. A probe
+  // written as `{ highEntropy: true }` therefore still ran the structured binding, which took
+  // attribution and reported `binding` where the fixture was supposed to prove `entropy`. The
+  // isolation has to be explicit or the fixture proves nothing about the detector it names.
   const ALL = { gitleaks: true, highEntropy: true, email: true, phone: true, secret: true, identity: true, bank: true, structuredContext: true };
   const only = (...keep) => Object.fromEntries(Object.keys(ALL).map((k) => [k, keep.includes(k)]));
   const DOMAIN = [
