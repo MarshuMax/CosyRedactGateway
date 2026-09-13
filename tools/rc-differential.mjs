@@ -1,6 +1,6 @@
 // item 3b: RC baseline differential, run manually.
 //
-//   node test/baseline/rc-differential.mjs
+//   node tools/rc-differential.mjs
 //
 // ORACLE is the RC worker itself, regenerated from the tag rather than kept as a fixture:
 //
@@ -18,6 +18,11 @@
 //
 // Compared per case: status, response body BYTES, the response headers we emit, the upstream fetch
 // count, and the body itself.
+//
+// It lives in tools/ rather than test/ on purpose: `node --test` collects anything under test/, so
+// this file was being executed on EVERY run -- inflating the reported test count and, worse, tying
+// the ordinary suite to a /tmp oracle and a `git show`. A harness that needs a checked-out baseline
+// must not run on a clean clone, and must not be counted as a unit test.
 //
 // KNOWN GAP, not yet closed: the `true restore` section at the bottom is broken. It was meant to
 // cover the one path the deterministic corpus cannot reach -- an upstream echoing the token THIS
