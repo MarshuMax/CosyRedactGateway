@@ -214,3 +214,53 @@ None of these numbers is a pass/fail threshold; they depend on V8, GC timing and
 | `test/` | correctness and bounded deterministic regressions | yes |
 | `tools/rc-differential.mjs` | RC baseline differential; needs a checked-out tag and a /tmp oracle | **no**, deliberately |
 | `scripts/perf-*.mjs` | heavy sweeps and measurement, observation only | **no** |
+
+## PR2.1 -- /admin security envelope
+
+The route exists and enforces its boundary, but exposes **no data**: no summary, no ring, no HTML.
+Admission and authorisation landed together, so there is no state in which the route is reachable
+while authentication is still pending.
+
+### Visibility and authorisation matrix
+
+| Situation | Result |
+|---|---|
+| `REDACT_OBSERVABILITY` != `1` | **404** -- hidden, not 403, because a 403 would confirm the surface exists |
+| Node adapter, bind `127.0.0.1` or `::1`, obs on | **200** without a token |
+| Node adapter, any other bind, no `REDACT_ADMIN_TOKEN` | **404** |
+| Node adapter, any other bind, token configured, missing or wrong Bearer | **401** |
+| Node adapter, any other bind, correct Bearer | **200** |
+| Cloudflare / Deno, no token configured | **404** |
+| Cloudflare / Deno, token configured, missing or wrong Bearer | **401** |
+| Cloudflare / Deno, correct Bearer | **200** |
+
+### The bind address comes from the adapter, never from the request
+
+`node-server.mjs` passes `{ runtime: { kind: "node", bindHost: host } }`, where `host` is the
+configured bind address. **Host, X-Forwarded-For, Forwarded, X-Real-IP and the request URL's own
+hostname are all attacker-controlled and are not consulted at all.** A public deployment must not be
+able to become "local" by sending a header.
+
+Only the two literal values `127.0.0.1` and `::1` count as loopback. `0.0.0.0`, `::`, `localhost` and
+any hostname are treated as **non-loopback and require a token** -- guessing what a bind address means
+is how the distinction gets lost. A Worker or Deno deployment has no local bind and therefore never
+qualifies, even if a `bindHost` were somehow supplied.
+
+Absent runtime metadata means an unknown runtime, which is treated as non-loopback.
+
+### Authentication
+
+`Authorization: Bearer <token>` is the only accepted form. **Query strings are not read at all** --
+not `?token=`, not `?key=`, not `?access_token=` -- because a query credential leaks into browser
+history, proxy logs and referrer headers. Cookies and custom headers are equally ignored.
+
+The comparison reduces both sides to a fixed-length digest before comparing, so the cost does not
+depend on how much of the token was correct. A failed comparison echoes nothing, and the token never
+reaches telemetry: `/admin` sits outside the telemetry admission boundary and records no request at
+all.
+
+The response carries `cache-control: no-store` and **no CORS headers**: the route is not for
+cross-origin browser callers.
+
+No token is generated and none is printed. `REDACT_ADMIN_TOKEN` is read from the environment or the
+route stays hidden.

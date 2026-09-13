@@ -4993,12 +4993,126 @@ export function formatTelemetryLine(rec) {
 
 
 
+
+// =====================================================================================
+// v2.1 PR2.1 -- /admin security envelope: admission, runtime visibility, authentication.
+//
+// This establishes the BOUNDARY and nothing else. It does not read the telemetry summary, it does
+// not render HTML, and it exposes no data. Admission and authorisation are deliberately one change:
+// a commit that opened the route while auth was still to come would present a safety matrix that
+// looked satisfied but was not a security boundary yet.
+// =====================================================================================
+
+/** Only these two literal values count as loopback. */
+const ADMIN_LOOPBACK_HOSTS = Object.freeze(new Set(["127.0.0.1", "::1"]));
+
+/**
+ * Runtime metadata, supplied by the ADAPTER -- never inferred from the request.
+ *
+ * Host, X-Forwarded-For, Forwarded and the request URL's own hostname are all attacker-controlled
+ * and are therefore NOT consulted. A deployment that binds a public interface must not be able to
+ * become "local" by sending a header, and `0.0.0.0`, `::`, `localhost` and any hostname are all
+ * treated as NON-loopback on purpose: guessing what a bind address means is how the distinction is
+ * lost.
+ *
+ * Absent metadata means an unknown runtime, which is treated as non-loopback and requires a token.
+ */
+function adminRuntime(options) {
+  const meta = options?.runtime;
+  if (meta && typeof meta === "object") {
+    return { kind: typeof meta.kind === "string" ? meta.kind : "unknown", bindHost: typeof meta.bindHost === "string" ? meta.bindHost : null };
+  }
+  return { kind: "unknown", bindHost: null };
+}
+
+/**
+ * Constant-work token comparison.
+ *
+ * A plain `supplied === expected` leaks the shared prefix length through timing. Both sides are
+ * reduced to a fixed-length digest first, so the comparison cost does not depend on how much of the
+ * token was correct.
+ */
+async function adminTokenMatches(supplied, expected) {
+  if (typeof supplied !== "string" || typeof expected !== "string" || expected.length === 0) return false;
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode("cg-admin-compare"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const [a, b] = await Promise.all([
+    crypto.subtle.sign("HMAC", key, enc.encode(supplied)),
+    crypto.subtle.sign("HMAC", key, enc.encode(expected)),
+  ]);
+  const av = new Uint8Array(a), bv = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < av.length; i++) diff |= av[i] ^ bv[i];
+  return diff === 0;
+}
+
+/** `Authorization: Bearer <token>` ONLY. Query strings, cookies and custom headers are not read. */
+function bearerToken(request) {
+  const raw = request.headers.get("authorization");
+  if (!raw) return null;
+  const m = /^Bearer[ ]+(.+)$/i.exec(raw.trim());
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Resolve whether this request may reach /admin, and with what status.
+ * @returns {Promise<{allowed: boolean, status: number}>} 404 hides the route; 401 says the route
+ * exists but the credential did not match.
+ */
+async function adminAdmission(request, env, options) {
+  // Disabled observability means the route does not exist at all, so it is a 404 rather than a 403:
+  // a 403 would confirm that an admin surface is present.
+  if (!observabilityEnabled(env)) return { allowed: false, status: 404 };
+
+  const { kind, bindHost } = adminRuntime(options);
+  const configured = typeof env?.REDACT_ADMIN_TOKEN === "string" && env.REDACT_ADMIN_TOKEN.length > 0 ? env.REDACT_ADMIN_TOKEN : null;
+
+  // Loopback exemption comes ONLY from adapter metadata, and only for the two literal values. It
+  // applies to the Node adapter; a Worker or Deno deployment has no local bind and therefore never
+  // qualifies, even if a bindHost were somehow supplied.
+  const isNodeAdapter = kind === "node";
+  const loopback = isNodeAdapter && bindHost !== null && ADMIN_LOOPBACK_HOSTS.has(bindHost);
+  if (loopback) return { allowed: true, status: 200 };
+
+  // Every other case needs a token. Without one configured the route is hidden, because exposing it
+  // and answering 401 would advertise an unauthenticated admin surface.
+  if (!configured) return { allowed: false, status: 404 };
+
+  const supplied = bearerToken(request);
+  if (supplied === null) return { allowed: false, status: 401 };
+  const ok = await adminTokenMatches(supplied, configured);
+  return ok ? { allowed: true, status: 200 } : { allowed: false, status: 401 };
+}
+
+/** Minimal, metadata-free acknowledgement. No summary, no ring, no HTML. */
+function adminAck() {
+  return new Response("admin endpoint available\n", {
+    status: 200,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      // An admin surface must not be cached by anything in between.
+      "cache-control": "no-store",
+      // Deliberately NO CORS headers: this route is not for browser cross-origin callers.
+    },
+  });
+}
+
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
   const url=new URL(request.url);
   if (url.pathname === "/" || url.pathname === "/healthz") {
     return new Response(JSON.stringify({ok:true,service:"cosy-redact-gateway",route:"/<flags>$<upstream-url>",flags:ALL_FLAG_LETTERS,defaultAll:true}),{headers:withCors({"content-type":"application/json; charset=utf-8"},corsOrigin)});
+  }
+  if (url.pathname === "/admin") {
+    const admission = await adminAdmission(request, env, options);
+    if (!admission.allowed) {
+      // 404 hides the route; 401 reports a credential failure without echoing the token or
+      // revealing whether it was close.
+      if (admission.status === 401) return new Response(JSON.stringify({ error: { message: "Unauthorized", type: "cosy_redact_gateway_error" } }), { status: 401, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+      return jsonError(404, "Not found");
+    }
+    return adminAck();
   }
   let target;
   try { target=parseProxyTarget(request.url); } catch(e) { return jsonError(400,e.message); }
