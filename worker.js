@@ -3297,6 +3297,9 @@ export class TelemetryStore {
   }
 
   /** Insert a fully-formed metadata record. Returns true when stored. */
+  // `logging` mirrors the observability switch in PR1; a second env var is PR2 scope.
+  static logging = false;
+
   record(rec) {
     if (!rec || typeof rec !== "object") { this.diagnostics.records_dropped_invalid_total++; return false; }
     // CORE enums decide the record's meaning. If any is untrustworthy, store nothing at all.
@@ -3314,6 +3317,11 @@ export class TelemetryStore {
     this.seq++;
     const stored = { schema_version: TELEMETRY_SCHEMA_VERSION, seq: this.seq, ...rec };
     this.recent.push(stored);
+    // Log straight out; never accumulated. Written AFTER the ring push so a logging failure
+    // cannot drop the record.
+    if (TelemetryStore.logging) {
+      try { const line = formatTelemetryLine(stored); if (line) console.error(line); } catch { /* logging must never break a request */ }
+    }
 
     this.counters.requests_total++;
     const redacted = (rec.spans && rec.spans.redact) || 0;
@@ -4729,7 +4737,10 @@ export function __resetTelemetryStore() { TELEMETRY_STORE = null; TELEMETRY_STOR
  * constructed. SSE uses a different pair of fields because its lifecycle is different -- one
  * number meaning two things would make the two incomparable.
  */
-function finalizeNonStream(response, ctx, telemetry) {
+async function finalizeNonStream(responsePromise, ctx, telemetry) {
+  const response = await responsePromise;
+  // `response.status` undefined and pushed a Promise object into the telemetry store -- both a
+  // wrong status and a retained reference to live request state.
   if (telemetry) {
     telemetry.setStatus(response.status);
     telemetry.setOutcome(response.status >= 400 ? "upstream_error" : "forwarded");
@@ -4738,6 +4749,38 @@ function finalizeNonStream(response, ctx, telemetry) {
   }
   return response;
 }
+
+/**
+ * One structured log line per completed request, written straight to stderr.
+ *
+ * Written, not accumulated: nothing is buffered in memory, so logging cannot become a
+ * retention source. Every field is a number, an allowlisted enum, or a hostname -- the record
+ * never carried text and this line is a rendering of that record, so it cannot either.
+ */
+export function formatTelemetryLine(rec) {
+  if (!rec) return null;
+  const kv = (o) => Object.entries(o || {}).filter(([, v]) => v).map(([k, v]) => `${k}:${v}`).join(",");
+  const parts = [
+    `[CRG] seq=${rec.seq}`,
+    `upstream=${rec.upstream || "-"}`,
+    `status=${rec.status}`,
+    `outcome=${rec.outcome}`,
+  ];
+  const s = rec.spans || {};
+  parts.push(`detected=${s.decisions || 0}`, `redacted=${s.redact || 0}`, `preserved=${s.preserve || 0}`);
+  const det = kv(rec.detectors);
+  if (det) parts.push(`detectors=${det}`);
+  const sm = kv(rec.sink_modes);
+  const so = kv(rec.sink_outcomes);
+  if (sm) parts.push(`sink_modes=${sm}`);
+  if (so) parts.push(`sink_outcomes=${so}`);
+  if (rec.limit_reason) parts.push(`limit=${rec.limit_reason}`);
+  if (Number.isFinite(rec.response_ready_ms)) parts.push(`response_ready_ms=${Math.round(rec.response_ready_ms)}`);
+  if (Number.isFinite(rec.stream_duration_ms)) parts.push(`stream_duration_ms=${Math.round(rec.stream_duration_ms)}`);
+  return parts.join(" ");
+}
+
+
 
 
 export async function handleRequest(request, env = {}, options = {}) {
@@ -4775,14 +4818,14 @@ export async function handleRequest(request, env = {}, options = {}) {
   // global ever holds it, so an SSE response that is never consumed becomes garbage rather
   // than a retained pending entry.
   const telemetryOn = observabilityEnabled(env);
+  TelemetryStore.logging = telemetryOn;
   const telemetry = telemetryOn ? new TelemetryAccumulator(getTelemetryStore(env), { upstream: target?.upstream?.hostname || null }) : null;
   if (telemetry) ctx.telemetry = telemetry;
   const headers=filteredRequestHeaders(request.headers);
   let body;
   if (request.method !== "GET" && request.method !== "HEAD") {
     const { bytes, exceeded } = await readBodyCapped(request, maxBody);
-      if (telemetry) { telemetry.setOutcome("rejected_body"); telemetry.setLimit("body_bytes"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); }
-    if (exceeded) return jsonError(413,`Request body exceeds ${maxBody} bytes`);
+    if (exceeded) { if (telemetry) { telemetry.setOutcome("rejected_body"); telemetry.setLimit("body_bytes"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413,`Request body exceeds ${maxBody} bytes`); }
     const ct=request.headers.get("content-type") || "";
     if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
     if (bytes.byteLength) {
@@ -4790,8 +4833,7 @@ export async function handleRequest(request, env = {}, options = {}) {
       try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
       // A payload resource limit, checked before redactJson walks the structure. Refused as 413
       // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
-      if (telemetry) { telemetry.setOutcome("rejected_depth"); telemetry.setLimit("json_depth"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); }
-      if (exceedsJsonDepth(data, maxDepth)) return jsonError(413, `JSON nesting exceeds ${maxDepth}`);
+      if (exceedsJsonDepth(data, maxDepth)) { if (telemetry) { telemetry.setOutcome("rejected_depth"); telemetry.setLimit("json_depth"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413, `JSON nesting exceeds ${maxDepth}`); }
       try {
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
