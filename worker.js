@@ -3204,10 +3204,27 @@ const TELEMETRY_STAT_ENUMS = Object.freeze({
   infraType: null,  // validated against INFRA_TYPE
   parser: null,     // validated against PARSER
 });
+/** Limit reasons this build can emit. `limit_reason` is statistical, so an unknown value is
+ *  dropped and counted rather than rejecting the record. */
+const TELEMETRY_LIMIT_REASONS = new Set([
+  "body_bytes", "json_depth", "reference_work", "redaction_limit", "upstream_depth",
+]);
 const TELEMETRY_CORE_ENUMS = Object.freeze({
   outcome: new Set([
-    "forwarded", "rejected_body", "rejected_depth", "rejected_redaction", "rejected_work",
-    "upstream_error", "stream_error", "client_cancel",
+    // Admission boundary: once the proxy target parses AND the upstream host is admitted, every
+    // terminal path records one of these. Routing and health requests (OPTIONS, /healthz, an
+    // invalid proxy route, a host-allowlist 403) are OUTSIDE telemetry by design.
+    "forwarded",                 // includes a successful forward of an upstream 4xx/5xx
+    "rejected_content_type",     // 415
+    "rejected_json",             // 400, unparseable body
+    "rejected_body",             // 413, byte cap
+    "rejected_depth",            // 413, JSON nesting
+    "rejected_redaction",        // 413, unique-entity cap
+    "rejected_work",             // 413, reference-scan work budget
+    "upstream_error",            // fetch threw: transport failure
+    "upstream_depth",            // 502, upstream response nesting
+    "stream_error",              // SSE terminal error, including the depth guard
+    "client_cancel",
   ]),
   spanAction: new Set(["redact", "preserve"]),
   sinkMode: new Set([SINK_MODE.RESTORE, SINK_MODE.PRESERVE, SINK_MODE.BLOCK]),
@@ -3273,7 +3290,11 @@ class TelemetryRing {
  * total. There is no persistence in v2.1.
  */
 export class TelemetryStore {
-  constructor({ recentCap = TELEMETRY_RECENT_DEFAULT } = {}) {
+  constructor({ recentCap = TELEMETRY_RECENT_DEFAULT, logging = false } = {}) {
+    // INSTANCE configuration, not a class static. A static field meant one request flipping logging
+    // off for every other in-flight request in the process, so an ON request could be silenced by
+    // an OFF one that finished in between.
+    this.logging = logging === true;
     // Explicit rather than `Number(recentCap) || DEFAULT`: that idiom treats an explicit 0 as
     // absent AND lets a negative value through to Math.max, so two different invalid inputs took
     // two different paths. Undefined/NaN -> the default; anything else is clamped to [1, MAX].
@@ -3290,7 +3311,11 @@ export class TelemetryStore {
     };
     // Fixed-key maps. An unknown key is counted and DISCARDED, never inserted.
     this.by_detector = Object.create(null);
-    this.by_action = Object.create(null);
+    // Named by_reason because that is what it accumulates: rec.spans.reasons. The true span-action
+    // aggregate lives in rec.spans as redact/preserve. PR2 has not started, so renaming now costs
+    // nothing and avoids a dashboard whose label means the opposite of its numbers.
+    this.by_reason = Object.create(null);
+    this.by_infra_type = Object.create(null);
     this.by_status = Object.create(null);
     this.by_outcome = Object.create(null);
     this.by_limit = Object.create(null);
@@ -3302,60 +3327,142 @@ export class TelemetryStore {
     this.latency = { count: 0, sum_ms: 0, max_ms: 0 };
   }
 
-  /** Insert a fully-formed metadata record. Returns true when stored. */
-  // `logging` mirrors the observability switch in PR1; a second env var is PR2 scope.
-  static logging = false;
 
+  /**
+   * Sanitize, validate, THEN store. The order is the point.
+   *
+   * The previous version pushed the incoming record into the ring first and filtered the
+   * aggregates afterwards. An unknown `detector` / `reason` / `infraType` / `parser` therefore
+   * never reached a counter map but WAS retained verbatim inside `recent` -- which directly
+   * violates "an unknown statistical value is never retained". The suite missed it because it
+   * scanned `summary()`, and `summary()` does not include `recent`.
+   *
+   * Now: incoming -> sanitize -> validate -> push(SAFE) -> aggregate(SAFE). The ring can only
+   * ever hold allowlisted keys, and the aggregates consume the very object that was stored, so
+   * the two cannot disagree.
+   */
   record(rec) {
-    if (!rec || typeof rec !== "object") { this.diagnostics.records_dropped_invalid_total++; return false; }
-    // CORE enums decide the record's meaning. If any is untrustworthy, store nothing at all.
-    if (!TELEMETRY_CORE_ENUMS.outcome.has(rec.outcome)) { this.diagnostics.records_dropped_invalid_total++; return false; }
-    const sa = rec.spans || {};
-    if (!TELEMETRY_CORE_ENUMS.spanAction.has("redact")) { /* unreachable guard for future edits */ }
-    if (sa.redact !== undefined && !Number.isFinite(sa.redact)) { this.diagnostics.records_dropped_invalid_total++; return false; }
-    for (const [mode, n] of Object.entries(rec.sink_modes || {})) {
-      if (!TELEMETRY_CORE_ENUMS.sinkMode.has(mode) && n > 0) { this.diagnostics.records_dropped_invalid_total++; return false; }
+    const safe = this.sanitize(rec);
+    if (safe === null) return false;
+    this.recent.push(safe);
+    if (this.logging) {
+      try { const line = formatTelemetryLine(safe); if (line) console.error(line); } catch { /* logging must never break a request */ }
     }
-    for (const [oc, n] of Object.entries(rec.sink_outcomes || {})) {
-      if (!TELEMETRY_CORE_ENUMS.sinkOutcome.has(oc) && n > 0) { this.diagnostics.records_dropped_invalid_total++; return false; }
-    }
-
-    this.seq++;
-    const stored = { schema_version: TELEMETRY_SCHEMA_VERSION, seq: this.seq, ...rec };
-    this.recent.push(stored);
-    // Log straight out; never accumulated. Written AFTER the ring push so a logging failure
-    // cannot drop the record.
-    if (TelemetryStore.logging) {
-      try { const line = formatTelemetryLine(stored); if (line) console.error(line); } catch { /* logging must never break a request */ }
-    }
-
-    this.counters.requests_total++;
-    const redacted = (rec.spans && rec.spans.redact) || 0;
-    if (redacted > 0) this.counters.requests_redacted++; else this.counters.requests_clean++;
-    this.counters.entities_total += redacted;
-    this.counters.bytes_redacted_total += (rec.spans && rec.spans.bytes_redacted) || 0;
-
-    this.#bump(this.by_status, String(rec.status));
-    this.#bump(this.by_outcome, rec.outcome);
-    if (rec.limit_reason) this.#bump(this.by_limit, rec.limit_reason);
-    for (const [k, n] of Object.entries(rec.detectors || {})) this.#statEnum(this.by_detector, k, n, "detector");
-    for (const [k, n] of Object.entries(rec.spans?.reasons || {})) this.#statEnum(this.by_action, k, n, "reason");
-    for (const [k, n] of Object.entries(rec.sink_modes || {})) if (n > 0) this.#bump(this.by_sink_mode, k, n);
-    for (const [k, n] of Object.entries(rec.sink_outcomes || {})) if (n > 0) this.#bump(this.by_sink_outcome, k, n);
-    for (const [k, v] of Object.entries(rec.coverage || {})) {
-      if (Object.prototype.hasOwnProperty.call(PARSER, k) || Object.values(PARSER).includes(k)) this.#bump(this.by_coverage_parser, k, v.attempted || 0);
-      else this.diagnostics.dropped_enum_values_total++;
-    }
-    const rms = rec.response_ready_ms;
-    if (Number.isFinite(rms)) {
-      this.latency.count++;
-      this.latency.sum_ms += rms;
-      if (rms > this.latency.max_ms) this.latency.max_ms = rms;
-    }
+    this.aggregate(safe);
     return true;
   }
 
+  /**
+   * Deep safe projection. Returns null when the record as a whole is not trustworthy.
+   *
+   * Unknown STATISTICAL values are dropped HERE, so they are absent from the stored record and
+   * from every aggregate, and their original strings are never written anywhere. Unknown CORE
+   * values reject the entire record, because a record whose meaning is uncertain is worse than
+   * no record at all.
+   */
+  sanitize(rec) {
+    const reject = () => { this.diagnostics.records_dropped_invalid_total++; return null; };
+    if (!rec || typeof rec !== "object") return reject();
+    if (!TELEMETRY_CORE_ENUMS.outcome.has(rec.outcome)) return reject();
+
+    const int = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : null);
+    const s = rec.spans || {};
+    const redact = int(s.redact) ?? 0;
+    const preserve = int(s.preserve) ?? 0;
+    const decisions = int(s.decisions) ?? 0;
+    // The span-action invariant. telemetryProjection() copies only `redact` and `preserve`, so a
+    // FUTURE span action would be silently dropped from the counts rather than noticed. Requiring
+    // the three numbers to agree turns that silent loss into a schema incompatibility.
+    if (decisions !== redact + preserve) return reject();
+
+    const keep = (obj, ok) => {
+      const out = Object.create(null);
+      for (const [k, v] of Object.entries(obj || {})) {
+        const n = int(v);
+        if (n === null || n === 0) continue;
+        if (!ok(k)) { this.diagnostics.dropped_enum_values_total++; continue; }
+        out[k] = n;
+      }
+      return out;
+    };
+    const detectors = keep(s.detectors, (k) => TELEMETRY_DETECTORS.has(k));
+    const reasons = keep(s.reasons, (k) => telemetryReasonKey(k) !== null);
+    const infraTypes = keep(s.infra_types, (k) => Object.prototype.hasOwnProperty.call(INFRA_TYPE, k));
+    const parserKey = (k) => Object.prototype.hasOwnProperty.call(PARSER, k) || Object.values(PARSER).includes(k);
+    const coverage = Object.keys(rec.coverage || {}).length
+      ? Object.fromEntries(Object.entries(rec.coverage).filter(([k]) => {
+          const ok = parserKey(k);
+          if (!ok) this.diagnostics.dropped_enum_values_total++;
+          return ok;
+        }).map(([k, v]) => [k, {
+          attempted: int(v?.attempted) ?? 0, parsed: int(v?.parsed) ?? 0,
+          partial: int(v?.partial) ?? 0, failed: int(v?.failed) ?? 0, bytes: int(v?.bytes) ?? 0,
+        }]))
+      : null;
+
+    const sinkModes = Object.create(null);
+    for (const [k, v] of Object.entries(rec.sink_modes || {})) {
+      const n = int(v);
+      if (n === null || n === 0) continue;
+      if (!TELEMETRY_CORE_ENUMS.sinkMode.has(k)) return reject();
+      sinkModes[k] = n;
+    }
+    const sinkOutcomes = Object.create(null);
+    for (const [k, v] of Object.entries(rec.sink_outcomes || {})) {
+      const n = int(v);
+      if (n === null || n === 0) continue;
+      if (!TELEMETRY_CORE_ENUMS.sinkOutcome.has(k)) return reject();
+      sinkOutcomes[k] = n;
+    }
+    let limit = null;
+    if (rec.limit_reason != null) {
+      if (TELEMETRY_LIMIT_REASONS.has(rec.limit_reason)) limit = rec.limit_reason;
+      else this.diagnostics.dropped_enum_values_total++;
+    }
+
+    this.seq++;
+    return {
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      seq: this.seq,
+      t: Number.isFinite(rec.t) ? rec.t : Date.now(),
+      upstream: typeof rec.upstream === "string" ? rec.upstream : null,
+      status: int(rec.status) ?? 0,
+      outcome: rec.outcome,
+      response_ready_ms: Number.isFinite(rec.response_ready_ms) ? rec.response_ready_ms : null,
+      stream_duration_ms: Number.isFinite(rec.stream_duration_ms) ? rec.stream_duration_ms : null,
+      spans: { decisions, redact, preserve, bytes_redacted: int(s.bytes_redacted) ?? 0, detectors, reasons, infra_types: infraTypes },
+      detectors,
+      coverage,
+      sink_modes: sinkModes,
+      sink_outcomes: sinkOutcomes,
+      limit_reason: limit,
+    };
+  }
+
+  /** Aggregates consume the SAME sanitized object that was stored, so they cannot disagree. */
+  aggregate(safe) {
+    this.counters.requests_total++;
+    if (safe.spans.redact > 0) this.counters.requests_redacted++; else this.counters.requests_clean++;
+    this.counters.entities_total += safe.spans.redact;
+    this.counters.bytes_redacted_total += safe.spans.bytes_redacted;
+    this.#bump(this.by_status, String(safe.status));
+    this.#bump(this.by_outcome, safe.outcome);
+    if (safe.limit_reason) this.#bump(this.by_limit, safe.limit_reason);
+    for (const [k, n] of Object.entries(safe.detectors)) this.#bump(this.by_detector, k, n);
+    for (const [k, n] of Object.entries(safe.spans.reasons)) this.#bump(this.by_reason, k, n);
+    for (const [k, n] of Object.entries(safe.spans.infra_types)) this.#bump(this.by_infra_type, k, n);
+    for (const [k, n] of Object.entries(safe.sink_modes)) this.#bump(this.by_sink_mode, k, n);
+    for (const [k, n] of Object.entries(safe.sink_outcomes)) this.#bump(this.by_sink_outcome, k, n);
+    for (const [k, v] of Object.entries(safe.coverage || {})) this.#bump(this.by_coverage_parser, k, v.attempted);
+    if (Number.isFinite(safe.response_ready_ms)) {
+      this.latency.count++;
+      this.latency.sum_ms += safe.response_ready_ms;
+      if (safe.response_ready_ms > this.latency.max_ms) this.latency.max_ms = safe.response_ready_ms;
+    }
+  }
+
   #bump(map, key, by = 1) { map[key] = (map[key] || 0) + by; }
+
 
   /** Statistical dimension: unknown key -> drop the bucket and count it. The raw value is
    *  never retained, so an unknown string cannot widen the schema. */
@@ -3376,7 +3483,7 @@ export class TelemetryStore {
     return {
       recent: { length: this.recent.length, cap: this.recentCap, within: this.recent.length <= this.recentCap },
       fixed_key_maps: Object.fromEntries(
-        ["by_detector", "by_action", "by_status", "by_outcome", "by_limit", "by_sink_mode", "by_sink_outcome", "by_coverage_parser"]
+        ["by_detector", "by_reason", "by_infra_type", "by_status", "by_outcome", "by_limit", "by_sink_mode", "by_sink_outcome", "by_coverage_parser"]
           .map((k) => [k, Object.keys(this[k]).length])
       ),
       diagnostics: { ...this.diagnostics },
@@ -3390,7 +3497,8 @@ export class TelemetryStore {
       scope: "process/isolate-local; resets on restart or isolate replacement",
       counters: { ...this.counters },
       by_detector: { ...this.by_detector },
-      by_action: { ...this.by_action },
+      by_reason: { ...this.by_reason },
+      by_infra_type: { ...this.by_infra_type },
       by_status: { ...this.by_status },
       by_outcome: { ...this.by_outcome },
       by_limit: { ...this.by_limit },
@@ -4726,9 +4834,15 @@ let TELEMETRY_STORE_CAP = -1;
 
 function getTelemetryStore(env) {
   const cap = telemetryBufferSize(env);
+  const logging = observabilityEnabled(env);
   if (!TELEMETRY_STORE || TELEMETRY_STORE_CAP !== cap) {
-    TELEMETRY_STORE = new TelemetryStore({ recentCap: cap });
+    TELEMETRY_STORE = new TelemetryStore({ recentCap: cap, logging });
     TELEMETRY_STORE_CAP = cap;
+  } else {
+    // Logging is an INSTANCE setting so it can be set here rather than by a request mutating
+    // process-global state. It is a scalar with no per-request meaning, so assigning it is safe;
+    // what was not safe was a class static that any request could flip for every other request.
+    TELEMETRY_STORE.logging = logging;
   }
   return TELEMETRY_STORE;
 }
@@ -4828,7 +4942,6 @@ export async function handleRequest(request, env = {}, options = {}) {
   // global ever holds it, so an SSE response that is never consumed becomes garbage rather
   // than a retained pending entry.
   const telemetryOn = observabilityEnabled(env);
-  TelemetryStore.logging = telemetryOn;
   const telemetry = telemetryOn ? new TelemetryAccumulator(getTelemetryStore(env), { upstream: target?.upstream?.hostname || null }) : null;
   if (telemetry) ctx.telemetry = telemetry;
   const headers=filteredRequestHeaders(request.headers);
