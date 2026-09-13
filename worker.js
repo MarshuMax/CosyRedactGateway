@@ -5050,7 +5050,19 @@ export async function handleRequest(request, env = {}, options = {}) {
   const fetchImpl=options.fetchImpl || fetch;
   let upstreamResponse;
   try { upstreamResponse=await fetchImpl(target.upstream.toString(),{method:request.method,headers,body,redirect:"manual"}); }
-  catch(e) { if (telemetry) { telemetry.setOutcome("upstream_error"); telemetry.setStatus(502); telemetry.markResponseReady(); telemetry.finalizeExactlyOnce(); } return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
+  catch(e) {
+    // Construct FIRST so response_ready_ms names the moment the downstream Response is ready, the
+    // same rule the other terminal paths follow. Marking before the Response existed made this path
+    // the one place where the documented semantics did not literally hold.
+    const response = jsonError(502, `Upstream fetch failed: ${e?.message || e}`);
+    if (telemetry) {
+      telemetry.setOutcome("upstream_error");
+      telemetry.setStatus(response.status);
+      telemetry.markResponseReady();
+      telemetry.finalizeExactlyOnce();
+    }
+    return response;
+  }
 
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
