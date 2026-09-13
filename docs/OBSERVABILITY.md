@@ -198,13 +198,13 @@ What PR1 established, and the evidence behind each:
 | A telemetry fault cannot change a status, body or security outcome | four fault injections, each comparing OFF against faulted-ON; the sink case asserts the security verdict, not just absence of a crash |
 | The recent ring is bounded | `recent.length === cap`, `within === true` after 10,000 requests against a cap of 100 |
 | Fixed-key maps do not grow with request count | every map `<= 1` key after the same soak |
-| No post-cap growth | B (ring full) to C (10,000 requests) delta: RSS -1.94 MiB, heap +0.12 MiB, post-GC heap 9.0 -> 9.1 MiB |
+| No sustained post-cap growth signal | B (ring full) to C (10,000 requests) delta: RSS -1.94 MiB, heap +0.12 MiB, post-GC heap 9.0 -> 9.1 MiB |
 
 Observability overhead, measured on identical workloads, is **reported and not gated**: the ON run
 measured slightly faster (throughput ratio 1.0737, latency ratio 0.9313), which is JIT and execution
 order rather than a speed-up, since the ON run executes second against warmed code. The +22.75 MiB RSS
 difference between the two runs is **start-up**, not a resident telemetry cost -- the post-cap phase
-shows no growth at all, which is precisely why that phase is measured separately from process start.
+shows no evidence of request-count-proportional growth, which is precisely why that phase is measured separately from process start.
 None of these numbers is a pass/fail threshold; they depend on V8, GC timing and the machine.
 
 ### Test asset layout
