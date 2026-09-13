@@ -3562,7 +3562,22 @@ export class TelemetryAccumulator {
   setStatus(s) { this.status = s; }
   setLimit(reason) { this.limitReason = reason; }
   setOutcome(o) { this.outcome = o; }
-  setResponseReady(ms) { this.responseReadyMs = ms; }
+  /**
+   * Mark the moment the downstream Response is ready to return, computed HERE from the
+   * accumulator's own admission timestamp.
+   *
+   * Semantics, fixed once: elapsed milliseconds from telemetry admission until the downstream
+   * Response is ready, INCLUDING the upstream wait. It is deliberately not described as "gateway
+   * processing time", which would be wrong.
+   *
+   * The accumulator owns the start point so the several terminal paths cannot each pick their own
+   * and produce incomparable numbers. Idempotent: the first mark wins, so a later call cannot move
+   * it.
+   */
+  markResponseReady() {
+    if (this.responseReadyMs !== null) return;
+    this.responseReadyMs = Math.max(0, Date.now() - this.meta.t);
+  }
 
   /** Idempotent. A stream can be cancelled after it closed, and both paths call this. */
   finalizeExactlyOnce(streamOutcome, durationMs) {
@@ -4643,7 +4658,6 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null, tel
   const finalizeStream = (outcome) => {
     if (!telemetry) return;
     telemetry.setOutcome(outcome);
-    telemetry.onSpanProjection(ctx.telemetryProjection());
     telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt);
   };
   const reader=body.getReader();
@@ -4881,7 +4895,10 @@ async function finalizeNonStream(responsePromise, ctx, telemetry) {
     // response-depth 502 also reaches this line, so it currently records `forwarded` too. Item 8
     // gives it `upstream_depth`. Stating the boundary keeps each commit's proof scope exact.
     telemetry.setOutcome("forwarded");
-    telemetry.onSpanProjection(ctx.telemetryProjection());
+    // No second onSpanProjection()/onCoverage() here: the request-stage snapshot already ran, and
+    // taking the same data at two lifecycle points would let them disagree without either being
+    // obviously wrong.
+    telemetry.markResponseReady();
     telemetry.finalizeExactlyOnce();
   }
   return response;
@@ -4994,6 +5011,14 @@ export async function handleRequest(request, env = {}, options = {}) {
         }
         throw e;
       }
+      // SNAPSHOT HERE, right after request redaction succeeded and before fetchImpl().
+      // Taking it only at response completion meant a request whose upstream fetch THREW reported
+      // redacted=0 / coverage=null -- telemetry asserting that no redaction had happened when one
+      // had. The snapshot is what the request stage actually did, independent of how it ended.
+      if (telemetry) {
+        telemetry.onSpanProjection(ctx.telemetryProjection());
+        telemetry.onCoverage(ctx.coverageSummary().byParser);
+      }
       body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
     } else body="";
   }
@@ -5001,7 +5026,7 @@ export async function handleRequest(request, env = {}, options = {}) {
   const fetchImpl=options.fetchImpl || fetch;
   let upstreamResponse;
   try { upstreamResponse=await fetchImpl(target.upstream.toString(),{method:request.method,headers,body,redirect:"manual"}); }
-  catch(e) { if (telemetry) { telemetry.setOutcome("upstream_error"); telemetry.setStatus(502); telemetry.finalizeExactlyOnce(); } return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
+  catch(e) { if (telemetry) { telemetry.setOutcome("upstream_error"); telemetry.setStatus(502); telemetry.markResponseReady(); telemetry.finalizeExactlyOnce(); } return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
 
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
@@ -5011,6 +5036,10 @@ export async function handleRequest(request, env = {}, options = {}) {
     // a stream error and the offending event is never emitted. It must NOT fall back to
     // assistant_text: that is the fail-open this guard exists to prevent.
     const t0 = Date.now();
+    // Both latency fields are meaningful for SSE and neither is null: response_ready_ms is the
+    // initial Response becoming returnable (including the upstream wait), and stream_duration_ms is
+    // the body's own lifetime, filled at close/error/cancel. They answer different questions.
+    if (telemetry) telemetry.markResponseReady();
     return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0 }),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
   }
   return finalizeNonStream(restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth), ctx, telemetry);

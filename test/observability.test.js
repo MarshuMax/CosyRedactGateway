@@ -540,3 +540,76 @@ test("observability: the two limit classes never report a contradictory pair [GR
       `${label}: contradictory pair outcome=${rec.outcome} limit_reason=${rec.limit_reason}`);
   }
 });
+
+// =====================================================================================
+// item 5 -- latency wiring and coverage snapshot
+// =====================================================================================
+
+const sseUpstream = async () => {
+  const ev = (s) => `event: response.output_text.delta${NL}data: ${JSON.stringify({ type: "response.output_text.delta", delta: s })}${NL}${NL}`;
+  return new Response(ev("hello") + `data: [DONE]${NL}${NL}`, { headers: { "content-type": "text/event-stream" } });
+};
+
+test("observability: non-stream records a finite response_ready_ms and a null stream_duration_ms [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  await (await call({ content: "hello" })).text();
+  const rec = __storeSummary().recent;
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0, `rrm=${rec.response_ready_ms}`);
+  assert.equal(rec.stream_duration_ms, null, "a non-stream response has no stream lifetime");
+});
+
+test("observability: SSE fills BOTH latency fields, and they mean different things [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  await (await call({ path: "/v1/responses", body: JSON.stringify({ model: "g", stream: true, input: `PW=${SECRET}` }), fetchImpl: sseUpstream })).text();
+  const rec = __storeSummary().recent;
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0, "response_ready_ms must be filled for SSE too, not left null");
+  assert.ok(Number.isFinite(rec.stream_duration_ms) && rec.stream_duration_ms >= 0, "the stream lifetime is filled at close");
+});
+
+test("observability: coverage comes from the real parser path, with canonical buckets only [GREEN NOW]", async () => {
+  // NOT a hand-fed onCoverage({env:...}). This runs handleRequest -> redactJson -> parser ->
+  // ctx.coverageSummary() -> telemetry, so the bucket proves the wiring rather than the call.
+  __resetTelemetryStore();
+  await (await call({ content: "DB_PASSWORD=wJalrXUtnFEMI12345678" })).text();
+  const rec = __storeSummary().recent;
+  assert.ok(rec.coverage, "a structured request must produce coverage");
+  const keys = Object.keys(rec.coverage);
+  assert.ok(keys.length >= 1, `expected at least one parser bucket, got ${JSON.stringify(rec.coverage)}`);
+  for (const k of keys) {
+    // canonical parser VALUE, not a summary field. coverageSummary() also carries calls /
+    // attempted_regions / ... at the top level, and passing the whole object would have made the
+    // sanitizer treat those as parser names.
+    assert.ok(["env", "shell", "yaml", "header", "url"].includes(k), `non-canonical parser bucket ${k}`);
+    assert.deepEqual(Object.keys(rec.coverage[k]).sort(), ["attempted", "bytes", "failed", "parsed", "partial"],
+      `bucket ${k} must carry only the five counters`);
+  }
+});
+
+test("observability: a redacted request whose fetch throws still reports its redaction [GREEN NOW]", async () => {
+  // The reason the snapshot runs at the REQUEST stage rather than at response completion. Taking it
+  // only at completion made a request whose upstream fetch threw report redacted=0 / coverage=null
+  // -- telemetry asserting no redaction had happened when one had.
+  __resetTelemetryStore();
+  await (await call({ content: `PW=${SECRET}`, fetchImpl: async () => { throw new Error("ECONNREFUSED"); } })).text();
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "upstream_error");
+  assert.ok(rec.spans.redact > 0, `redaction happened before the fetch failed; got ${rec.spans.redact}`);
+  assert.ok(Object.keys(rec.detectors).length > 0, "a detector bucket must exist");
+  assert.ok(rec.coverage, "and coverage must survive the failed fetch");
+  // And it must still carry a finite latency: this exit records telemetry, so it must be comparable
+  // with the others rather than having a null that silently drops out of the aggregates.
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0, `rrm=${rec.response_ready_ms}`);
+});
+
+test("observability: a completed record feeds the latency aggregates [GREEN NOW]", async () => {
+  const store = new TelemetryStore();
+  assert.equal(store.latency.count, 0);
+  store.record({ t: 0, upstream: "h", status: 200, outcome: "forwarded", response_ready_ms: 12,
+    spans: { decisions: 0, redact: 0, preserve: 0, bytes_redacted: 0, detectors: {}, reasons: {}, infra_types: {} },
+    detectors: {}, coverage: null, sink_modes: {}, sink_outcomes: {}, limit_reason: null });
+  assert.equal(store.latency.count, 1);
+  assert.equal(store.latency.sum_ms, 12);
+  assert.ok(store.latency.max_ms >= 0);
+  // No wall-clock threshold anywhere: asserting a millisecond value or sleeping would make this
+  // flaky on a loaded machine.
+});

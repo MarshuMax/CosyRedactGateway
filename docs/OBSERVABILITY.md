@@ -34,8 +34,8 @@ The record has a **closed schema**:
 | `t`, `seq` | Timestamp; monotonic per-process sequence. |
 | `upstream` | Hostname only. No path, no query. |
 | `status`, `outcome` | See the outcome list below. |
-| `response_ready_ms` | Non-stream: time until the Response was constructed. |
-| `stream_duration_ms` | SSE: filled at close / error / cancel. `null` for non-stream. |
+| `response_ready_ms` | Elapsed from telemetry admission until the downstream Response is ready to return, **including the upstream wait**. Filled on every recorded path. Idempotent: the first mark wins. |
+| `stream_duration_ms` | SSE only: the body's lifetime, filled at close / error / cancel. `null` for non-stream. |
 | `spans` | `{decisions, redact, preserve, bytes_redacted, detectors, reasons, infra_types}` |
 | `detectors` | detector name -> count |
 | `sink_modes` | `{restore, preserve, block}` -- the **policy** |
@@ -112,9 +112,21 @@ the dropped-value counters, so the bound is inspectable rather than assumed.
 
 ## Latency is two fields
 
-`response_ready_ms` measures the gateway's own work up to constructing the Response.
-`stream_duration_ms` measures the SSE lifetime and is filled at close, error or cancel. One
-number meaning both would make the two incomparable.
+`response_ready_ms` is elapsed time from **telemetry admission until the downstream Response is
+ready to return**, and it **includes the upstream wait**. It is deliberately not described as
+gateway processing time.
+
+`stream_duration_ms` is the SSE body's own lifetime, filled at close, error or cancel.
+
+An SSE record carries **both**, and neither is null: one answers "how long until we could answer",
+the other "how long the stream then lived". Collapsing them into one number would make the two
+incomparable.
+
+The accumulator owns the start point and computes the delta itself, so the several terminal paths
+cannot each pick their own origin and produce numbers that look comparable but are not.
+`coverage` is snapshotted right after request redaction succeeds and **before** the upstream fetch,
+so a request whose fetch later fails still reports the redaction and parser coverage it really had
+rather than reporting zero.
 
 ## Scope: this is not a global metric
 
