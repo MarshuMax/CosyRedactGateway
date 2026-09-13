@@ -409,15 +409,24 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     // unclaimed one: the outer DLP is where the plaintext would appear, and this layer
     // cannot resolve it, so delivering it as an operand is not honest either.
     if (OPERAND_SINKS.includes(sink.kind) && hasUnknownProtectedToken(text, ctx, registry)) {
+      if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, true, false);
       return { text: BLOCKED_OPERAND, mode, blocked: true };
     }
-    return { text, mode, blocked: false };
+    // PRESERVE never substitutes, so the outcome is `preserved` whatever the mode says.
+    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
+    return { text, mode, blocked: false, changed: false };
   }
   if (mode === SINK_MODE.BLOCK) {
     // Sensitive sink: an unresolvable operand is refused rather than forwarded, because a
     // shell, an egress call, a database or an email would receive a token it cannot use.
-    if (hasUnknownProtectedToken(text, ctx, registry)) return { text: BLOCKED_OPERAND, mode, blocked: true };
-    return { text, mode, blocked: false };
+    if (hasUnknownProtectedToken(text, ctx, registry)) {
+      if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, true, false);
+      return { text: BLOCKED_OPERAND, mode, blocked: true };
+    }
+    // A BLOCK channel with nothing to refuse delivered the text as-is: mode BLOCK, outcome
+    // `preserved`. Conflating the two is exactly the confusion this split prevents.
+    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
+    return { text, mode, blocked: false, changed: false };
   }
   // RESTORE resolves only what this layer owns; restoreText leaves everything else
   // untouched, so a FOREIGN_REGISTERED token is preserved here too. Trusted does not mean
@@ -426,7 +435,17 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     registry = ctx.foreignRegistry;
   }
   void registry;
-  return { text: ctx.restoreText(text), mode, blocked: false };
+    const out = ctx.restoreText(text);
+    // `changed` is computed HERE, where both input and output are already in hand, so the
+    // plaintext comparison never crosses into telemetry -- only the boolean does.
+    //
+    // Why it matters: mode RESTORE does NOT imply anything was resolved. A RESTORE channel that
+    // found no OWN token delivers the text unchanged, and calling that `restored` would overstate
+    // what the gateway did. classifyRestore() already draws this distinction from
+    // `applied.text !== text`; this is the same rule, evaluated once, where both strings exist.
+    const changed = out !== text;
+    if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, changed);
+      return { text: out, mode, blocked: false, changed };
 }
 
 export function classifyRestore({ ctx, text, sink = { kind: SINK_KIND.ASSISTANT_TEXT }, registry = null, trusted = null }) {
@@ -3156,6 +3175,307 @@ export function findSensitiveSpans(text, flags, deps = {}) {
 }
 
 export class RedactionLimitError extends Error {}
+// =====================================================================================
+// v2.1 observability -- telemetry CORE only. The /admin endpoint and its UI are PR2.
+//
+// Hard constraint: no plaintext, no tokens, no bodies ever reach these structures. That is
+// enforced structurally rather than by scanning: the builder does not ACCEPT text, and the
+// only inputs are a safe projection of counts and an allowlisted enum set.
+// =====================================================================================
+
+/** Telemetry schema version. Deliberately NOT the application version: a record schema and a
+ *  build identifier are different things, and hardcoding a release here would drift the moment
+ *  the next release ships. */
+export const TELEMETRY_SCHEMA_VERSION = 1;
+
+/** Default and hard maximum for the recent-request ring. The hard cap is not configurable past
+ *  this value, so no deployment can turn the ring back into an unbounded structure. */
+export const TELEMETRY_RECENT_DEFAULT = 500;
+export const TELEMETRY_RECENT_MAX = 2000;
+
+/**
+ * Enum allowlists. A value outside these sets is either dropped (statistical dimensions, which
+ * must not let an unknown string widen the schema) or invalidates the whole record (the enums
+ * that decide what the record MEANS -- a half-trustworthy record is worse than no record).
+ */
+const TELEMETRY_STAT_ENUMS = Object.freeze({
+  detector: null,   // validated against the detector name set built below
+  reason: null,     // prefix-validated: reasons are templated (`profile-redact:X`)
+  infraType: null,  // validated against INFRA_TYPE
+  parser: null,     // validated against PARSER
+});
+const TELEMETRY_CORE_ENUMS = Object.freeze({
+  outcome: new Set([
+    "forwarded", "rejected_body", "rejected_depth", "rejected_redaction", "rejected_work",
+    "upstream_error", "stream_error", "client_cancel",
+  ]),
+  spanAction: new Set(["redact", "preserve"]),
+  sinkMode: new Set([SINK_MODE.RESTORE, SINK_MODE.PRESERVE, SINK_MODE.BLOCK]),
+  sinkOutcome: new Set(["restored", "preserved", "blocked"]),
+});
+
+/** The detector names this build can emit. Seeded from the entity classes plus the detector
+ *  tags the redaction path actually uses, so a NEW detector is dropped rather than admitted. */
+const TELEMETRY_DETECTORS = new Set([
+  "gitleaks", "secret", "email", "phone", "identity", "bank", "entropy", "binding",
+  "highEntropy", "structuredContext", "reference", "infra",
+]);
+
+/** Reason strings are templated (`infra:SPAN_ID`, `profile-redact:X`). Validate the PREFIX and
+ *  the tail against allowlists so a future free-text reason cannot smuggle content in. */
+function telemetryReasonKey(reason) {
+  if (typeof reason !== "string") return null;
+  if (reason === "hard-secret" || reason === "default") return reason;
+  const at = reason.indexOf(":");
+  if (at < 0) return null;
+  const head = reason.slice(0, at);
+  const tail = reason.slice(at + 1);
+  const heads = new Set(["infra", "infra-ambiguous", "profile-redact", "profile-preserve"]);
+  if (!heads.has(head)) return null;
+  if (Object.prototype.hasOwnProperty.call(INFRA_TYPE, tail)) return `${head}:${tail}`;
+  return null;
+}
+
+/**
+ * Fixed-capacity ring. Overwrites the oldest entry and NEVER grows. This exists because the
+ * R3.6 soak's apparent gateway memory leak turned out to be an unbounded `arr.push` in the
+ * measurement harness itself; the same mistake is not repeated in production.
+ */
+class TelemetryRing {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.buf = new Array(capacity);
+    this.n = 0;
+    this.head = 0;
+  }
+  push(v) {
+    this.buf[this.head] = v;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.n < this.capacity) this.n++;
+  }
+  get length() { return this.n; }
+  /** Newest-first, bounded by the current length. */
+  toArray() {
+    const out = [];
+    const start = this.n < this.capacity ? 0 : this.head;
+    for (let k = this.n - 1; k >= 0; k--) out.push(this.buf[(start + k) % this.capacity]);
+    return out;
+  }
+  clear() { this.buf = new Array(this.capacity); this.n = 0; this.head = 0; }
+}
+
+/**
+ * The process/isolate-local telemetry store.
+ *
+ * Scope, stated so no UI can imply otherwise: this holds counters for THE CURRENT PROCESS on
+ * Node, THE CURRENT ISOLATE on Cloudflare, and the current runtime on Deno. A restart or an
+ * isolate replacement resets it. On Cloudflare with several isolates this is NOT a deployment
+ * total. There is no persistence in v2.1.
+ */
+export class TelemetryStore {
+  constructor({ recentCap = TELEMETRY_RECENT_DEFAULT } = {}) {
+    const cap = Math.max(1, Math.min(Number(recentCap) || TELEMETRY_RECENT_DEFAULT, TELEMETRY_RECENT_MAX));
+    this.recentCap = cap;
+    this.recent = new TelemetryRing(cap);
+    this.seq = 0;
+    this.counters = {
+      requests_total: 0, requests_redacted: 0, requests_clean: 0,
+      entities_total: 0, bytes_redacted_total: 0,
+    };
+    // Fixed-key maps. An unknown key is counted and DISCARDED, never inserted.
+    this.by_detector = Object.create(null);
+    this.by_action = Object.create(null);
+    this.by_status = Object.create(null);
+    this.by_outcome = Object.create(null);
+    this.by_limit = Object.create(null);
+    this.by_sink_mode = Object.create(null);
+    this.by_sink_outcome = Object.create(null);
+    this.by_coverage_parser = Object.create(null);
+    // Diagnostics: counts only. The dropped VALUES are never retained.
+    this.diagnostics = { dropped_enum_values_total: 0, records_dropped_invalid_total: 0 };
+    this.latency = { count: 0, sum_ms: 0, max_ms: 0 };
+  }
+
+  /** Insert a fully-formed metadata record. Returns true when stored. */
+  record(rec) {
+    if (!rec || typeof rec !== "object") { this.diagnostics.records_dropped_invalid_total++; return false; }
+    // CORE enums decide the record's meaning. If any is untrustworthy, store nothing at all.
+    if (!TELEMETRY_CORE_ENUMS.outcome.has(rec.outcome)) { this.diagnostics.records_dropped_invalid_total++; return false; }
+    const sa = rec.spans || {};
+    if (!TELEMETRY_CORE_ENUMS.spanAction.has("redact")) { /* unreachable guard for future edits */ }
+    if (sa.redact !== undefined && !Number.isFinite(sa.redact)) { this.diagnostics.records_dropped_invalid_total++; return false; }
+    for (const [mode, n] of Object.entries(rec.sink_modes || {})) {
+      if (!TELEMETRY_CORE_ENUMS.sinkMode.has(mode) && n > 0) { this.diagnostics.records_dropped_invalid_total++; return false; }
+    }
+    for (const [oc, n] of Object.entries(rec.sink_outcomes || {})) {
+      if (!TELEMETRY_CORE_ENUMS.sinkOutcome.has(oc) && n > 0) { this.diagnostics.records_dropped_invalid_total++; return false; }
+    }
+
+    this.seq++;
+    const stored = { schema_version: TELEMETRY_SCHEMA_VERSION, seq: this.seq, ...rec };
+    this.recent.push(stored);
+
+    this.counters.requests_total++;
+    const redacted = (rec.spans && rec.spans.redact) || 0;
+    if (redacted > 0) this.counters.requests_redacted++; else this.counters.requests_clean++;
+    this.counters.entities_total += redacted;
+    this.counters.bytes_redacted_total += (rec.spans && rec.spans.bytes_redacted) || 0;
+
+    this.#bump(this.by_status, String(rec.status));
+    this.#bump(this.by_outcome, rec.outcome);
+    if (rec.limit_reason) this.#bump(this.by_limit, rec.limit_reason);
+    for (const [k, n] of Object.entries(rec.detectors || {})) this.#statEnum(this.by_detector, k, n, "detector");
+    for (const [k, n] of Object.entries(rec.spans?.reasons || {})) this.#statEnum(this.by_action, k, n, "reason");
+    for (const [k, n] of Object.entries(rec.sink_modes || {})) if (n > 0) this.#bump(this.by_sink_mode, k, n);
+    for (const [k, n] of Object.entries(rec.sink_outcomes || {})) if (n > 0) this.#bump(this.by_sink_outcome, k, n);
+    for (const [k, v] of Object.entries(rec.coverage || {})) {
+      if (Object.prototype.hasOwnProperty.call(PARSER, k) || Object.values(PARSER).includes(k)) this.#bump(this.by_coverage_parser, k, v.attempted || 0);
+      else this.diagnostics.dropped_enum_values_total++;
+    }
+    const rms = rec.response_ready_ms;
+    if (Number.isFinite(rms)) {
+      this.latency.count++;
+      this.latency.sum_ms += rms;
+      if (rms > this.latency.max_ms) this.latency.max_ms = rms;
+    }
+    return true;
+  }
+
+  #bump(map, key, by = 1) { map[key] = (map[key] || 0) + by; }
+
+  /** Statistical dimension: unknown key -> drop the bucket and count it. The raw value is
+   *  never retained, so an unknown string cannot widen the schema. */
+  #statEnum(map, key, n, kind) {
+    if (!Number.isFinite(n) || n <= 0) return;
+    let ok;
+    if (kind === "detector") ok = TELEMETRY_DETECTORS.has(key);
+    else if (kind === "reason") ok = telemetryReasonKey(key) !== null;
+    else ok = false;
+    if (!ok) { this.diagnostics.dropped_enum_values_total++; return; }
+    const k2 = kind === "reason" ? telemetryReasonKey(key) : key;
+    map[k2] = (map[k2] || 0) + n;
+  }
+
+  /** Retention self-report. During the R3.6 work an unbounded structure looked exactly like a
+   *  cheap one until it was measured; this makes the bound visible instead. */
+  retentionReport() {
+    return {
+      recent: { length: this.recent.length, cap: this.recentCap, within: this.recent.length <= this.recentCap },
+      fixed_key_maps: Object.fromEntries(
+        ["by_detector", "by_action", "by_status", "by_outcome", "by_limit", "by_sink_mode", "by_sink_outcome", "by_coverage_parser"]
+          .map((k) => [k, Object.keys(this[k]).length])
+      ),
+      diagnostics: { ...this.diagnostics },
+      latency: { ...this.latency },
+    };
+  }
+
+  summary() {
+    return {
+      schema_version: TELEMETRY_SCHEMA_VERSION,
+      scope: "process/isolate-local; resets on restart or isolate replacement",
+      counters: { ...this.counters },
+      by_detector: { ...this.by_detector },
+      by_action: { ...this.by_action },
+      by_status: { ...this.by_status },
+      by_outcome: { ...this.by_outcome },
+      by_limit: { ...this.by_limit },
+      by_sink_mode: { ...this.by_sink_mode },
+      by_sink_outcome: { ...this.by_sink_outcome },
+      by_coverage_parser: { ...this.by_coverage_parser },
+      latency: { ...this.latency },
+      retention: this.retentionReport(),
+    };
+  }
+}
+
+/**
+ * Request-local accumulator. Holds counters only -- no ctx, no Response, no stream, no span
+ * rows, no text. It is owned by the request (or by the stream it was created for) and becomes
+ * garbage as soon as that owner is, which is what keeps an unconsumed SSE response from becoming
+ * a retention leak.
+ */
+export class TelemetryAccumulator {
+  constructor(store, meta = {}) {
+    this.store = store;
+    this.meta = { upstream: meta.upstream || null, t: Date.now() };
+    this.responseReadyMs = null;
+    this.streamDurationMs = null;
+    this.outcome = null;
+    this.status = 0;
+    this.limitReason = null;
+    this.spans = null;
+    this.sinkModes = Object.create(null);
+    this.sinkOutcomes = Object.create(null);
+    this.coverage = null;
+    this.finalized = false;
+  }
+
+  /** Safe projection: counts only. `rows` is deliberately NOT accepted. */
+  onSpanProjection(proj) {
+    if (!proj) return;
+    this.spans = {
+      decisions: proj.decisions || 0,
+      redact: (proj.actionCounts && proj.actionCounts.redact) || 0,
+      preserve: (proj.actionCounts && proj.actionCounts.preserve) || 0,
+      bytes_redacted: (proj.byteCounts && proj.byteCounts.redact) || 0,
+      detectors: { ...(proj.detectorCounts || {}) },
+      reasons: { ...(proj.reasonCounts || {}) },
+      infra_types: { ...(proj.infraTypeCounts || {}) },
+    };
+  }
+
+  /** The ONLY sink hook. Receives three scalars; the text comparison already happened inside
+   *  applySinkPolicy, so no text or token ever crosses this boundary. */
+  onSinkEvent(mode, blocked, changed) {
+    const m = mode;
+    this.sinkModes[m] = (this.sinkModes[m] || 0) + 1;
+    const outcome = blocked ? "blocked" : (mode === SINK_MODE.RESTORE && changed ? "restored" : "preserved");
+    this.sinkOutcomes[outcome] = (this.sinkOutcomes[outcome] || 0) + 1;
+  }
+
+  onCoverage(summary) { this.coverage = summary || null; }
+  setStatus(s) { this.status = s; }
+  setLimit(reason) { this.limitReason = reason; }
+  setOutcome(o) { this.outcome = o; }
+  setResponseReady(ms) { this.responseReadyMs = ms; }
+
+  /** Idempotent. A stream can be cancelled after it closed, and both paths call this. */
+  finalizeExactlyOnce(streamOutcome, durationMs) {
+    if (this.finalized) return false;
+    this.finalized = true;
+    if (streamOutcome) this.outcome = streamOutcome;
+    if (Number.isFinite(durationMs)) this.streamDurationMs = durationMs;
+    if (!this.outcome) return false;
+    return this.store.record({
+      t: this.meta.t,
+      upstream: this.meta.upstream,
+      status: this.status,
+      outcome: this.outcome,
+      response_ready_ms: this.responseReadyMs,
+      stream_duration_ms: this.streamDurationMs,
+      spans: this.spans || { decisions: 0, redact: 0, preserve: 0, bytes_redacted: 0, detectors: {}, reasons: {}, infra_types: {} },
+      detectors: (this.spans && this.spans.detectors) || {},
+      coverage: this.coverage,
+      sink_modes: { ...this.sinkModes },
+      sink_outcomes: { ...this.sinkOutcomes },
+      limit_reason: this.limitReason,
+    });
+  }
+}
+
+/** Observability is OFF unless explicitly enabled. Every runtime behaves the same way. */
+export function observabilityEnabled(env) {
+  return String(env?.REDACT_OBSERVABILITY ?? "") === "1";
+}
+
+export function telemetryBufferSize(env) {
+  const n = Number(env?.REDACT_OBSERVABILITY_BUFFER);
+  if (!Number.isFinite(n) || n <= 0) return TELEMETRY_RECENT_DEFAULT;
+  return Math.max(1, Math.min(Math.floor(n), TELEMETRY_RECENT_MAX));
+}
+
+
 
 /**
  * The reference scanner exceeded its deterministic work budget.
@@ -3239,6 +3559,9 @@ export class RedactionContext {
     this.entityLedger = new EntityLedger();
     // Per-span policy decisions, for telemetry. Records the action and WHY, which is what
     // makes a preserve auditable rather than invisible.
+    // Telemetry sink for this request. Null unless observability is enabled, so the disabled path
+    // has no object to write into and cannot accumulate anything at all.
+    this.telemetry = null;
     this.spanActions = [];
     // Eligibility for protected spans: a token is protected only if this request
     // minted or registered it. Shape alone is
@@ -3401,6 +3724,35 @@ export class RedactionContext {
     }
     return out + text.slice(at);
   }
+  /**
+   * SAFE PROJECTION for telemetry: counts only.
+   *
+   * `policySummary()` returns `rows: this.spanActions` and that array is deliberately NOT
+   * forwarded. Telemetry has no use for per-span detail, and handing it over would mean a field
+   * added to a row later silently widens the telemetry surface. Nothing returned here is a
+   * reference to a live structure -- every value is a copied scalar or count.
+   */
+  telemetryProjection() {
+    const actionCounts = Object.create(null);
+    const byteCounts = Object.create(null);
+    const detectorCounts = Object.create(null);
+    const reasonCounts = Object.create(null);
+    const infraTypeCounts = Object.create(null);
+    for (const row of this.spanActions) {
+      const a = row.action;
+      actionCounts[a] = (actionCounts[a] || 0) + 1;
+      byteCounts[a] = (byteCounts[a] || 0) + (row.bytes || 0);
+      if (row.detector) detectorCounts[row.detector] = (detectorCounts[row.detector] || 0) + 1;
+      if (row.reason) reasonCounts[row.reason] = (reasonCounts[row.reason] || 0) + 1;
+      if (row.infraType) infraTypeCounts[row.infraType] = (infraTypeCounts[row.infraType] || 0) + 1;
+    }
+    return {
+      decisions: this.spanActions.length,
+      actionCounts, byteCounts, detectorCounts, reasonCounts, infraTypeCounts,
+    };
+  }
+
+
   /** Rollup of the per-span policy decisions taken in this request. */
   policySummary() {
     const byAction = {};
@@ -4156,7 +4508,20 @@ export function guardSseDepth(body, maxDepth = MAX_JSON_DEPTH) {
   });
 }
 
-export function restoreSseStream(body, ctx, trusted = null, registry = null) {
+export function restoreSseStream(body, ctx, trusted = null, registry = null, telemetryOpts = null) {
+  // Telemetry for a STREAM lives for as long as the stream does. It is reachable only from this
+  // closure, never from a global map, so a response that is neither consumed nor cancelled becomes
+  // garbage instead of a retained pending entry. An unconsumed, uncancelled SSE response therefore
+  // produces NO record -- an accepted, documented boundary rather than a completion hook we cannot
+  // honestly guarantee.
+  const telemetry = telemetryOpts?.telemetry || null;
+  const streamStartedAt = telemetryOpts?.startedAt || Date.now();
+  const finalizeStream = (outcome) => {
+    if (!telemetry) return;
+    telemetry.setOutcome(outcome);
+    telemetry.onSpanProjection(ctx.telemetryProjection());
+    telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt);
+  };
   const reader=body.getReader();
   const decoder=new TextDecoder();
   const encoder=new TextEncoder();
@@ -4192,6 +4557,7 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null) {
               const final=restorer.finish();
               if (final) { controller.enqueue(encoder.encode(final)); return; }
             }
+            finalizeStream("forwarded");
             controller.close();
             return;
           }
@@ -4207,11 +4573,12 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null) {
           }
         }
       } catch (e) {
+        finalizeStream("stream_error");
         controller.error(e);
         try { await reader.cancel(e); } catch {}
       }
     },
-    async cancel(reason) { try { await reader.cancel(reason); } catch {} }
+    async cancel(reason) { finalizeStream("client_cancel"); try { await reader.cancel(reason); } catch {} }
   });
 }
 
@@ -4338,6 +4705,41 @@ export function exceedsJsonDepth(value, max = MAX_JSON_DEPTH) {
   return false;
 }
 
+// Module-level telemetry store, created LAZILY and only when observability is enabled. Keyed by
+// buffer size so a configuration change does not silently keep the old ring.
+let TELEMETRY_STORE = null;
+let TELEMETRY_STORE_CAP = -1;
+
+function getTelemetryStore(env) {
+  const cap = telemetryBufferSize(env);
+  if (!TELEMETRY_STORE || TELEMETRY_STORE_CAP !== cap) {
+    TELEMETRY_STORE = new TelemetryStore({ recentCap: cap });
+    TELEMETRY_STORE_CAP = cap;
+  }
+  return TELEMETRY_STORE;
+}
+
+/** Test/reset hook. Not used by the request path. */
+export function __resetTelemetryStore() { TELEMETRY_STORE = null; TELEMETRY_STORE_CAP = -1; }
+
+/**
+ * Finalize telemetry for a non-stream response, then return it untouched.
+ *
+ * `response_ready_ms` measures the gateway's own work up to the point the Response is
+ * constructed. SSE uses a different pair of fields because its lifecycle is different -- one
+ * number meaning two things would make the two incomparable.
+ */
+function finalizeNonStream(response, ctx, telemetry) {
+  if (telemetry) {
+    telemetry.setStatus(response.status);
+    telemetry.setOutcome(response.status >= 400 ? "upstream_error" : "forwarded");
+    telemetry.onSpanProjection(ctx.telemetryProjection());
+    telemetry.finalizeExactlyOnce();
+  }
+  return response;
+}
+
+
 export async function handleRequest(request, env = {}, options = {}) {
   const corsOrigin=env?.REDACT_CORS_ORIGIN || "*";
   if (request.method === "OPTIONS") return corsPreflight(request,corsOrigin);
@@ -4369,10 +4771,17 @@ export async function handleRequest(request, env = {}, options = {}) {
   //   profile         -- RedactionContext honoured it, but nothing ever passed one, so a
   //     deployment could not actually choose a profile through the production entry point.
   const ctx=new RedactionContext({salt:options.salt || RUNTIME_SALT,maxRedactions,foreignRegistry,profile:options.profile});
+  // Accumulator is created ONLY when enabled, and is owned by this request/stream. Nothing
+  // global ever holds it, so an SSE response that is never consumed becomes garbage rather
+  // than a retained pending entry.
+  const telemetryOn = observabilityEnabled(env);
+  const telemetry = telemetryOn ? new TelemetryAccumulator(getTelemetryStore(env), { upstream: target?.upstream?.hostname || null }) : null;
+  if (telemetry) ctx.telemetry = telemetry;
   const headers=filteredRequestHeaders(request.headers);
   let body;
   if (request.method !== "GET" && request.method !== "HEAD") {
     const { bytes, exceeded } = await readBodyCapped(request, maxBody);
+      if (telemetry) { telemetry.setOutcome("rejected_body"); telemetry.setLimit("body_bytes"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); }
     if (exceeded) return jsonError(413,`Request body exceeds ${maxBody} bytes`);
     const ct=request.headers.get("content-type") || "";
     if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
@@ -4381,12 +4790,13 @@ export async function handleRequest(request, env = {}, options = {}) {
       try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
       // A payload resource limit, checked before redactJson walks the structure. Refused as 413
       // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
+      if (telemetry) { telemetry.setOutcome("rejected_depth"); telemetry.setLimit("json_depth"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); }
       if (exceedsJsonDepth(data, maxDepth)) return jsonError(413, `JSON nesting exceeds ${maxDepth}`);
       try {
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
         injectRedactNotice(data,protocol);
-      } catch(e) { if (e instanceof RedactionLimitError) return jsonError(413,e.message); throw e; }
+      } catch(e) { if (e instanceof RedactionLimitError) { if (telemetry) { telemetry.setOutcome("rejected_redaction"); telemetry.setLimit(e instanceof ReferenceWorkLimitError ? "reference_work" : "redaction_limit"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413,e.message); } throw e; }
       body=JSON.stringify(data); headers.set("content-type","application/json"); headers.delete("content-length");
     } else body="";
   }
@@ -4394,7 +4804,7 @@ export async function handleRequest(request, env = {}, options = {}) {
   const fetchImpl=options.fetchImpl || fetch;
   let upstreamResponse;
   try { upstreamResponse=await fetchImpl(target.upstream.toString(),{method:request.method,headers,body,redirect:"manual"}); }
-  catch(e) { return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
+  catch(e) { if (telemetry) { telemetry.setOutcome("upstream_error"); telemetry.setStatus(502); telemetry.finalizeExactlyOnce(); } return jsonError(502,`Upstream fetch failed: ${e?.message || e}`); }
 
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
@@ -4403,9 +4813,10 @@ export async function handleRequest(request, env = {}, options = {}) {
     // Once the first byte is streaming a 502 is no longer available, so an over-deep event becomes
     // a stream error and the offending event is never emitted. It must NOT fall back to
     // assistant_text: that is the fail-open this guard exists to prevent.
-    return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
+    const t0 = Date.now();
+    return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0 }),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
   }
-  return restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth);
+  return finalizeNonStream(restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth), ctx, telemetry);
 }
 
 export default { fetch(request, env, ctx) { return handleRequest(request,env); } };
