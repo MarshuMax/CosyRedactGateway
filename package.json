@@ -10,7 +10,8 @@
     "entropy-report": "node scripts/entropy-report.mjs",
     "perf": "node scripts/perf.mjs",
     "perf:soak": "node scripts/perf.mjs --soak",
-    "perf:redos": "node scripts/perf-redos.mjs"
+    "perf:redos": "node scripts/perf-redos.mjs",
+    "perf:observability": "node scripts/perf-observability.mjs"
   },
   "files": [
     "worker.js",
