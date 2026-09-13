@@ -14,8 +14,16 @@ const node = (bindHost) => ({ runtime: { kind: "node", bindHost } });
 const cf = { runtime: { kind: "cloudflare" } };
 const deno = { runtime: { kind: "deno" } };
 
-const get = (env, options, headers = {}, url = "https://proxy.example/admin") =>
-  handleRequest(new Request(url, { method: "GET", headers }), env, options);
+/**
+ * Build an admin request with an EXPLICIT Host header.
+ *
+ * Required since PR2.4: the loopback exemption now also requires the request to be ADDRESSED locally,
+ * and Node's Request does not derive a Host header from the URL. The real adapter supplies one from
+ * `req.headers`, so a request without it is not what a real client sends -- and it must not be
+ * treated as local, which is the DNS-rebinding guard.
+ */
+const get = (env, options, headers = {}, url = "http://127.0.0.1:8787/admin") =>
+  handleRequest(new Request(url, { method: "GET", headers: { host: "127.0.0.1:8787", ...headers } }), env, options);
 
 test("PR2.1: observability disabled hides /admin as 404, never 403 [GREEN NOW]", async () => {
   // 404 rather than 403: a 403 confirms an admin surface exists.

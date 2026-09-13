@@ -17,8 +17,9 @@ const WITH_TOKEN = { ...OBS, REDACT_ADMIN_TOKEN: TOKEN };
 const loopback = { runtime: { kind: "node", bindHost: "127.0.0.1" } };
 const publicBind = { runtime: { kind: "node", bindHost: "0.0.0.0" } };
 
+/** Admin page request with an EXPLICIT local Host; see admin-envelope.test.js for why. */
 const getAdmin = (env, options, headers = {}) =>
-  handleRequest(new Request("https://proxy.example/admin", { method: "GET", headers }), env, options);
+  handleRequest(new Request("http://127.0.0.1:8787/admin", { method: "GET", headers: { host: "127.0.0.1:8787", ...headers } }), env, options);
 
 /** Everything a browser would fetch from another origin, or any subresource at all. */
 const EXTERNAL_PATTERNS = [
@@ -88,11 +89,11 @@ test("PR2.3: the CSP script hash matches the inline script actually served [GREE
 test("PR2.3: /admin is GET-only, admission first [GREEN NOW]", async () => {
   // Non-GET is refused AFTER admission, so an unauthorised caller learns nothing about method support.
   for (const method of ["POST", "PUT", "DELETE", "OPTIONS"]) {
-    const unauth = await handleRequest(new Request("https://proxy.example/admin", { method }), WITH_TOKEN, publicBind);
+    const unauth = await handleRequest(new Request("http://127.0.0.1:8787/admin", { method, headers: { host: "127.0.0.1:8787" } }), WITH_TOKEN, publicBind);
     assert.equal(unauth.status, 401, `${method}: admission runs first`);
     assert.equal(unauth.headers.get("cache-control"), "no-store");
     assert.equal(unauth.headers.get("access-control-allow-origin"), null);
-    const authed = await handleRequest(new Request("https://proxy.example/admin", { method, headers: { authorization: `Bearer ${TOKEN}` } }), WITH_TOKEN, publicBind);
+    const authed = await handleRequest(new Request("http://127.0.0.1:8787/admin", { method, headers: { host: "127.0.0.1:8787", authorization: `Bearer ${TOKEN}` } }), WITH_TOKEN, publicBind);
     assert.equal(authed.status, 405, `${method}: admitted, so the method is what fails`);
     assert.equal(authed.headers.get("allow"), "GET");
     assert.equal(authed.headers.get("cache-control"), "no-store");
@@ -107,7 +108,7 @@ test("PR2.3: the dashboard requires the same admission as the API [GREEN NOW]", 
   assert.equal((await getAdmin(WITH_TOKEN, publicBind, { authorization: "Bearer wrong" })).status, 401);
   assert.equal((await getAdmin(WITH_TOKEN, publicBind, { authorization: `Bearer ${TOKEN}` })).status, 200);
   // Query and cookie credentials are still not accepted for the page either.
-  const q = await handleRequest(new Request(`https://proxy.example/admin?token=${TOKEN}`, { method: "GET" }), WITH_TOKEN, publicBind);
+  const q = await handleRequest(new Request(`http://127.0.0.1:8787/admin?token=${TOKEN}`, { method: "GET", headers: { host: "127.0.0.1:8787" } }), WITH_TOKEN, publicBind);
   assert.equal(q.status, 401, "a query credential must not open the page");
   const c = await getAdmin(WITH_TOKEN, publicBind, { cookie: `token=${TOKEN}` });
   assert.equal(c.status, 401, "a cookie must not open the page");

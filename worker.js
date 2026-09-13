@@ -5007,6 +5007,26 @@ export function formatTelemetryLine(rec) {
 const ADMIN_LOOPBACK_HOSTS = Object.freeze(new Set(["127.0.0.1", "::1"]));
 
 /**
+ * Host header values that may ACCOMPANY a loopback bind. `localhost` is an explicitly allowed local
+ * name; it can never CREATE loopback access, only fail to cancel it.
+ */
+const ADMIN_LOCAL_NAMES = Object.freeze(new Set(["127.0.0.1", "::1", "localhost"]));
+
+/**
+ * The hostname from the Host header, with any port and IPv6 brackets removed.
+ * Returns null when the header is absent or unparseable, which is treated as NOT present.
+ */
+function requestHostName(request) {
+  const raw = request.headers.get("host");
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  // Bracketed IPv6 (`[::1]:8787`) keeps its brackets stripped.
+  const m = /^\[([^\]]+)\](?::\d+)?$/.exec(raw.trim());
+  if (m) return m[1].toLowerCase();
+  const bare = raw.trim().replace(/:\d+$/, "");
+  return bare.length ? bare.toLowerCase() : null;
+}
+
+/**
  * Runtime metadata, supplied by the ADAPTER -- never inferred from the request.
  *
  * Host, X-Forwarded-For, Forwarded and the request URL's own hostname are all attacker-controlled
@@ -5067,12 +5087,22 @@ async function adminAdmission(request, env, options) {
   const { kind, bindHost } = adminRuntime(options);
   const configured = typeof env?.REDACT_ADMIN_TOKEN === "string" && env.REDACT_ADMIN_TOKEN.length > 0 ? env.REDACT_ADMIN_TOKEN : null;
 
-  // Loopback exemption comes ONLY from adapter metadata, and only for the two literal values. It
-  // applies to the Node adapter; a Worker or Deno deployment has no local bind and therefore never
-  // qualifies, even if a bindHost were somehow supplied.
-  const isNodeAdapter = kind === "node";
-  const loopback = isNodeAdapter && bindHost !== null && ADMIN_LOOPBACK_HOSTS.has(bindHost);
-  if (loopback) return { allowed: true, status: 200 };
+  // The POSITIVE authority is still the adapter's bindHost, and only the two literal values. A Worker
+  // or Deno deployment has no local bind and never qualifies, even if a bindHost were supplied.
+  const boundToLoopback = kind === "node" && bindHost !== null && ADMIN_LOOPBACK_HOSTS.has(bindHost);
+
+  // DNS REBINDING GUARD -- rejection-only. A page on attacker.example can point that name at
+  // 127.0.0.1, make a REAL TCP connection to this process, and send `Host: attacker.example`. The
+  // bind address is loopback, so without this check the exemption would apply and the admin API would
+  // be readable with no token.
+  //
+  // The Host header can therefore only CANCEL the exemption, never create it: a request that is not
+  // actually addressed to a local name is treated as non-loopback. `localhost` is an accepted local
+  // name; because the connection already reached a loopback-bound socket, accepting it does not widen
+  // reachability.
+  const hostName = requestHostName(request);
+  const addressedLocally = hostName !== null && ADMIN_LOCAL_NAMES.has(hostName);
+  if (boundToLoopback && addressedLocally) return { allowed: true, status: 200 };
 
   // Every other case needs a token. Without one configured the route is hidden, because exposing it
   // and answering 401 would advertise an unauthenticated admin surface.

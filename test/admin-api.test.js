@@ -33,8 +33,13 @@ async function proxyRequest(env, { content = `PW=${SECRET} mail ${EMAIL}`, fetch
   });
 }
 
-const apiGet = (env, options, headers = {}, url = "https://proxy.example/admin/api") =>
-  handleRequest(new Request(url, { method: "GET", headers }), env, options);
+/**
+ * Admin API request with an EXPLICIT local Host. See the note in admin-envelope.test.js: since PR2.4
+ * the exemption also requires the request to be ADDRESSED locally, and Node's Request does not derive
+ * a Host header from the URL.
+ */
+const apiGet = (env, options, headers = {}, url = "http://127.0.0.1:8787/admin/api") =>
+  handleRequest(new Request(url, { method: "GET", headers: { host: "127.0.0.1:8787", ...headers } }), env, options);
 
 test("PR2.2: an empty store returns a zero summary and an empty recent, not an error [GREEN NOW]", async () => {
   __resetTelemetryStore();
@@ -119,12 +124,12 @@ test("PR2.2: /admin/api leaks no sentinel from a real request lifecycle [GREEN N
 test("PR2.2: the API is GET-only and takes no parameters [GREEN NOW]", async () => {
   __resetTelemetryStore();
   for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
-    const res = await handleRequest(new Request("https://proxy.example/admin/api", { method }), OBS, loopback);
+    const res = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method, headers: { host: "127.0.0.1:8787" } }), OBS, loopback);
     assert.equal(res.status, 405, `${method} must be refused`);
     assert.equal(res.headers.get("allow"), "GET");
   }
   // Query parameters are ignored rather than interpreted: no filtering, no selectors.
-  const withParams = await apiGet(OBS, loopback, {}, "https://proxy.example/admin/api?limit=1&filter=x&clear=1");
+  const withParams = await apiGet(OBS, loopback, {}, "http://127.0.0.1:8787/admin/api?limit=1&filter=x&clear=1");
   assert.equal(withParams.status, 200);
   const body = await withParams.json();
   assert.equal(body.counters.requests_total, 0);
@@ -155,7 +160,7 @@ function assertNoCorsAndNoStore(res, label) {
 
 test("PR2.2: OPTIONS /admin/api with observability off is a no-store 404 with no CORS [GREEN NOW]", async () => {
   __resetTelemetryStore();
-  const res = await handleRequest(new Request("https://proxy.example/admin/api", { method: "OPTIONS" }), {}, loopback);
+  const res = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "OPTIONS", headers: { host: "127.0.0.1:8787" } }), {}, loopback);
   assert.equal(res.status, 404, "a preflight must not bypass admission");
   assertNoCorsAndNoStore(res, "OPTIONS obs off");
 });
@@ -165,7 +170,7 @@ test("PR2.2: OPTIONS /admin/api on a public bind without a credential is a 401, 
   // adminAdmission() ran, which both bypassed authorisation and advertised a cross-origin surface
   // the route does not have.
   __resetTelemetryStore();
-  const res = await handleRequest(new Request("https://proxy.example/admin/api", { method: "OPTIONS" }), WITH_TOKEN, publicBind);
+  const res = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "OPTIONS", headers: { host: "127.0.0.1:8787" } }), WITH_TOKEN, publicBind);
   assert.equal(res.status, 401, "admission runs before any preflight handling");
   assertNoCorsAndNoStore(res, "OPTIONS unauthenticated");
 });
@@ -173,7 +178,7 @@ test("PR2.2: OPTIONS /admin/api on a public bind without a credential is a 401, 
 test("PR2.2: an authorised OPTIONS /admin/api is a 405 with Allow: GET and no CORS [GREEN NOW]", async () => {
   __resetTelemetryStore();
   const authed = await handleRequest(
-    new Request("https://proxy.example/admin/api", { method: "OPTIONS", headers: { authorization: `Bearer ${TOKEN}` } }),
+    new Request("http://127.0.0.1:8787/admin/api", { method: "OPTIONS", headers: { host: "127.0.0.1:8787", authorization: `Bearer ${TOKEN}` } }),
     WITH_TOKEN, publicBind);
   assert.equal(authed.status, 405, "admitted, so the method is what fails");
   assert.equal(authed.headers.get("allow"), "GET");
@@ -182,19 +187,19 @@ test("PR2.2: an authorised OPTIONS /admin/api is a 405 with Allow: GET and no CO
 
 test("PR2.2: every hidden GET /admin/api status is no-store with no CORS [GREEN NOW]", async () => {
   __resetTelemetryStore();
-  const off = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), {}, loopback);
+  const off = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "GET", headers: { host: "127.0.0.1:8787" } }), {}, loopback);
   assert.equal(off.status, 404);
   assertNoCorsAndNoStore(off, "GET obs off");
 
-  const publicNoToken = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), OBS, publicBind);
+  const publicNoToken = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "GET", headers: { host: "127.0.0.1:8787" } }), OBS, publicBind);
   assert.equal(publicNoToken.status, 404);
   assertNoCorsAndNoStore(publicNoToken, "GET public bind, no token");
 
-  const denied = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), WITH_TOKEN, publicBind);
+  const denied = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "GET", headers: { host: "127.0.0.1:8787" } }), WITH_TOKEN, publicBind);
   assert.equal(denied.status, 401);
   assertNoCorsAndNoStore(denied, "GET unauthenticated");
 
-  const ok = await handleRequest(new Request("https://proxy.example/admin/api", { method: "GET" }), WITH_TOKEN, loopback);
+  const ok = await handleRequest(new Request("http://127.0.0.1:8787/admin/api", { method: "GET", headers: { host: "127.0.0.1:8787" } }), WITH_TOKEN, loopback);
   assert.equal(ok.status, 200);
   assertNoCorsAndNoStore(ok, "GET authorised");
 });

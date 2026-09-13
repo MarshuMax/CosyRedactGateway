@@ -340,3 +340,32 @@ a public bind**. Node on loopback is the direct browser use case for this versio
 PR2.3 deliberately does **not** work around this. No query parameter, no cookie, no `localStorage`
 credential and no relaxed scheme is offered, because each of those would trade the property that makes
 the boundary meaningful -- that a credential only ever travels in a header the address bar cannot set.
+
+## PR2.4 -- DNS rebinding guard
+
+**The rule, and it does not change:** the adapter's `bindHost` is the **only positive authority** for
+the loopback exemption. `Host`, `X-Forwarded-For`, `Forwarded`, `X-Real-IP` and the request URL can
+never *create* loopback access.
+
+**The gap that was closed:** the exemption depended on the bind address alone. A page served from
+`attacker.example` can point that name at `127.0.0.1`, make a **real TCP connection** to this process,
+and send `Host: attacker.example`. The bind is loopback, so the admin API was readable with no token.
+
+The `Host` header is now a **rejection-only gate**: it can *cancel* the exemption, never grant it. A
+request that is not actually addressed to a local name is treated as non-loopback.
+
+| Bind | `Host` | Result |
+|---|---|---|
+| `127.0.0.1` | `127.0.0.1[:port]` | exemption applies |
+| `127.0.0.1` | `localhost[:port]` | exemption applies -- an accepted local name |
+| `::1` | `[::1][:port]` | exemption applies |
+| `127.0.0.1` | `rebind.example`, missing, empty | **not exempt**: 404 with no token, 401 with a token and no/incorrect Bearer, 200 with a correct Bearer |
+| `0.0.0.0` | any local-looking value | **still public** -- a `Host` header cannot create access |
+| Cloudflare / Deno | any value | unchanged: a token is always required |
+
+`localhost` is accepted because the connection already reached a loopback-bound socket, so accepting
+it does not widen reachability. A missing or unparseable `Host` counts as **not local**, which is the
+safe direction.
+
+No query parameter, cookie or `localStorage` credential was introduced, and the public-bind contract
+is unchanged.
