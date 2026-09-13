@@ -613,3 +613,64 @@ test("observability: a completed record feeds the latency aggregates [GREEN NOW]
   // No wall-clock threshold anywhere: asserting a millisecond value or sleeping would make this
   // flaky on a loaded machine.
 });
+
+// =====================================================================================
+// item 5.1 -- early terminal paths mark ready; SSE records its real status
+// =====================================================================================
+
+test("observability: every early terminal path has a finite response_ready_ms [GREEN NOW]", async () => {
+  // These four paths finalize long before any upstream call, and they were the ones missing
+  // markResponseReady(). Each is driven through handleRequest, and each must therefore also feed the
+  // latency aggregate -- a null there silently drops the record out of it.
+  const cases = [
+    ["rejected_body", ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_BODY_BYTES: "64" }), "x".repeat(300)],
+    ["rejected_depth", ENV({ REDACT_OBSERVABILITY: "1" }), null],
+    ["rejected_redaction", ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_REDACTIONS: "1" }),
+      Array.from({ length: 6 }, (_, i) => `k${i}=wJalrXUtnFEMI${String(i).padStart(8, "0")}`).join(NL)],
+    ["rejected_work", ENV({ REDACT_OBSERVABILITY: "1", REDACT_MAX_BODY_BYTES: "1048576" }),
+      `cred=${SECRET}${NL}${"{{".repeat(20000)}`],
+  ];
+  for (const [label, env, content] of cases) {
+    __resetTelemetryStore();
+    const deep = content === null;
+    await (await call({
+      env,
+      body: deep ? JSON.stringify({ model: "g", deep: (() => { let n = "x"; for (let i = 0; i < 700; i++) n = { c: n }; return n; })() }) : undefined,
+      content: deep ? undefined : content,
+    })).text();
+    const store = __telemetryStore();
+    const rec = store.recent.toArray()[0];
+    assert.equal(rec.outcome, label, `expected ${label}, got ${rec.outcome}`);
+    assert.equal(rec.status, 413, `${label}: real status recorded`);
+    assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0,
+      `${label}: response_ready_ms must be finite, got ${rec.response_ready_ms}`);
+    assert.equal(store.latency.count, 1, `${label}: the record must reach the latency aggregate`);
+  }
+});
+
+test("observability: SSE records the real HTTP status, not the accumulator default [GREEN NOW]", async () => {
+  // The SSE path never called setStatus, so the accumulator's default 0 reached the record.
+  __resetTelemetryStore();
+  const res = await call({ path: "/v1/responses", body: JSON.stringify({ model: "g", stream: true, input: `PW=${SECRET}` }), fetchImpl: sseUpstream });
+  assert.equal(res.status, 200, "client sees the upstream status");
+  await res.text();
+  const rec = __storeSummary().recent;
+  assert.equal(rec.status, 200, `telemetry must record 200, got ${rec.status}`);
+  assert.ok(Number.isFinite(rec.response_ready_ms) && rec.response_ready_ms >= 0);
+  assert.ok(Number.isFinite(rec.stream_duration_ms) && rec.stream_duration_ms >= 0);
+});
+
+test("observability: a non-200 SSE status is recorded as-is, not assumed to be 200 [GREEN NOW]", async () => {
+  // Proves the status is read from the Response rather than hardcoded.
+  __resetTelemetryStore();
+  const res = await call({
+    path: "/v1/responses",
+    body: JSON.stringify({ model: "g", stream: true, input: "hello" }),
+    fetchImpl: async () => new Response(`data: [DONE]${NL}${NL}`, { status: 429, headers: { "content-type": "text/event-stream" } }),
+  });
+  assert.equal(res.status, 429);
+  await res.text();
+  const rec = __storeSummary().recent;
+  assert.equal(rec.status, 429, `telemetry must carry the real SSE status, got ${rec.status}`);
+  assert.equal(rec.outcome, "forwarded", "a forwarded upstream 429 is still a forward");
+});

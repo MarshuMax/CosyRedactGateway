@@ -4978,7 +4978,19 @@ export async function handleRequest(request, env = {}, options = {}) {
   let body;
   if (request.method !== "GET" && request.method !== "HEAD") {
     const { bytes, exceeded } = await readBodyCapped(request, maxBody);
-    if (exceeded) { if (telemetry) { telemetry.setOutcome("rejected_body"); telemetry.setLimit("body_bytes"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413,`Request body exceeds ${maxBody} bytes`); }
+    if (exceeded) {
+      // Construct FIRST, then mark: response_ready_ms means "the downstream Response is ready", so
+      // marking before the Response exists would name a moment that had not happened yet.
+      const response = jsonError(413, `Request body exceeds ${maxBody} bytes`);
+      if (telemetry) {
+        telemetry.setOutcome("rejected_body");
+        telemetry.setLimit("body_bytes");
+        telemetry.setStatus(response.status);
+        telemetry.markResponseReady();
+        telemetry.finalizeExactlyOnce();
+      }
+      return response;
+    }
     const ct=request.headers.get("content-type") || "";
     if (bytes.byteLength && !isJsonContentType(ct)) return jsonError(415,"For safety, request bodies must be JSON so they can be redacted before forwarding");
     if (bytes.byteLength) {
@@ -4986,7 +4998,17 @@ export async function handleRequest(request, env = {}, options = {}) {
       try { data=JSON.parse(new TextDecoder().decode(bytes)); } catch { return jsonError(400,"Invalid JSON request body"); }
       // A payload resource limit, checked before redactJson walks the structure. Refused as 413
       // because nothing has been forwarded yet: no upstream fetch happens for an over-deep body.
-      if (exceedsJsonDepth(data, maxDepth)) { if (telemetry) { telemetry.setOutcome("rejected_depth"); telemetry.setLimit("json_depth"); telemetry.setStatus(413); telemetry.finalizeExactlyOnce(); } return jsonError(413, `JSON nesting exceeds ${maxDepth}`); }
+      if (exceedsJsonDepth(data, maxDepth)) {
+        const response = jsonError(413, `JSON nesting exceeds ${maxDepth}`);
+        if (telemetry) {
+          telemetry.setOutcome("rejected_depth");
+          telemetry.setLimit("json_depth");
+          telemetry.setStatus(response.status);
+          telemetry.markResponseReady();
+          telemetry.finalizeExactlyOnce();
+        }
+        return response;
+      }
       try {
         data=await redactJson(data,ctx,target.flags);
         const protocol=detectProtocol(data,target.upstream,request.headers);
@@ -5001,13 +5023,15 @@ export async function handleRequest(request, env = {}, options = {}) {
           // extends RedactionLimitError precisely so the work budget keeps sharing the same 413
           // fail-closed path. A message check would be a string contract on an error text.
           const workLimited = e instanceof ReferenceWorkLimitError;
+          const response = jsonError(413, e.message);
           if (telemetry) {
             telemetry.setOutcome(workLimited ? "rejected_work" : "rejected_redaction");
             telemetry.setLimit(workLimited ? "reference_work" : "redaction_limit");
-            telemetry.setStatus(413);
+            telemetry.setStatus(response.status);
+            telemetry.markResponseReady();
             telemetry.finalizeExactlyOnce();
           }
-          return jsonError(413, e.message);
+          return response;
         }
         throw e;
       }
@@ -5039,8 +5063,18 @@ export async function handleRequest(request, env = {}, options = {}) {
     // Both latency fields are meaningful for SSE and neither is null: response_ready_ms is the
     // initial Response becoming returnable (including the upstream wait), and stream_duration_ms is
     // the body's own lifetime, filled at close/error/cancel. They answer different questions.
-    if (telemetry) telemetry.markResponseReady();
-    return new Response(restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0 }),{status:upstreamResponse.status,statusText:upstreamResponse.statusText,headers:rh});
+    const downstream = new Response(
+      restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0 }),
+      { status: upstreamResponse.status, statusText: upstreamResponse.statusText, headers: rh }
+    );
+    if (telemetry) {
+      // The SSE path never recorded a status, so the accumulator's default 0 reached the record.
+      // The real status comes from the Response actually being returned, which also keeps the mark
+      // timepoint consistent with its definition.
+      telemetry.setStatus(downstream.status);
+      telemetry.markResponseReady();
+    }
+    return downstream;
   }
   return finalizeNonStream(restoreNonStreamResponse(upstreamResponse,ctx,corsOrigin,trustedSinks,foreignRegistry,maxDepth), ctx, telemetry);
 }
