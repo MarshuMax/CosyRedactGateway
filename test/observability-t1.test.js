@@ -32,8 +32,28 @@ const ENV = (extra = {}) => ({ REDACT_MAX_BODY_BYTES: "16384", ...extra });
 const ON = ENV({ REDACT_OBSERVABILITY: "1" });
 const TOKEN_RE = /CRG_[A-Z0-9]{6}_[A-Z0-9]{4}/g;
 
-/** The strings that must never appear in ANY outlet. */
-const FORBIDDEN = [SECRET, EMAIL, CARD, PHONE, "CRG_"];
+// ---------------------------------------------------------------------------------------------
+// Markers that must reach the gateway's internals and then appear NOWHERE in telemetry.
+//
+// These are not arbitrary strings. Each one is placed where a leak would be most plausible and
+// least obvious -- routing metadata and a raw error message -- because telemetry legitimately
+// records the upstream HOSTNAME, and "the host is recorded" is exactly the reason path, query and
+// header values need their own explicit check rather than being assumed absent.
+// ---------------------------------------------------------------------------------------------
+const T1_HEADER_MARKER = "T1-HEADER-MARKER-8f21";
+const T1_PATH_MARKER = "T1-PATH-MARKER-4c7a";
+const T1_QUERY_MARKER = "T1-QUERY-MARKER-9b3e";
+const T1_RAW_ERROR_MARKER = "T1-RAW-ERROR-MARKER-5d60";
+
+/**
+ * The strings that must never appear in ANY outlet.
+ *
+ * `ruleId` is in the list as a SCHEMA KEY, not a value: telemetry deliberately does not record rule
+ * ids, because a rule id identifies which kind of secret was found and would narrow the search space
+ * for anyone reading the dashboard. Checking that the key does not appear catches a future field
+ * being added under that name.
+ */
+const FORBIDDEN = [SECRET, EMAIL, CARD, PHONE, "CRG_", T1_HEADER_MARKER, T1_PATH_MARKER, T1_QUERY_MARKER, T1_RAW_ERROR_MARKER, "ruleId"];
 
 /** Capture the three outlets as text. */
 function outlets() {
@@ -56,37 +76,37 @@ function captureLogs(fn) {
 }
 
 /**
- * Scan every outlet for every forbidden string.
- * Returns the hits rather than throwing, so the caller can assert on shape.
+ * The ONE scanner predicate. Used by the sweep AND by the positive control, so the control cannot
+ * pass while the sweep's predicate is broken.
  */
-function scanOutlets() {
-  const o = outlets();
+function scanText(outlet, text) {
   const hits = [];
-  for (const [outlet, text] of Object.entries(o)) {
-    for (const f of FORBIDDEN) {
-      if (text.includes(f)) hits.push(`${outlet} contains ${f}`);
-    }
+  for (const f of FORBIDDEN) {
+    if (text.includes(f)) hits.push(`${outlet} contains ${f}`);
   }
   return hits;
+}
+
+/** Scan every outlet, naming which one leaked. */
+function scanOutlets() {
+  return Object.entries(outlets()).flatMap(([outlet, text]) => scanText(outlet, text));
 }
 
 // ---------------------------------------------------------------------------------------------
 // POSITIVE CONTROL -- the scanner must be able to fail
 // ---------------------------------------------------------------------------------------------
 
-test("T1 positive control: the scanner detects a leak when one is planted [GREEN NOW]", () => {
-  // Plant each forbidden shape directly into an object with the same structure as a record, and
-  // confirm the SCANNER's predicate finds it. Without this, every "0 leaks" below could be reporting
-  // a broken scanner rather than a clean gateway.
-  const planted = { note: `${SECRET} ${EMAIL} ${CARD} ${PHONE} CRG_AAAAAA_0001` };
-  const text = JSON.stringify(planted);
+test("T1 positive control: the SAME scanner helper detects every planted forbidden value [GREEN NOW]", () => {
+  // This must call the real scanner rather than `text.includes()` directly. A control that uses a
+  // different predicate from the sweep proves the predicate in the control works, not the one doing
+  // the scanning -- which is how the original `__lastSummary` test came to verify nothing.
+  const hits = scanText("planted", FORBIDDEN.map((f) => `x ${f} y`).join(" "));
   for (const f of FORBIDDEN) {
-    assert.ok(text.includes(f), `positive control: the scanner must be able to see ${f}`);
+    assert.ok(hits.some((h) => h.includes(f)), `the scanner must report ${f}; reported ${JSON.stringify(hits)}`);
   }
-  // And the same predicate applied to a clean record finds nothing.
-  const clean = { outcome: "forwarded", status: 200, spans: { redact: 1 } };
-  const cleanText = JSON.stringify(clean);
-  for (const f of FORBIDDEN) assert.equal(cleanText.includes(f), false);
+  assert.equal(hits.length, FORBIDDEN.length, "one hit per planted value");
+  // And the same helper finds nothing in a clean record.
+  assert.deepEqual(scanText("clean", JSON.stringify({ outcome: "forwarded", status: 200, spans: { redact: 1 } })), []);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -162,4 +182,75 @@ test("T1: the outlets genuinely contain data, so the scan is not vacuous [GREEN 
   const store = __telemetryStore();
   assert.ok(store.counters.requests_total >= 1);
   assert.ok(store.recent.toArray()[0].spans.redact >= 1, "a redaction happened, so a leak would have been possible");
+});
+
+
+// =====================================================================================
+// T1.1 -- routing metadata and raw error text, each proven present then proven absent
+// =====================================================================================
+
+test("T1.1: header / path / query markers really reach the upstream, then leak nowhere [GREEN NOW]", async () => {
+  // Both halves matter. Asserting absence alone is satisfied by a marker that never entered the
+  // system, which would make this pass without testing anything -- the same shape of false green as
+  // scanning an unassigned variable.
+  __resetTelemetryStore();
+  LOGS.length = 0;
+
+  let seenUrl = null, seenHeader = null;
+  const upstreamImpl = async (url, init) => {
+    seenUrl = String(url);
+    // The request headers are forwarded; read whichever representation the stub received.
+    seenHeader = init?.headers ? JSON.stringify(init.headers) : null;
+    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), { headers: { "content-type": "application/json" } });
+  };
+
+  const proxyUrl = `https://proxy.example/H$https://api.example/v1/chat/completions/${T1_PATH_MARKER}?q=${T1_QUERY_MARKER}`;
+  await captureLogs(async () => {
+    const res = await handleRequest(
+      new Request(proxyUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-t1-marker": T1_HEADER_MARKER },
+        body: JSON.stringify({ model: "g", messages: [{ role: "user", content: `PW=${SECRET}` }] }),
+      }), ON, { salt: "t1", fetchImpl: upstreamImpl });
+    await res.text();
+  });
+
+  // The markers genuinely travelled through the gateway. If either assertion here fails, the leakage
+  // assertions below are meaningless rather than passing.
+  assert.ok(seenUrl && seenUrl.includes(T1_PATH_MARKER), `path marker must reach the upstream; saw ${seenUrl}`);
+  assert.ok(seenUrl.includes(T1_QUERY_MARKER), "query marker must reach the upstream");
+
+  const hits = scanOutlets();
+  assert.deepEqual(hits, [], `telemetry leaked routing metadata: ${hits.join("; ")}`);
+  const store = __telemetryStore();
+  assert.ok(store.recent.length >= 1);
+  // The upstream HOST is legitimately recorded -- stated so the absence checks above are not read as
+  // "nothing about the upstream is stored".
+  assert.equal(store.recent.toArray()[0].upstream, "api.example");
+});
+
+test("T1.1: a raw fetch error message reaches the client 502 but never telemetry [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  LOGS.length = 0;
+
+  let clientBody = null;
+  await captureLogs(async () => {
+    const res = await handleRequest(
+      new Request("https://proxy.example/H$https://api.example/v1/chat/completions", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "g", messages: [{ role: "user", content: "hello" }] }),
+      }), ON, { salt: "t1", fetchImpl: async () => { throw new Error(T1_RAW_ERROR_MARKER); } });
+    clientBody = await res.text();
+  });
+
+  // The gateway DOES surface the transport message to the client. That is deliberate fail-loud
+  // behaviour, and it is exactly why the check below is worth making: the string exists in this
+  // request's lifecycle, so its absence from telemetry is a real property and not an accident of the
+  // value never existing.
+  assert.ok(clientBody.includes(T1_RAW_ERROR_MARKER), `the client 502 carries the transport message; got ${clientBody.slice(0, 120)}`);
+
+  const hits = scanOutlets();
+  assert.deepEqual(hits, [], `telemetry leaked the raw error message: ${hits.join("; ")}`);
+  const rec = __telemetryStore().recent.toArray()[0];
+  assert.equal(rec.outcome, "upstream_error", "and the refusal is still classified normally");
 });

@@ -83,11 +83,23 @@ test("observability: no plaintext, token or body reaches the store or the log [G
     await (await call({ content: `PW=${SECRET}`, fetchImpl: echoToken })).text();
     await (await call({ content: `PW=${SECRET}`, fetchImpl: toolOperand })).text();
   });
-  const rendered = JSON.stringify(lines) + globalThis.__lastSummary;
-  for (const forbidden of [SECRET, EMAIL, "CRG_"]) {
-    assert.equal(rendered.includes(forbidden), false, `telemetry output must never contain ${forbidden}`);
+  // The three REAL outlets, not `globalThis.__lastSummary` -- that property was never assigned, so
+  // the previous form scanned the log lines and silently reported "summary verified" for a summary it
+  // never looked at. T1 owns the exhaustive sweep; this is the focused version, and it reads the same
+  // objects the sweep does.
+  const store = __telemetryStore();
+  const outlets = {
+    recent: JSON.stringify(store.recent.toArray()),
+    summary: JSON.stringify(store.summary()),
+    logs: JSON.stringify(lines),
+  };
+  for (const [outlet, text] of Object.entries(outlets)) {
+    for (const forbidden of [SECRET, EMAIL, "CRG_"]) {
+      assert.equal(text.includes(forbidden), false, `${outlet} must never contain ${forbidden}`);
+    }
   }
   assert.ok(lines.some((l) => l.startsWith("[CRG]")), "and it must actually have logged something");
+  assert.ok(store.recent.length >= 3, "and recorded every request");
 });
 
 test("observability: applySinkPolicy keeps its original public return shape [GREEN NOW]", async () => {
