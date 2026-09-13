@@ -4591,7 +4591,7 @@ export function applyResponsePolicy(data, ctx, trusted = null, registry = null) 
  * payload -- that downgrade is what turned a deep untrusted tool operand into plaintext on the
  * non-stream path.
  */
-export function guardSseDepth(body, maxDepth = MAX_JSON_DEPTH) {
+export function guardSseDepth(body, maxDepth = MAX_JSON_DEPTH, onDepthLimit = null) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const reader = body.getReader();
@@ -4629,6 +4629,18 @@ export function guardSseDepth(body, maxDepth = MAX_JSON_DEPTH) {
       const window = tail + decoder.decode(value, { stream: true });
       if (inspect(window)) {
         tripped = true;
+        // METADATA-ONLY notification, sent BEFORE the error event is emitted so the terminal cause
+        // is recorded first.
+        //
+        // Why it is needed at all: this guard emits a normal `gateway_depth_limit` error EVENT and
+        // then CLOSES. It does not call controller.error(), so downstream sees a clean EOF and would
+        // otherwise finalize the request as `forwarded` -- a controlled depth refusal displayed as a
+        // success.
+        //
+        // The callback receives NOTHING: no event body, no text, no raw payload. Its only job is to
+        // say "the limit fired". A throwing callback must not damage the fail-closed path, so it is
+        // contained here rather than allowed to interrupt the cancel-and-close below.
+        try { if (typeof onDepthLimit === "function") onDepthLimit(); } catch { /* never break fail-closed */ }
         controller.enqueue(encoder.encode(
           `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "gateway_depth_limit", message: `SSE event exceeds structural depth limit (${maxDepth})` } })}\n\n`
         ));
@@ -4655,7 +4667,14 @@ export function restoreSseStream(body, ctx, trusted = null, registry = null, tel
   // honestly guarantee.
   const telemetry = telemetryOpts?.telemetry || null;
   const streamStartedAt = telemetryOpts?.startedAt || Date.now();
-  const finalizeStream = (outcome) => {
+  // FIRST TERMINAL CAUSE WINS. The depth guard trips BEFORE the stream closes, so it claims the
+  // cause first and the ordinary close that follows must not relabel the request `forwarded`.
+  // Without a shared claim, a controlled depth refusal was reported as a success.
+  const terminal = telemetryOpts?.terminal || null;
+  const finalizeStream = (outcome, limit = null) => {
+    // The stream owns the start point, so it computes the duration and hands it to the claim. The
+    // first terminal cause keeps its own duration; a later cause is ignored entirely.
+    if (terminal) { terminal.claim(outcome, limit, Date.now() - streamStartedAt); return; }
     if (!telemetry) return;
     telemetry.setOutcome(outcome);
     telemetry.finalizeExactlyOnce(null, Date.now() - streamStartedAt);
@@ -5067,7 +5086,29 @@ export async function handleRequest(request, env = {}, options = {}) {
   const responseCt=upstreamResponse.headers.get("content-type") || "";
   if (/text\/event-stream/i.test(responseCt) && upstreamResponse.body) {
     const rh=withCors(upstreamResponse.headers,corsOrigin); rh.delete("content-length"); rh.delete("content-encoding");
-    const guarded = guardSseDepth(upstreamResponse.body, maxDepth);
+    // Shared terminal state for this stream. `claim` records the FIRST terminal cause and ignores
+    // later ones, so a depth trip followed by a normal close cannot be reported as forwarded.
+    const sseTerminal = {
+      cause: null, limit: null,
+      // `durationMs` is supplied by the stream, which owns the start point; a depth trip has no
+      // duration of its own because the stream is still closing when it fires.
+      claim(cause, limit = null, durationMs = null) {
+        if (this.cause !== null) return false;
+        this.cause = cause; this.limit = limit;
+        if (telemetry) {
+          telemetry.setOutcome(cause);
+          if (limit) telemetry.setLimit(limit);
+          telemetry.finalizeExactlyOnce(null, Number.isFinite(durationMs) ? durationMs : null);
+        }
+        return true;
+      },
+    };
+    const guarded = guardSseDepth(upstreamResponse.body, maxDepth, () => {
+      // FIRST TERMINAL CAUSE WINS, and this is that moment: the guard trips before the stream
+      // closes, so it must claim the terminal cause and the later normal close must not overwrite it
+      // with `forwarded`.
+      sseTerminal.claim("stream_error", "json_depth");
+    });
     // Once the first byte is streaming a 502 is no longer available, so an over-deep event becomes
     // a stream error and the offending event is never emitted. It must NOT fall back to
     // assistant_text: that is the fail-open this guard exists to prevent.
@@ -5076,7 +5117,7 @@ export async function handleRequest(request, env = {}, options = {}) {
     // initial Response becoming returnable (including the upstream wait), and stream_duration_ms is
     // the body's own lifetime, filled at close/error/cancel. They answer different questions.
     const downstream = new Response(
-      restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0 }),
+      restoreSseStream(guarded,ctx,trustedSinks,foreignRegistry,{ telemetry, startedAt: t0, terminal: sseTerminal }),
       { status: upstreamResponse.status, statusText: upstreamResponse.statusText, headers: rh }
     );
     if (telemetry) {

@@ -30,6 +30,8 @@ import {
   SINK_MODE,
   SINK_KIND,
   applySinkPolicy,
+  guardSseDepth,
+  MAX_JSON_DEPTH,
 } from "../worker.js";
 
 const SECRET = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
@@ -673,4 +675,91 @@ test("observability: a non-200 SSE status is recorded as-is, not assumed to be 2
   const rec = __storeSummary().recent;
   assert.equal(rec.status, 429, `telemetry must carry the real SSE status, got ${rec.status}`);
   assert.equal(rec.outcome, "forwarded", "a forwarded upstream 429 is still a forward");
+});
+
+// =====================================================================================
+// item 6 -- a controlled SSE depth refusal must not be recorded as a success
+// =====================================================================================
+
+/** Build an SSE body carrying one event whose payload nests past the depth limit. */
+function deepSseBody(extra) {
+  const nested = (() => { let n = "y"; for (let i = 0; i < 700; i++) n = { c: n }; return n; })();
+  const ev = { type: "response.output_text.delta", delta: "x", nested, ...(extra || {}) };
+  return `event: response.output_text.delta${NL}data: ${JSON.stringify(ev)}${NL}${NL}data: [DONE]${NL}${NL}`;
+}
+
+test("observability: an over-deep SSE event is stream_error/json_depth, not forwarded [GREEN NOW]", async () => {
+  // The guard emits a normal `gateway_depth_limit` error EVENT and then closes; it does not call
+  // controller.error(), so downstream sees a clean EOF and would otherwise record `forwarded` -- a
+  // controlled refusal displayed as a success.
+  __resetTelemetryStore();
+  let upstreamCancelled = false;
+  const body = deepSseBody();
+  const res = await call({
+    path: "/v1/responses",
+    body: JSON.stringify({ model: "g", stream: true, input: "hello" }),
+    fetchImpl: async () => new Response(
+      new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(body)); }, cancel() { upstreamCancelled = true; } }),
+      { headers: { "content-type": "text/event-stream" } }
+    ),
+  });
+  const out = await res.text();
+  // The wire behaviour is UNCHANGED: the client still receives the same gateway_depth_limit event.
+  assert.match(out, /gateway_depth_limit/, "the existing error event must still be emitted");
+  assert.equal(upstreamCancelled, true, "and the upstream reader must still be cancelled");
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "stream_error");
+  assert.equal(rec.limit_reason, "json_depth");
+  assert.equal(rec.status, 200, "the SSE HTTP status is still 200, which is exactly why the outcome had to carry the refusal");
+});
+
+test("observability: a normal SSE stream is forwarded with no limit reason [GREEN NOW]", async () => {
+  __resetTelemetryStore();
+  await (await call({ path: "/v1/responses", body: JSON.stringify({ model: "g", stream: true, input: "hello" }), fetchImpl: sseUpstream })).text();
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "forwarded");
+  assert.equal(rec.limit_reason, null, "a normal stream has no limit reason");
+});
+
+test("observability: first terminal cause wins -- a cancel after a depth trip cannot relabel it [GREEN NOW]", async () => {
+  // The depth trip happens BEFORE the close, so it must claim the terminal cause and the later
+  // close/cancel must not overwrite it.
+  __resetTelemetryStore();
+  const body = deepSseBody();
+  const res = await call({
+    path: "/v1/responses",
+    body: JSON.stringify({ model: "g", stream: true, input: "hello" }),
+    fetchImpl: async () => new Response(
+      new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(body)); } }),
+      { headers: { "content-type": "text/event-stream" } }
+    ),
+  });
+  const reader = res.body.getReader();
+  await reader.read();
+  await reader.cancel();   // client cancel AFTER the guard already tripped
+  const rec = __storeSummary().recent;
+  assert.equal(rec.outcome, "stream_error", "the first terminal cause must survive a later cancel");
+  assert.equal(rec.limit_reason, "json_depth");
+});
+
+test("observability: a throwing onDepthLimit callback cannot damage the fail-closed path [GREEN NOW]", async () => {
+  // The callback receives no event body, no text and no raw payload -- only the fact that the limit
+  // fired -- and its failure must not interrupt the cancel-and-close that follows.
+  let cancelled = false;
+  const body = deepSseBody();
+  const guarded = guardSseDepth(
+    new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(body)); }, cancel() { cancelled = true; } }),
+    MAX_JSON_DEPTH,
+    () => { throw new Error("callback exploded"); }
+  );
+  const out = await new Response(guarded).text();
+  assert.match(out, /gateway_depth_limit/, "the client still receives the error event");
+  assert.equal(cancelled, true, "and the upstream reader is still cancelled");
+});
+
+test("observability: onDepthLimit is optional [GREEN NOW]", async () => {
+  const body = deepSseBody();
+  const guarded = guardSseDepth(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(body)); } }), MAX_JSON_DEPTH);
+  const out = await new Response(guarded).text();
+  assert.match(out, /gateway_depth_limit/, "calling without a callback must still refuse");
 });
