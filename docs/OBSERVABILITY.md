@@ -178,3 +178,39 @@ against unreliable finalization and real memory retention.
 
 > telemetry records completed or explicitly terminated stream lifecycles; an SSE response that
 > is never consumed and never cancelled may have no per-request telemetry record.
+
+## Status: PR1 frozen
+
+PR1 -- the telemetry core and the structured log line -- is frozen at commit `934bafa6` on branch
+`v2.1-observability`, based on the v2.0.0-rc.1 tag (`151c12fd`). Twenty-five commits, 830 insertions
+and 15 deletions in `worker.js`.
+
+Frozen means: no further benchmarks, no additional leak cases, no production telemetry optimisation.
+PR2 (the `/admin` endpoint, its authentication and its UI) starts from `934bafa6` as its baseline and
+its contents are not back-filled into PR1.
+
+What PR1 established, and the evidence behind each:
+
+| Claim | Evidence |
+|---|---|
+| 11 terminal outcomes all wired | every recorded path asserted through the real `handleRequest` |
+| Three telemetry outlets carry no plaintext, token, routing metadata or raw error text | T1 sweep over `recent.toArray()`, `summary()` and the log lines, with a positive control that uses the SAME scanner and a negative-verified leaky build |
+| A telemetry fault cannot change a status, body or security outcome | four fault injections, each comparing OFF against faulted-ON; the sink case asserts the security verdict, not just absence of a crash |
+| The recent ring is bounded | `recent.length === cap`, `within === true` after 10,000 requests against a cap of 100 |
+| Fixed-key maps do not grow with request count | every map `<= 1` key after the same soak |
+| No sustained post-cap growth signal | B (ring full) to C (10,000 requests) delta: RSS -1.94 MiB, heap +0.12 MiB, post-GC heap 9.0 -> 9.1 MiB |
+
+Observability overhead, measured on identical workloads, is **reported and not gated**: the ON run
+measured slightly faster (throughput ratio 1.0737, latency ratio 0.9313), which is JIT and execution
+order rather than a speed-up, since the ON run executes second against warmed code. The +22.75 MiB RSS
+difference between the two runs is **start-up**, not a resident telemetry cost -- the post-cap phase
+shows no evidence of request-count-proportional growth, which is precisely why that phase is measured separately from process start.
+None of these numbers is a pass/fail threshold; they depend on V8, GC timing and the machine.
+
+### Test asset layout
+
+| Location | Role | Runs in `npm test` |
+|---|---|---|
+| `test/` | correctness and bounded deterministic regressions | yes |
+| `tools/rc-differential.mjs` | RC baseline differential; needs a checked-out tag and a /tmp oracle | **no**, deliberately |
+| `scripts/perf-*.mjs` | heavy sweeps and measurement, observation only | **no** |
