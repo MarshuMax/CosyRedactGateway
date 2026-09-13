@@ -28,6 +28,8 @@ import {
   TELEMETRY_RECENT_MAX,
   TELEMETRY_SCHEMA_VERSION,
   SINK_MODE,
+  SINK_KIND,
+  applySinkPolicy,
 } from "../worker.js";
 
 const SECRET = "wJalrXUtnFEMIK7MDENGbPxRfiCY";
@@ -84,6 +86,28 @@ test("observability: no plaintext, token or body reaches the store or the log [G
     assert.equal(rendered.includes(forbidden), false, `telemetry output must never contain ${forbidden}`);
   }
   assert.ok(lines.some((l) => l.startsWith("[CRG]")), "and it must actually have logged something");
+});
+
+test("observability: applySinkPolicy keeps its original public return shape [GREEN NOW]", async () => {
+  // `changed` is telemetry-internal metadata and must NOT widen this exported function's return
+  // shape. Widening it would be an API change for every caller, made on behalf of a private
+  // counter. The RC baseline returned exactly { text, mode, blocked }.
+  const ctx = new RedactionContext({ salt: "shape" });
+  await ctx.tokenFor(SECRET);
+  const shapes = [];
+  // PRESERVE + operand with an unknown token -> blocked
+  shapes.push(applySinkPolicy("CRG_ZZZZZZ_9999", ctx, { kind: SINK_KIND.TOOL_ARGUMENT, toolName: "t" }));
+  // PRESERVE, nothing to refuse
+  shapes.push(applySinkPolicy("plain text", ctx, { kind: SINK_KIND.TOOL_ARGUMENT, toolName: "t" }));
+  // BLOCK
+  shapes.push(applySinkPolicy("plain text", ctx, { kind: SINK_KIND.SHELL }));
+  // RESTORE with nothing to resolve
+  shapes.push(applySinkPolicy("plain text", ctx, { kind: SINK_KIND.ASSISTANT_TEXT }));
+  for (const r of shapes) {
+    assert.deepEqual(Object.keys(r).sort(), ["blocked", "mode", "text"],
+      `applySinkPolicy must return exactly {text, mode, blocked}; got ${JSON.stringify(Object.keys(r))}`);
+    assert.equal("changed" in r, false, "changed must not escape the function");
+  }
 });
 
 test("observability: the accumulator does not accept text at all [GREEN NOW]", () => {

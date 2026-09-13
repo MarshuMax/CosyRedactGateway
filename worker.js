@@ -414,7 +414,7 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     }
     // PRESERVE never substitutes, so the outcome is `preserved` whatever the mode says.
     if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
-    return { text, mode, blocked: false, changed: false };
+    return { text, mode, blocked: false };
   }
   if (mode === SINK_MODE.BLOCK) {
     // Sensitive sink: an unresolvable operand is refused rather than forwarded, because a
@@ -426,7 +426,7 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     // A BLOCK channel with nothing to refuse delivered the text as-is: mode BLOCK, outcome
     // `preserved`. Conflating the two is exactly the confusion this split prevents.
     if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, false);
-    return { text, mode, blocked: false, changed: false };
+    return { text, mode, blocked: false };
   }
   // RESTORE resolves only what this layer owns; restoreText leaves everything else
   // untouched, so a FOREIGN_REGISTERED token is preserved here too. Trusted does not mean
@@ -445,7 +445,7 @@ export function applySinkPolicy(text, ctx, sink = {}, trusted = null, registry =
     // `applied.text !== text`; this is the same rule, evaluated once, where both strings exist.
     const changed = out !== text;
     if (ctx?.telemetry) ctx.telemetry.onSinkEvent(mode, false, changed);
-      return { text: out, mode, blocked: false, changed };
+      return { text: out, mode, blocked: false };
 }
 
 export function classifyRestore({ ctx, text, sink = { kind: SINK_KIND.ASSISTANT_TEXT }, registry = null, trusted = null }) {
